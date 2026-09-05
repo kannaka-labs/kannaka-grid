@@ -68,14 +68,9 @@ class Snapshot:
 
     @property
     def lineage_top(self) -> float:
-        # Denominator is whichever total is larger: reported population or the
-        # sum of tracked founder-lineage counts. The two are expected to agree;
-        # taking the max keeps a lagging/undercounted field from inflating a
-        # lineage's apparent share when the other field is authoritative.
-        total = max(self.population, sum(self.strains))
-        if not total or not self.strains:
+        if not self.population or not self.strains:
             return 0.0
-        return max(self.strains) / total
+        return max(self.strains) / self.population
 
     @property
     def top_lineage(self) -> int:

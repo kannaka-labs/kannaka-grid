@@ -110,18 +110,23 @@ def test_genome_novel_fires_on_new_epoch_high_only():
     assert kinds(d.feed(snap(tick=4, dominant="abcyz", ancestor="abc"))) == ["genome.novel"]
 
 
+def crash_snap(tick: int, pop: int) -> Snapshot:
+    """A snapshot whose strains sum to its population, so no lineage ever passes 0.5."""
+    return snap(tick=tick, population=pop, strains=[pop // 2, pop - pop // 2])
+
+
 def test_population_crash_within_window_then_rearms():
     d = Distiller()
-    d.feed(snap(tick=0, population=100))
-    assert kinds(d.feed(snap(tick=50, population=70))) == []            # 30% drop: no
-    ev = d.feed(snap(tick=60, population=59))                           # 41% drop from 100
+    d.feed(crash_snap(0, 100))
+    assert kinds(d.feed(crash_snap(50, 70))) == []            # 30% drop: no
+    ev = d.feed(crash_snap(60, 59))                           # 41% drop from 100
     assert kinds(ev) == ["population.crash"]
     assert ev[0].fields == {"from": 100, "to": 59}
-    assert kinds(d.feed(snap(tick=70, population=40))) == []            # already fired
+    assert kinds(d.feed(crash_snap(70, 40))) == []            # already fired
     # after the window passes, a fresh crash counts again
-    d.feed(snap(tick=60 + CRASH_WINDOW_TICKS + 1, population=40))
-    d.feed(snap(tick=60 + CRASH_WINDOW_TICKS + 2, population=40))
-    assert kinds(d.feed(snap(tick=60 + CRASH_WINDOW_TICKS + 3, population=20))) == ["population.crash"]
+    d.feed(crash_snap(60 + CRASH_WINDOW_TICKS + 1, 40))
+    d.feed(crash_snap(60 + CRASH_WINDOW_TICKS + 2, 40))
+    assert kinds(d.feed(crash_snap(60 + CRASH_WINDOW_TICKS + 3, 20))) == ["population.crash"]
 
 
 def test_signal_dialect_needs_two_consecutive_hot_buckets_and_rearms():
