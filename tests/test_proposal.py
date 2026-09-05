@@ -1,0 +1,107 @@
+import json
+from pathlib import Path
+
+import pytest
+
+from grid.proposal import (GENOME_CAP, Rejection, Request, extract_names, parse_request,
+                           render_prompt, validate, write_proposal)
+
+ISA = [{"name": n, "cost": 0.1, "effect": f"do {n}"} for n in
+       ("nop", "harvest", "scan", "move", "alloc", "copy", "ifnotdone", "jmpb", "fork")]
+PARENT_GENOME = ["harvest", "alloc", "copy", "ifnotdone", "jmpb", "fork"]
+
+
+def request_dict(**over) -> dict:
+    d = {"request_id": "abc123", "created_at": 1.0,
+         "parent": {"id": 7, "energy": 80.0, "generation": 3, "tick": 500},
+         "genome": list(PARENT_GENOME), "instruction_set": ISA,
+         "ecology": {"signal/listen": "ephemeral local communication"},
+         "directive": "Odin must author one motivated variant; preserve viable replication."}
+    d.update(over)
+    return d
+
+
+def write_request(queue: Path, **over) -> Path:
+    queue.mkdir(parents=True, exist_ok=True)
+    p = queue / "request.json"
+    p.write_text(json.dumps(request_dict(**over)))
+    return p
+
+
+def req(**over) -> Request:
+    d = request_dict(**over)
+    return Request(d["request_id"], d["created_at"], d["parent"], d["genome"],
+                   d["instruction_set"], d["ecology"], d["directive"])
+
+
+def test_parse_request_reads_thegrid_shape(tmp_path):
+    write_request(tmp_path)
+    r = parse_request(tmp_path / "request.json")
+    assert r.request_id == "abc123"
+    assert r.genome == PARENT_GENOME
+    assert [i["name"] for i in r.instruction_set][:3] == ["nop", "harvest", "scan"]
+
+
+def test_parse_request_rejects_missing_genome(tmp_path):
+    p = tmp_path / "request.json"
+    p.write_text(json.dumps({"request_id": "x", "instruction_set": ISA}))
+    with pytest.raises(ValueError):
+        parse_request(p)
+
+
+def test_render_prompt_contains_directive_isa_parent_and_recall():
+    text = render_prompt(req(), recall=["last epoch the fork-early strain swept"])
+    assert "Odin must author one motivated variant" in text
+    assert "harvest" in text and "do harvest" in text
+    assert "fork-early strain swept" in text
+    assert "JSON array" in text
+
+
+def test_extract_names_finds_first_string_array():
+    assert extract_names('Sure: ["harvest", "copy"] and more') == ["harvest", "copy"]
+    assert extract_names("no array here") is None
+    assert extract_names("[1, 2]") is None
+
+
+def test_validate_accepts_variant_from_isa():
+    assert validate('["harvest","scan","alloc","copy","ifnotdone","jmpb","fork"]', req()) == \
+        ["harvest", "scan", "alloc", "copy", "ifnotdone", "jmpb", "fork"]
+
+
+def test_validate_rejects_unknown_opcode():
+    r = validate('["harvest","teleport"]', req())
+    assert isinstance(r, Rejection) and "teleport" in r.reason
+
+
+def test_validate_rejects_identical_to_parent():
+    r = validate(json.dumps(PARENT_GENOME), req())
+    assert isinstance(r, Rejection) and "identical" in r.reason
+
+
+def test_validate_rejects_empty_and_over_cap():
+    assert isinstance(validate("[]", req()), Rejection)
+    assert isinstance(validate(json.dumps(["nop"] * (GENOME_CAP + 1)), req()), Rejection)
+    assert validate(json.dumps(["nop"] * GENOME_CAP), req()) == ["nop"] * GENOME_CAP
+
+
+def test_validate_rejects_no_array():
+    r = validate("I would fork earlier.", req())
+    assert isinstance(r, Rejection) and "array" in r.reason
+
+
+def test_write_proposal_is_atomic_and_matches_live_request(tmp_path):
+    write_request(tmp_path)
+    r = parse_request(tmp_path / "request.json")
+    assert write_proposal(tmp_path, r, ["harvest", "fork"]) is True
+    assert json.loads((tmp_path / "proposal.json").read_text()) == {"genome": ["harvest", "fork"]}
+    assert not (tmp_path / "proposal.tmp").exists()
+
+
+def test_write_proposal_refuses_when_request_gone_or_replaced(tmp_path):
+    write_request(tmp_path)
+    r = parse_request(tmp_path / "request.json")
+    (tmp_path / "request.json").unlink()
+    assert write_proposal(tmp_path, r, ["harvest", "fork"]) is False
+    write_request(tmp_path, request_id="other")
+    assert write_proposal(tmp_path, r, ["harvest", "fork"]) is False
+    assert not (tmp_path / "proposal.json").exists()
