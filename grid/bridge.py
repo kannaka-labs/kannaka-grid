@@ -93,6 +93,7 @@ class Bridge:
         self.isa: list[str] = []
         self._chronicled_phase: int = -1
         self._last_chronicle_tick: int = 0
+        self._chronicle_task: asyncio.Task | None = None
 
     # -- identity ------------------------------------------------------------
 
@@ -183,6 +184,17 @@ class Bridge:
                 log.error("chronicle %s publish failed: %s", kind, e)
         return out
 
+    def schedule_chronicle(self) -> None:
+        """Run the chronicle off the stream path; at most one in flight."""
+        if self._chronicle_task is not None and not self._chronicle_task.done():
+            return
+        if self.last is None:
+            return
+        phase = self.last.tick // chron.CHRONICLE_EVERY_TICKS
+        if phase == 0 or phase == self._chronicled_phase:
+            return
+        self._chronicle_task = asyncio.create_task(self.maybe_chronicle())
+
 
 # -- daemon --------------------------------------------------------------------
 
@@ -193,21 +205,27 @@ async def _stream(cfg: BridgeConfig, bridge: Bridge) -> None:
             response.raise_for_status()
             last_state, last_history = 0.0, 0.0
             async for line in response.aiter_lines():
-                for data in iter_sse_data([line]):
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                try:
                     await bridge.handle_state(json.loads(data))
-                    now = time.monotonic()
-                    if now - last_state >= cfg.state_every_s and bridge.last is not None:
-                        await bridge.publish_state(bridge.last)
-                        last_state = now
-                    if now - last_history >= cfg.history_every_s:
-                        try:
-                            r = await client.get(f"{cfg.colony_url}/api/history")
-                            r.raise_for_status()
-                            await bridge.poll_history(r.json())
-                        except Exception as e:
-                            log.warning("history poll failed: %s", e)
-                        last_history = now
-                    await bridge.maybe_chronicle()
+                except Exception as e:  # one bad frame must not cost the connection
+                    log.warning("skipped unreadable frame: %s", e)
+                    continue
+                now = time.monotonic()
+                if now - last_state >= cfg.state_every_s and bridge.last is not None:
+                    await bridge.publish_state(bridge.last)
+                    last_state = now
+                if now - last_history >= cfg.history_every_s:
+                    try:
+                        r = await client.get(f"{cfg.colony_url}/api/history")
+                        r.raise_for_status()
+                        await bridge.poll_history(r.json())
+                    except Exception as e:
+                        log.warning("history poll failed: %s", e)
+                    last_history = now
+                bridge.schedule_chronicle()
 
 
 async def run(cfg: BridgeConfig) -> None:

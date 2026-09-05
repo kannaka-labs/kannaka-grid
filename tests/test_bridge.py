@@ -166,6 +166,81 @@ async def test_poll_history_publishes_dialect_events():
     assert bus.published[-1][0] == "GRID.colony-one.event.signal.dialect"
 
 
+class FailingBus(FakeBus):
+    """Refuses every publish, the way a NATS permissions error surfaces."""
+
+    async def publish(self, subject, payload):
+        from grid.natsio import BusError
+        raise BusError("permissions violation")
+
+
+class FailingFlux(FakeFlux):
+    async def upsert(self, entity_id, properties):
+        raise RuntimeError("flux down")
+
+
+class BusErrorMind(FakeMind):
+    """Every ask fails the way a dead daemon does (timeout is a BusError subclass)."""
+
+    async def ask(self, text, *, recall_query=None, timeout_s=180.0):
+        from grid.natsio import BusTimeout
+        raise BusTimeout("no reply")
+
+
+class RefusingMind(FakeMind):
+    def remember(self, text, tags, *, category="grid"):
+        self.remembered.append((text, tags))
+        return False
+
+
+async def test_refused_publish_is_dropped_not_raised():
+    bridge = Bridge(cfg(), bus=FailingBus(), mind=FakeMind())
+    events = await bridge.handle_state(state())
+    assert [e.kind for e in events] == ["epoch.started", "lineage.sweep"]
+
+
+async def test_flux_failure_does_not_block_state_publish():
+    bus = FakeBus()
+    bridge = Bridge(cfg(), bus=bus, mind=FakeMind(), flux=FailingFlux())
+    await bridge.handle_state(state())
+    await bridge.publish_state(bridge.last)
+    assert bus.published[-1][0] == "GRID.colony-one.state"
+
+
+async def test_chronicle_skips_kinds_whose_ask_fails():
+    bus = FakeBus()
+    bridge = Bridge(cfg(), bus=bus, mind=BusErrorMind())
+    await bridge.handle_state(state(tick=CHRONICLE_EVERY_TICKS))
+    assert await bridge.maybe_chronicle() == {}
+    assert not [s for s, _ in bus.published if ".chronicle." in s]
+
+
+async def test_refused_memory_still_publishes_event():
+    bus, mind = FakeBus(), RefusingMind()
+    bridge = Bridge(cfg(), bus=bus, mind=mind)
+    await bridge.handle_state(state())
+    assert len(bus.published) == 2 and len(mind.remembered) == 2
+
+
+async def test_schedule_chronicle_spawns_at_most_one_task():
+    import asyncio
+    bridge = Bridge(cfg(), bus=FakeBus(), mind=FakeMind(answers={
+        "What is this epoch about": "A slow squeeze.",
+        "Name the capability": "fork early via fork.",
+        "single most important": "Sweep at tick 1900."}))
+    await bridge.handle_state(state(tick=CHRONICLE_EVERY_TICKS))
+    bridge.schedule_chronicle()
+    first = bridge._chronicle_task
+    bridge.schedule_chronicle()
+    assert bridge._chronicle_task is first
+    await first
+    assert [s for s, _ in bridge.bus.published if ".chronicle." in s] == [
+        "GRID.colony-one.chronicle.topic", "GRID.colony-one.chronicle.skill",
+        "GRID.colony-one.chronicle.event"]
+    bridge.schedule_chronicle()          # same phase: nothing new spawned
+    assert bridge._chronicle_task is first
+
+
 def test_config_from_env_defaults(monkeypatch):
     for k in ("COLONY_URL", "NATS_URL", "NATS_USER", "NATS_PASSWORD", "FLUX_URL", "MIND_AGENT_ID",
               "MIND_DATA_DIR", "KANNAKA_BIN", "STATE_EVERY_S", "HISTORY_EVERY_S"):
