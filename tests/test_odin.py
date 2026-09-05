@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
 
-from grid.natsio import BusTimeout
+import pytest
+
+from grid.natsio import BusClosed, BusTimeout
 from grid.odin import Relay
 
 ISA = [{"name": n, "cost": 0.1, "effect": n} for n in ("nop", "harvest", "copy", "fork")]
@@ -116,3 +118,17 @@ async def test_replaced_request_is_asked_again(tmp_path):
     write_request(tmp_path, "r2")
     assert await r.poll_once() == "proposed"
     assert len(mind.asked) == 2
+
+
+class ClosedBus(FakeBus):
+    """The client gave up reconnecting; nothing will be delivered again."""
+
+    async def publish(self, subject, payload):
+        raise BusClosed("connection closed for good")
+
+
+async def test_closed_bus_is_fatal_for_the_relay(tmp_path):
+    write_request(tmp_path)
+    r = relay(tmp_path, FakeMind(answer='["harvest","fork"]'), ClosedBus())
+    with pytest.raises(BusClosed):
+        await r.poll_once()

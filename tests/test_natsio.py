@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from grid.natsio import Bus, BusError, BusTimeout
+from grid.natsio import Bus, BusClosed, BusError, BusTimeout
 
 
 class FakeMsg:
@@ -15,6 +15,7 @@ class FakeNC:
         self.published: list[tuple[str, bytes]] = []
         self.flushed = 0
         self.closed = False
+        self.is_closed = False
         self.reply: bytes | None = None
         self.raise_timeout = False
         self.fail_flush = False
@@ -52,6 +53,29 @@ async def test_connect_passes_url_and_creds():
     bus = await make_bus(FakeNC())
     assert bus._connect_kwargs["servers"] == ["nats://example:4222"]
     assert bus._connect_kwargs["user"] == "u" and bus._connect_kwargs["password"] == "p"
+
+
+async def test_connect_never_gives_up_reconnecting_and_installs_callbacks():
+    bus = await make_bus(FakeNC())
+    kwargs = bus._connect_kwargs
+    # 60 x 2 s is the nats-py default: two minutes unreachable and the client
+    # is CLOSED for good, with every later publish failing silently.
+    assert kwargs["max_reconnect_attempts"] == -1
+    assert kwargs["reconnect_time_wait"] == 2
+    assert {"disconnected_cb", "reconnected_cb", "closed_cb", "error_cb"} <= kwargs.keys()
+    assert all(callable(kwargs[k]) for k in
+               ("disconnected_cb", "reconnected_cb", "closed_cb", "error_cb"))
+
+
+async def test_publish_and_request_raise_bus_closed_once_the_client_gave_up():
+    nc = FakeNC()
+    bus = await make_bus(nc)
+    nc.is_closed = True
+    with pytest.raises(BusClosed):
+        await bus.publish("GRID.c.event.storm", {"a": 1})
+    with pytest.raises(BusClosed):
+        await bus.request("KANNAKA.ask.m", {"text": "hi"}, timeout_s=1)
+    assert nc.published == [] and nc.flushed == 0
 
 
 async def test_publish_encodes_json_and_flushes():

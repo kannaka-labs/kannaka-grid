@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from grid.bridge import (Bridge, BridgeConfig, iter_sse_data, memory_text, state_properties)
 from grid.chronicle import CHRONICLE_EVERY_TICKS
 from grid.distill import Event, Snapshot
@@ -191,6 +193,21 @@ class RefusingMind(FakeMind):
     def remember(self, text, tags, *, category="grid"):
         self.remembered.append((text, tags))
         return False
+
+
+class ClosedBus(FakeBus):
+    """The client gave up reconnecting; nothing will be delivered again."""
+
+    async def publish(self, subject, payload):
+        from grid.natsio import BusClosed
+        raise BusClosed("connection closed for good")
+
+
+async def test_closed_bus_is_fatal_not_dropped():
+    from grid.natsio import BusClosed
+    bridge = Bridge(cfg(), bus=ClosedBus(), mind=FakeMind())
+    with pytest.raises(BusClosed):
+        await bridge.handle_state(state())
 
 
 async def test_refused_publish_is_dropped_not_raised():

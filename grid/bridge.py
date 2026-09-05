@@ -22,7 +22,7 @@ from .distill import Distiller, Event, Snapshot
 from .envelope import envelope, slug, subject
 from .flux import Flux
 from .mind import REMEMBER_MIN_INTERVAL_S, Mind, MindError, Throttle
-from .natsio import Bus, BusError
+from .natsio import Bus, BusClosed, BusError
 
 log = logging.getLogger("grid.bridge")
 
@@ -114,6 +114,8 @@ class Bridge:
         subj = subject(self.colony, "event", event.kind)
         try:
             await self.bus.publish(subj, self._env(event.epoch, event.tick, kind=event.kind, **event.fields))
+        except BusClosed:
+            raise
         except BusError as e:
             log.error("dropped %s: %s", subj, e)
             return
@@ -144,6 +146,8 @@ class Bridge:
         extra = {k: v for k, v in props.items() if k not in ("epoch", "tick")}
         try:
             await self.bus.publish(subject(self.colony, "state"), self._env(snap.epoch, snap.tick, **extra))
+        except BusClosed:
+            raise
         except BusError as e:
             log.error("state publish failed: %s", e)
         if self.flux is not None:
@@ -169,6 +173,8 @@ class Bridge:
             q = chron.question(kind, colony=self.colony, epoch=snap.epoch, tick=snap.tick, since_tick=since)
             try:
                 raw = await self.mind.ask(q, recall_query=f"colony {self.colony} epoch {snap.epoch}")
+            except BusClosed:
+                raise
             except (MindError, BusError) as e:
                 log.warning("chronicle %s: mind unavailable: %s", kind, e)
                 continue
@@ -180,6 +186,8 @@ class Bridge:
             try:
                 await self.bus.publish(subject(self.colony, "chronicle", kind),
                                        self._env(snap.epoch, snap.tick, text=answer, since_tick=since))
+            except BusClosed:
+                raise
             except BusError as e:
                 log.error("chronicle %s publish failed: %s", kind, e)
         return out
@@ -210,6 +218,8 @@ async def _stream(cfg: BridgeConfig, bridge: Bridge) -> None:
                 data = line[len("data:"):].strip()
                 try:
                     await bridge.handle_state(json.loads(data))
+                except BusClosed:       # fatal: the caller exits for a systemd restart
+                    raise
                 except Exception as e:  # one bad frame must not cost the connection
                     log.warning("skipped unreadable frame: %s", e)
                     continue
@@ -222,6 +232,8 @@ async def _stream(cfg: BridgeConfig, bridge: Bridge) -> None:
                         r = await client.get(f"{cfg.colony_url}/api/history")
                         r.raise_for_status()
                         await bridge.poll_history(r.json())
+                    except BusClosed:
+                        raise
                     except Exception as e:
                         log.warning("history poll failed: %s", e)
                     last_history = now
@@ -230,7 +242,15 @@ async def _stream(cfg: BridgeConfig, bridge: Bridge) -> None:
 
 async def run(cfg: BridgeConfig) -> None:
     bus = Bus(cfg.nats_url, user=cfg.nats_user, password=cfg.nats_password)
-    await bus.connect()
+    backoff = 1.0
+    while True:
+        try:
+            await bus.connect()
+            break
+        except Exception as e:      # a boot-time DNS or NATS blip must not burn a start slot
+            log.error("nats connect failed: %s; retrying in %.0fs", e, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
     mind = Mind(cfg.mind_agent_id or "grid-unbound", bus, kannaka_bin=cfg.kannaka_bin,
                 data_dir=Path(cfg.mind_data_dir) if cfg.mind_data_dir else None)
     flux = Flux(cfg.flux_url) if cfg.flux_url else None
@@ -242,6 +262,9 @@ async def run(cfg: BridgeConfig) -> None:
         try:
             await _stream(cfg, bridge)
             backoff = 1.0
+        except BusClosed as e:      # EX_TEMPFAIL: only a restart gets a live client back
+            log.error("nats gave up: %s; exiting for systemd to restart", e)
+            raise SystemExit(75) from e
         except Exception as e:
             log.error("stream dropped: %s; reconnecting in %.0fs", e, backoff)
             await asyncio.sleep(backoff)

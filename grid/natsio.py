@@ -6,11 +6,15 @@ like success and data was lost with the process still healthy. Not here.
 """
 from __future__ import annotations
 
+import collections
 import json
+import logging
 from typing import Any, Callable
 
 import nats
 import nats.errors
+
+log = logging.getLogger("grid.natsio")
 
 
 class BusError(Exception):
@@ -19,6 +23,10 @@ class BusError(Exception):
 
 class BusTimeout(BusError):
     pass
+
+
+class BusClosed(BusError):
+    """The client gave up reconnecting; only a process restart fixes it."""
 
 
 def _encode(payload: dict) -> bytes:
@@ -33,9 +41,30 @@ class Bus:
         self.password = password
         self._connect = connect
         self._nc = None
+        self._errors: collections.deque[str] = collections.deque(maxlen=64)
 
     async def connect(self) -> None:
-        kwargs: dict[str, Any] = {"servers": [self.url], "name": "kannaka-grid"}
+        async def on_disconnected() -> None:
+            log.warning("nats disconnected from %s; reconnecting", self.url)
+
+        async def on_reconnected() -> None:
+            log.info("nats reconnected to %s", self.url)
+
+        async def on_closed() -> None:
+            log.warning("nats connection to %s closed for good", self.url)
+
+        async def on_error(e: Exception) -> None:
+            self._errors.append(str(e))
+            log.warning("nats error: %s", e)
+
+        kwargs: dict[str, Any] = {
+            "servers": [self.url], "name": "kannaka-grid",
+            # 60 attempts x 2 s is two minutes; after that nats-py closes the
+            # client for good and every publish fails silently forever.
+            "max_reconnect_attempts": -1, "reconnect_time_wait": 2,
+            "disconnected_cb": on_disconnected, "reconnected_cb": on_reconnected,
+            "closed_cb": on_closed, "error_cb": on_error,
+        }
         if self.user:
             kwargs["user"] = self.user
             kwargs["password"] = self.password
@@ -48,6 +77,8 @@ class Bus:
 
     async def publish(self, subject: str, payload: dict) -> None:
         nc = self._require()
+        if nc.is_closed:
+            raise BusClosed("connection closed for good")
         try:
             await nc.publish(subject, _encode(payload))
             await nc.flush(timeout=5)
@@ -56,6 +87,8 @@ class Bus:
 
     async def request(self, subject: str, payload: dict, timeout_s: float) -> dict:
         nc = self._require()
+        if nc.is_closed:
+            raise BusClosed("connection closed for good")
         try:
             msg = await nc.request(subject, _encode(payload), timeout=timeout_s)
         except nats.errors.TimeoutError as e:

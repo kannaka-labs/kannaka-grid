@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .envelope import envelope, subject
 from .mind import ASK_TIMEOUT_S, Mind, MindError
-from .natsio import Bus, BusError, BusTimeout
+from .natsio import Bus, BusClosed, BusError, BusTimeout
 from .proposal import Rejection, parse_request, render_prompt, validate, write_proposal
 
 log = logging.getLogger("grid.odin")
@@ -41,6 +41,8 @@ class Relay:
             await self.bus.publish(subject(self.colony, "event", f"odin.{kind}"),
                                    envelope(agent_id=self.agent_id, colony=self.colony,
                                             epoch=epoch, tick=tick, kind=f"odin.{kind}", **fields))
+        except BusClosed:
+            raise
         except BusError as e:
             log.error("odin.%s publish failed: %s", kind, e)
 
@@ -62,6 +64,8 @@ class Relay:
         prompt = render_prompt(req, recall)
         try:
             reply = await self.mind.ask(prompt, recall_query=f"colony {self.colony}", timeout_s=self.timeout_s)
+        except BusClosed:
+            raise
         except (BusTimeout, BusError, MindError) as e:
             log.warning("mind unavailable for %s: %s; retry in %.0fs", req.request_id, e, self.retry_after_s)
             self._retry_not_before[req.request_id] = self._clock() + self.retry_after_s
@@ -110,7 +114,15 @@ class RelayConfig:
 
 async def run(cfg: RelayConfig) -> None:
     bus = Bus(cfg.nats_url, user=cfg.nats_user, password=cfg.nats_password)
-    await bus.connect()
+    backoff = 1.0
+    while True:
+        try:
+            await bus.connect()
+            break
+        except Exception as e:      # a boot-time DNS or NATS blip must not burn a start slot
+            log.error("nats connect failed: %s; retrying in %.0fs", e, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
     mind = Mind(cfg.agent_id, bus)
     relay = Relay(cfg.queue, colony=cfg.colony, agent_id=cfg.agent_id, mind=mind, bus=bus)
     log.info("watching %s for %s", cfg.queue, cfg.agent_id)
@@ -119,6 +131,9 @@ async def run(cfg: RelayConfig) -> None:
             outcome = await relay.poll_once()
             if outcome:
                 log.info("%s", outcome)
+        except BusClosed as e:  # EX_TEMPFAIL: only a restart gets a live client back
+            log.error("nats gave up: %s; exiting for systemd to restart", e)
+            raise SystemExit(75) from e
         except Exception as e:  # one bad poll must not kill the relay
             log.exception("poll failed: %s", e)
         await asyncio.sleep(cfg.poll_s)
