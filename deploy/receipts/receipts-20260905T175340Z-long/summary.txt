@@ -1,0 +1,13 @@
+capture: {'subject': 'GRID.>', 'seconds': 2100.0, 'messages': 76}
+    1  GRID.colony-one.chronicle.event
+    1  GRID.colony-one.chronicle.topic
+    1  GRID.colony-one.event.genome.novel
+    6  GRID.colony-one.event.lineage.extinct
+   23  GRID.colony-one.event.odin.proposed
+    1  GRID.colony-one.event.odin.rejected
+    5  GRID.colony-one.event.population.crash
+    3  GRID.colony-one.event.storm
+    1  GRID.colony-one.event.task.solved
+   34  GRID.colony-one.state
+ticks 907 -> 3403 | storms 0 -> 3 | pop 280 -> 515
+receipt 2 storm: True | receipt 5 chronicle kinds: ['event', 'topic']
