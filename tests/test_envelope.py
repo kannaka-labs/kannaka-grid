@@ -35,3 +35,8 @@ def test_envelope_refuses_field_that_shadows_envelope_key():
         envelope(agent_id="a", colony="c", epoch=0, tick=0, **{"ts": 1})
     with pytest.raises(ValueError):
         envelope(agent_id="a", colony="c", epoch=0, tick=0, **{"schema_version": "2.0"})
+
+
+def test_envelope_requires_identity_keys():
+    with pytest.raises(TypeError):
+        envelope(colony="c", epoch=0, tick=0)   # agent_id missing

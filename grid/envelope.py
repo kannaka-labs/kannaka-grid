@@ -30,18 +30,17 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def envelope(**all_args) -> dict:
-    ts_ms = all_args.pop('ts_ms', None)
-    fields = all_args
-
-    required = {"agent_id", "colony", "epoch", "tick"}
-    extra_keys = fields.keys() - required
-    clash = _RESERVED & extra_keys
+def envelope(*, agent_id: str, colony: str, epoch: int, tick: int,
+             ts_ms: int | None = None, **fields) -> dict:
+    clash = _RESERVED & fields.keys()
     if clash:
         raise ValueError(f"fields would overwrite envelope keys: {sorted(clash)}")
-
     return {
         "schema_version": SCHEMA_VERSION,
         "ts": now_ms() if ts_ms is None else ts_ms,
+        "agent_id": agent_id,
+        "colony": colony,
+        "epoch": epoch,
+        "tick": tick,
         **fields,
     }
