@@ -7,11 +7,14 @@ the daemon using kannaka's existing ask/recall contract.
 """
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import time
 from pathlib import Path
 from typing import Callable
+
+log = logging.getLogger("grid.mind")
 
 ASK_TIMEOUT_S = 180.0
 REMEMBER_MIN_INTERVAL_S = 300.0
@@ -53,7 +56,11 @@ class Mind:
         env = dict(os.environ)
         if self.data_dir is not None:
             env["KANNAKA_DATA_DIR"] = str(self.data_dir)
-        result = self._run(cmd, env=env, capture_output=True, text=True, timeout=60)
+        try:
+            result = self._run(cmd, env=env, capture_output=True, text=True, timeout=60)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log.warning("kannaka remember failed to run: %s", e)
+            return False
         return result.returncode == 0
 
     async def ask(self, text: str, *, recall_query: str | None = None,

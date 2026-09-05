@@ -62,6 +62,17 @@ def test_remember_reports_failure():
     assert mind.remember("x", []) is False
 
 
+def test_remember_returns_false_when_runner_raises():
+    def hangs(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, 60)
+
+    def missing(cmd, **kw):
+        raise FileNotFoundError("kannaka")
+
+    assert Mind("m", FakeBus(), runner=hangs).remember("x", []) is False
+    assert Mind("m", FakeBus(), runner=missing).remember("x", []) is False
+
+
 async def test_ask_sends_kannaka_contract_and_returns_text():
     bus = FakeBus(reply={"from": "grid-colony-one", "text": "  fork earlier  ", "mode_used": "full_recall_no_tools"})
     mind = Mind("grid-colony-one", bus)
