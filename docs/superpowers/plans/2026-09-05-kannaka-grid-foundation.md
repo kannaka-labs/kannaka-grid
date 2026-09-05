@@ -199,7 +199,14 @@ def test_envelope_defaults_ts_to_now():
 
 def test_envelope_refuses_field_that_shadows_envelope_key():
     with pytest.raises(ValueError):
-        envelope(agent_id="a", colony="c", epoch=0, tick=0, **{"agent_id": "x"})
+        envelope(agent_id="a", colony="c", epoch=0, tick=0, **{"ts": 1})
+    with pytest.raises(ValueError):
+        envelope(agent_id="a", colony="c", epoch=0, tick=0, **{"schema_version": "2.0"})
+
+
+def test_envelope_requires_identity_keys():
+    with pytest.raises(TypeError):
+        envelope(colony="c", epoch=0, tick=0)   # agent_id missing
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -262,7 +269,7 @@ def envelope(*, agent_id: str, colony: str, epoch: int, tick: int,
 - [ ] **Step 4: Run to verify they pass**
 
 Run: `python -m pytest tests/test_envelope.py -q`
-Expected: `6 passed`
+Expected: `7 passed`
 
 - [ ] **Step 5: Mutation check, then commit**
 
@@ -407,18 +414,23 @@ def test_genome_novel_fires_on_new_epoch_high_only():
     assert kinds(d.feed(snap(tick=4, dominant="abcyz", ancestor="abc"))) == ["genome.novel"]
 
 
+def crash_snap(tick: int, pop: int) -> Snapshot:
+    """A snapshot whose strains sum to its population, so no lineage ever passes 0.5."""
+    return snap(tick=tick, population=pop, strains=[pop // 2, pop - pop // 2])
+
+
 def test_population_crash_within_window_then_rearms():
     d = Distiller()
-    d.feed(snap(tick=0, population=100))
-    assert kinds(d.feed(snap(tick=50, population=70))) == []            # 30% drop: no
-    ev = d.feed(snap(tick=60, population=59))                           # 41% drop from 100
+    d.feed(crash_snap(0, 100))
+    assert kinds(d.feed(crash_snap(50, 70))) == []            # 30% drop: no
+    ev = d.feed(crash_snap(60, 59))                           # 41% drop from 100
     assert kinds(ev) == ["population.crash"]
     assert ev[0].fields == {"from": 100, "to": 59}
-    assert kinds(d.feed(snap(tick=70, population=40))) == []            # already fired
+    assert kinds(d.feed(crash_snap(70, 40))) == []            # already fired
     # after the window passes, a fresh crash counts again
-    d.feed(snap(tick=60 + CRASH_WINDOW_TICKS + 1, population=40))
-    d.feed(snap(tick=60 + CRASH_WINDOW_TICKS + 2, population=40))
-    assert kinds(d.feed(snap(tick=60 + CRASH_WINDOW_TICKS + 3, population=20))) == ["population.crash"]
+    d.feed(crash_snap(60 + CRASH_WINDOW_TICKS + 1, 40))
+    d.feed(crash_snap(60 + CRASH_WINDOW_TICKS + 2, 40))
+    assert kinds(d.feed(crash_snap(60 + CRASH_WINDOW_TICKS + 3, 20))) == ["population.crash"]
 
 
 def test_signal_dialect_needs_two_consecutive_hot_buckets_and_rearms():
@@ -1574,11 +1586,14 @@ the daemon using kannaka's existing ask/recall contract.
 """
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import time
 from pathlib import Path
 from typing import Callable
+
+log = logging.getLogger("grid.mind")
 
 ASK_TIMEOUT_S = 180.0
 REMEMBER_MIN_INTERVAL_S = 300.0
@@ -1620,7 +1635,11 @@ class Mind:
         env = dict(os.environ)
         if self.data_dir is not None:
             env["KANNAKA_DATA_DIR"] = str(self.data_dir)
-        result = self._run(cmd, env=env, capture_output=True, text=True, timeout=60)
+        try:
+            result = self._run(cmd, env=env, capture_output=True, text=True, timeout=60)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log.warning("kannaka remember failed to run: %s", e)
+            return False
         return result.returncode == 0
 
     async def ask(self, text: str, *, recall_query: str | None = None,
@@ -1647,7 +1666,7 @@ class Mind:
 - [ ] **Step 4: Run to verify they pass**
 
 Run: `python -m pytest tests/test_mind.py -q`
-Expected: `8 passed`
+Expected: `9 passed`
 
 - [ ] **Step 5: Mutation check, then commit**
 
@@ -1673,7 +1692,7 @@ git commit -m "feat: mind client (remember via CLI, ask/recall via NATS) and thr
   - `memory_text(event: Event) -> str` — the one-line fact remembered per event.
   - `state_properties(snap: Snapshot) -> dict` — the scalar fields sent to Flux and `GRID.<colony>.state`.
   - `BridgeConfig` dataclass + `BridgeConfig.from_env() -> BridgeConfig`.
-  - `class Bridge(cfg, *, bus, mind, flux=None, distiller=None, throttle=None, clock=time.monotonic)` with `async handle_state(state: dict) -> list[Event]`, `async publish_state(snap) -> None`, `async poll_history(summary: dict) -> list[Event]`, `async chronicle(snap) -> dict[str, str]`, `agent_id`, `colony` set on first state.
+  - `class Bridge(cfg, *, bus, mind, flux=None, distiller=None, throttle=None, clock=time.monotonic)` with `async handle_state(state: dict) -> list[Event]`, `async publish_state(snap) -> None`, `async poll_history(summary: dict) -> list[Event]`, `async maybe_chronicle() -> dict[str, str]`, `schedule_chronicle() -> None` (runs `maybe_chronicle` as a single in-flight asyncio task), `agent_id`, `colony` set on first state.
   - `async run(cfg)` — the daemon loop; `main()` entry.
 
 Environment (all read in `BridgeConfig.from_env`): `COLONY_URL` (default `http://127.0.0.1:8787`), `NATS_URL` (default `nats://swarm.ninja-portal.com:4222`), `NATS_USER`, `NATS_PASSWORD`, `FLUX_URL` (optional), `MIND_AGENT_ID` (default `grid-<colony>` once the name is known; override allowed), `MIND_DATA_DIR`, `KANNAKA_BIN` (default `kannaka`), `STATE_EVERY_S` (60), `HISTORY_EVERY_S` (60).
@@ -1850,6 +1869,81 @@ async def test_poll_history_publishes_dialect_events():
     assert bus.published[-1][0] == "GRID.colony-one.event.signal.dialect"
 
 
+class FailingBus(FakeBus):
+    """Refuses every publish, the way a NATS permissions error surfaces."""
+
+    async def publish(self, subject, payload):
+        from grid.natsio import BusError
+        raise BusError("permissions violation")
+
+
+class FailingFlux(FakeFlux):
+    async def upsert(self, entity_id, properties):
+        raise RuntimeError("flux down")
+
+
+class BusErrorMind(FakeMind):
+    """Every ask fails the way a dead daemon does (timeout is a BusError subclass)."""
+
+    async def ask(self, text, *, recall_query=None, timeout_s=180.0):
+        from grid.natsio import BusTimeout
+        raise BusTimeout("no reply")
+
+
+class RefusingMind(FakeMind):
+    def remember(self, text, tags, *, category="grid"):
+        self.remembered.append((text, tags))
+        return False
+
+
+async def test_refused_publish_is_dropped_not_raised():
+    bridge = Bridge(cfg(), bus=FailingBus(), mind=FakeMind())
+    events = await bridge.handle_state(state())
+    assert [e.kind for e in events] == ["epoch.started", "lineage.sweep"]
+
+
+async def test_flux_failure_does_not_block_state_publish():
+    bus = FakeBus()
+    bridge = Bridge(cfg(), bus=bus, mind=FakeMind(), flux=FailingFlux())
+    await bridge.handle_state(state())
+    await bridge.publish_state(bridge.last)
+    assert bus.published[-1][0] == "GRID.colony-one.state"
+
+
+async def test_chronicle_skips_kinds_whose_ask_fails():
+    bus = FakeBus()
+    bridge = Bridge(cfg(), bus=bus, mind=BusErrorMind())
+    await bridge.handle_state(state(tick=CHRONICLE_EVERY_TICKS))
+    assert await bridge.maybe_chronicle() == {}
+    assert not [s for s, _ in bus.published if ".chronicle." in s]
+
+
+async def test_refused_memory_still_publishes_event():
+    bus, mind = FakeBus(), RefusingMind()
+    bridge = Bridge(cfg(), bus=bus, mind=mind)
+    await bridge.handle_state(state())
+    assert len(bus.published) == 2 and len(mind.remembered) == 2
+
+
+async def test_schedule_chronicle_spawns_at_most_one_task():
+    import asyncio
+    bridge = Bridge(cfg(), bus=FakeBus(), mind=FakeMind(answers={
+        "What is this epoch about": "A slow squeeze.",
+        "Name the capability": "fork early via fork.",
+        "single most important": "Sweep at tick 1900."}))
+    await bridge.handle_state(state(tick=CHRONICLE_EVERY_TICKS))
+    bridge.schedule_chronicle()
+    first = bridge._chronicle_task
+    bridge.schedule_chronicle()
+    assert bridge._chronicle_task is first
+    await first
+    assert [s for s, _ in bridge.bus.published if ".chronicle." in s] == [
+        "GRID.colony-one.chronicle.topic", "GRID.colony-one.chronicle.skill",
+        "GRID.colony-one.chronicle.event"]
+    bridge.schedule_chronicle()          # same phase: nothing new spawned
+    assert bridge._chronicle_task is first
+
+
 def test_config_from_env_defaults(monkeypatch):
     for k in ("COLONY_URL", "NATS_URL", "NATS_USER", "NATS_PASSWORD", "FLUX_URL", "MIND_AGENT_ID",
               "MIND_DATA_DIR", "KANNAKA_BIN", "STATE_EVERY_S", "HISTORY_EVERY_S"):
@@ -1965,6 +2059,7 @@ class Bridge:
         self.isa: list[str] = []
         self._chronicled_phase: int = -1
         self._last_chronicle_tick: int = 0
+        self._chronicle_task: asyncio.Task | None = None
 
     # -- identity ------------------------------------------------------------
 
@@ -2055,6 +2150,17 @@ class Bridge:
                 log.error("chronicle %s publish failed: %s", kind, e)
         return out
 
+    def schedule_chronicle(self) -> None:
+        """Run the chronicle off the stream path; at most one in flight."""
+        if self._chronicle_task is not None and not self._chronicle_task.done():
+            return
+        if self.last is None:
+            return
+        phase = self.last.tick // chron.CHRONICLE_EVERY_TICKS
+        if phase == 0 or phase == self._chronicled_phase:
+            return
+        self._chronicle_task = asyncio.create_task(self.maybe_chronicle())
+
 
 # -- daemon --------------------------------------------------------------------
 
@@ -2065,21 +2171,27 @@ async def _stream(cfg: BridgeConfig, bridge: Bridge) -> None:
             response.raise_for_status()
             last_state, last_history = 0.0, 0.0
             async for line in response.aiter_lines():
-                for data in iter_sse_data([line]):
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                try:
                     await bridge.handle_state(json.loads(data))
-                    now = time.monotonic()
-                    if now - last_state >= cfg.state_every_s and bridge.last is not None:
-                        await bridge.publish_state(bridge.last)
-                        last_state = now
-                    if now - last_history >= cfg.history_every_s:
-                        try:
-                            r = await client.get(f"{cfg.colony_url}/api/history")
-                            r.raise_for_status()
-                            await bridge.poll_history(r.json())
-                        except Exception as e:
-                            log.warning("history poll failed: %s", e)
-                        last_history = now
-                    await bridge.maybe_chronicle()
+                except Exception as e:  # one bad frame must not cost the connection
+                    log.warning("skipped unreadable frame: %s", e)
+                    continue
+                now = time.monotonic()
+                if now - last_state >= cfg.state_every_s and bridge.last is not None:
+                    await bridge.publish_state(bridge.last)
+                    last_state = now
+                if now - last_history >= cfg.history_every_s:
+                    try:
+                        r = await client.get(f"{cfg.colony_url}/api/history")
+                        r.raise_for_status()
+                        await bridge.poll_history(r.json())
+                    except Exception as e:
+                        log.warning("history poll failed: %s", e)
+                    last_history = now
+                bridge.schedule_chronicle()
 
 
 async def run(cfg: BridgeConfig) -> None:
@@ -2115,7 +2227,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run to verify they pass**
 
 Run: `python -m pytest tests/test_bridge.py -q`
-Expected: `10 passed`
+Expected: `15 passed`
 
 - [ ] **Step 5: Mutation checks, then commit**
 
@@ -2445,8 +2557,9 @@ Why: thegrid's `SubstrateWorld.__init__` calls `cpu_temperature_c()`, which rais
 ```python
 # tests/test_launcher.py
 import types
+from pathlib import Path
 
-from grid.launcher import heat_proxy_from_cpu, install_heat_proxy
+from grid.launcher import _cgroup_cpu_fraction, heat_proxy_from_cpu, install_heat_proxy
 
 
 def test_heat_proxy_maps_cpu_fraction_to_celsius():
@@ -2468,6 +2581,33 @@ def test_install_replaces_missing_sensor_with_proxy():
     mod = types.SimpleNamespace(cpu_temperature_c=absent)
     assert install_heat_proxy(mod, cpu_fraction=lambda: 0.5) == "proxy"
     assert mod.cpu_temperature_c() == 65.0
+
+
+def write_cgroup(tmp_path: Path, usage_usec: int) -> tuple[Path, Path]:
+    cgroup_file = tmp_path / "proc-self-cgroup"
+    cgroup_file.write_text("0::/system.slice/thegrid-colony.service\n")
+    root = tmp_path / "sys-fs-cgroup"
+    stat_dir = root / "system.slice" / "thegrid-colony.service"
+    stat_dir.mkdir(parents=True, exist_ok=True)
+    (stat_dir / "cpu.stat").write_text(f"usage_usec {usage_usec}\nuser_usec 1\n")
+    return cgroup_file, root
+
+
+def test_sampler_seeds_baseline_so_first_sample_is_not_full_heat(tmp_path):
+    cgroup_file, root = write_cgroup(tmp_path, 5_000_000)
+    t = [100.0]
+    sample = _cgroup_cpu_fraction(cgroup_file=cgroup_file, cgroup_root=root, clock=lambda: t[0])
+    t[0] = 101.0
+    assert sample() == 0.0                          # no usage since construction
+    write_cgroup(tmp_path, 5_500_000)
+    t[0] = 102.0
+    assert sample() == 0.5                          # 0.5 s of CPU over 1 s
+
+
+def test_sampler_never_raises_when_cgroup_files_are_missing(tmp_path):
+    sample = _cgroup_cpu_fraction(cgroup_file=tmp_path / "absent", cgroup_root=tmp_path / "nowhere")
+    assert sample() == 0.0
+    assert heat_proxy_from_cpu(sample)() == 45.0
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -2506,25 +2646,43 @@ def heat_proxy_from_cpu(sample: Callable[[], float]) -> Callable[[], float]:
     return proxy
 
 
-def _cgroup_cpu_fraction() -> Callable[[], float]:
-    """Fraction of one CPU this service's cgroup used since the last call."""
-    cgroup = Path("/sys/fs/cgroup")
-    for line in Path("/proc/self/cgroup").read_text().splitlines():
-        if line.startswith("0::"):
-            cgroup = cgroup / line[3:].lstrip("/")
-    last = [time.monotonic(), 0]
+def _cgroup_cpu_fraction(*, cgroup_file: Path = Path("/proc/self/cgroup"),
+                         cgroup_root: Path = Path("/sys/fs/cgroup"),
+                         clock: Callable[[], float] = time.monotonic) -> Callable[[], float]:
+    """Fraction of one CPU this service's cgroup used since the previous sample.
 
-    def read_usec() -> int:
-        for row in (cgroup / "cpu.stat").read_text().splitlines():
-            if row.startswith("usage_usec"):
-                return int(row.split()[1])
-        return 0
+    Never raises: the proxy exists to keep the colony alive, so a missing or
+    unreadable cgroup file reads as "no change since last time".
+    """
+    cgroup = cgroup_root
+    try:
+        for line in cgroup_file.read_text().splitlines():
+            if line.startswith("0::"):
+                cgroup = cgroup_root / line[3:].lstrip("/")
+    except OSError:
+        pass
+
+    def read_usec() -> int | None:
+        try:
+            for row in (cgroup / "cpu.stat").read_text().splitlines():
+                if row.startswith("usage_usec"):
+                    return int(row.split()[1])
+        except (OSError, ValueError, IndexError):
+            return None
+        return None
+
+    last = [clock(), read_usec() or 0]
+    fraction = [0.0]
 
     def sample() -> float:
-        now, usec = time.monotonic(), read_usec()
+        now, usec = clock(), read_usec()
+        if usec is None:
+            return fraction[0]
         elapsed, delta = now - last[0], usec - last[1]
         last[0], last[1] = now, usec
-        return (delta / 1_000_000) / elapsed if elapsed > 0 else 0.0
+        if elapsed > 0 and delta >= 0:
+            fraction[0] = (delta / 1_000_000) / elapsed
+        return fraction[0]
     return sample
 
 
@@ -2555,7 +2713,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run to verify they pass**
 
 Run: `python -m pytest tests/test_launcher.py -q`
-Expected: `3 passed`
+Expected: `5 passed`
 
 - [ ] **Step 5: Commit**
 
