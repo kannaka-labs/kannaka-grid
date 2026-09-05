@@ -45,7 +45,7 @@ sudo systemctl enable --now grid-bridge.service grid-odin.service
 ```
 Receipts (acceptance criteria, spec §12):
 1. `journalctl -u grid-bridge -f` shows no `dropped` lines; from the operator seat, `kannaka swarm tail --subject 'GRID.>'` (or the nats app's capture) shows `GRID.colony-one.event.epoch.started` then `.state` every 60 s.
-2. Storms fire when host load rises (≈ +4 % of all CPUs sustained lifts the proxy ≥ 1.5 °C). Force one: `timeout 30 python3 -c 'while True: pass'` in two shells, then within ~1000 ticks `GRID.colony-one.event.storm` appears.
+2. Storms fire when host load rises: the proxy maps whole-host CPU to 45–85 °C and thegrid's substrate needs its fast thermal average (alpha 0.001 per tick ≈ 1000 ticks ≈ 100 s at 10 ticks/s) to climb ≥ 1.5 °C over the slow baseline. A short burst cannot do that. Force one with a full core held for three minutes: `timeout 180 python3 -c 'while True: pass'` (one core ≈ 17 % of Skywave's 6 CPUs ≈ +6.7 °C step). `GRID.colony-one.event.storm` appears during the burst or within ~1000 ticks after it.
 3. `KANNAKA_DATA_DIR=/srv/grid/colony-one/memory kannaka status` shows memory count rising; `kannaka recall "storm"` against that dir returns a colony fact.
 4. `ls /srv/grid/colony-one/state/operator` shows `request.json` then `proposal.json`; both vanish from the operator dir after a later birth (thegrid consumes them together); `journalctl -u grid-odin` shows `proposed`; `curl -s 127.0.0.1:8787/api/history | python3 -c "import json,sys; print(json.load(sys.stdin)['mutationMechanisms'])"` lists the mutation types thegrid recorded for the epoch.
 5. After tick 2000, three `GRID.colony-one.chronicle.*` messages appear.

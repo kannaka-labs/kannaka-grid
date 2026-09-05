@@ -362,13 +362,17 @@ fixed on `feat/foundation`:
    localhost.
 2. `GRID.<colony>.event.*` messages appear on the swarm bus for at least
    `epoch.started`, `storm`, and one of `lineage.sweep` / `task.solved` during
-   a real run. A storm can be forced for the receipt by running a 30 s CPU burst
-   on the host (`stress-ng --cpu 4 --timeout 30` or a tight Python loop).
+   a real run. A storm can be forced for the receipt by holding one full core
+   busy for three minutes (`timeout 180 python3 -c 'while True: pass'`): the
+   substrate's fast thermal average moves on a ~1000-tick scale, so a 30 s burst
+   is too short to lift it the 1.5 °C the storm trigger needs.
 3. The mind's memory count grows from bridge writes; `kannaka recall` on the
    mind returns colony facts.
 4. At least one `proposal.json` is written by the relay from a real
-   `request.json`, and thegrid's own telemetry shows `accepted ≥ 1` for the
-   Odin mutator.
+   `request.json`, and both files then vanish from the operator dir at a later
+   birth (thegrid consumes them together). `Habitat.snapshot()` exposes no
+   mutator counters, so the receipt is the files plus `journalctl -u grid-odin`
+   showing `proposed`, plus `/api/history`'s `mutationMechanisms` for the epoch.
 5. Three chronicle messages (topic, skill, event) publish after a climate
    phase.
 6. Stopping the mind, bridge, or relay does not change the colony's tick rate
