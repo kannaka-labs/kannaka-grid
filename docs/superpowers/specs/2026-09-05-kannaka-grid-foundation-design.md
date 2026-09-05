@@ -284,10 +284,16 @@ earlier text where they differ.
   calls `cpu_temperature_c()`, which raises when no `k10temp` hwmon exists, and
   `live.main()` hard-codes `physical=True`. A Proxmox VM has no such sensor.
   v0.1 therefore runs the colony through `grid/launcher.py`, which imports
-  thegrid as a library and replaces only `substrate.cpu_temperature_c` with a
-  cgroup-CPU-derived proxy when the real one raises. Memory pressure and CPU
-  usage stay real cgroup readings. thegrid's source is untouched. This is the
-  first thing to raise upstream (a `--heat simulated` flag would retire the launcher).
+  thegrid as a library and replaces only `substrate.cpu_temperature_c` when the
+  real one raises. The proxy is **whole-host CPU read from `/proc/stat`**, mapped
+  to 45-85 C: thegrid's substrate fires storms when its heat EMA rises 1.5 C over
+  a slow baseline, and the colony's own 5 % CPU quota cannot move that number at
+  all, so a cgroup-derived proxy could never produce `storm` or
+  `thermal.throttle`. Reading the host makes the mind's LLM calls and Skywave's
+  other tenants the colony's weather, which is what thegrid means by "the weather
+  is Odin itself". Memory pressure and CPU usage stay real cgroup readings.
+  thegrid's source is untouched. This is the first thing to raise upstream (a
+  `--heat simulated` flag would retire the launcher).
 - **Bind address is a CLI flag** (`--host`), so the observer binds `127.0.0.1`. §3.1's
   "to be verified" is resolved.
 - **Odin queue path** is `<state dir>/operator/`, derived from `--state`'s parent
@@ -329,7 +335,8 @@ earlier text where they differ.
    localhost.
 2. `GRID.<colony>.event.*` messages appear on the swarm bus for at least
    `epoch.started`, `storm`, and one of `lineage.sweep` / `task.solved` during
-   a real run.
+   a real run. A storm can be forced for the receipt by running a 30 s CPU burst
+   on the host (`stress-ng --cpu 4 --timeout 30` or a tight Python loop).
 3. The mind's memory count grows from bridge writes; `kannaka recall` on the
    mind returns colony facts.
 4. At least one `proposal.json` is written by the relay from a real

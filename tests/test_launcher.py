@@ -1,7 +1,7 @@
 import types
 from pathlib import Path
 
-from grid.launcher import _cgroup_cpu_fraction, heat_proxy_from_cpu, install_heat_proxy
+from grid.launcher import _host_cpu_fraction, heat_proxy_from_cpu, install_heat_proxy
 
 
 def test_heat_proxy_maps_cpu_fraction_to_celsius():
@@ -25,28 +25,31 @@ def test_install_replaces_missing_sensor_with_proxy():
     assert mod.cpu_temperature_c() == 65.0
 
 
-def write_cgroup(tmp_path: Path, usage_usec: int) -> tuple[Path, Path]:
-    cgroup_file = tmp_path / "proc-self-cgroup"
-    cgroup_file.write_text("0::/system.slice/thegrid-colony.service\n")
-    root = tmp_path / "sys-fs-cgroup"
-    stat_dir = root / "system.slice" / "thegrid-colony.service"
-    stat_dir.mkdir(parents=True, exist_ok=True)
-    (stat_dir / "cpu.stat").write_text(f"usage_usec {usage_usec}\nuser_usec 1\n")
-    return cgroup_file, root
+def write_stat(path: Path, busy: int, idle: int) -> None:
+    """A /proc/stat-shaped file: user nice system idle iowait irq softirq steal."""
+    lines = [f"cpu  {busy} 0 0 {idle} 0 0 0 0",
+             f"cpu0 {busy} 0 0 {idle} 0 0 0 0",
+             "intr 12345 0 0"]
+    path.write_text("\n".join(lines) + "\n")
 
 
-def test_sampler_seeds_baseline_so_first_sample_is_not_full_heat(tmp_path):
-    cgroup_file, root = write_cgroup(tmp_path, 5_000_000)
-    t = [100.0]
-    sample = _cgroup_cpu_fraction(cgroup_file=cgroup_file, cgroup_root=root, clock=lambda: t[0])
-    t[0] = 101.0
-    assert sample() == 0.0                          # no usage since construction
-    write_cgroup(tmp_path, 5_500_000)
-    t[0] = 102.0
-    assert sample() == 0.5                          # 0.5 s of CPU over 1 s
+def test_host_sampler_seeds_its_baseline_so_the_first_sample_is_not_full_heat(tmp_path):
+    stat = tmp_path / "proc-stat"
+    write_stat(stat, busy=1000, idle=9000)
+    sample = _host_cpu_fraction(stat_path=stat)
+    assert sample() == 0.0                       # nothing moved since construction
+
+    write_stat(stat, busy=1500, idle=9500)       # 500 of 1000 new jiffies were busy
+    assert sample() == 0.5
+
+    proxy = heat_proxy_from_cpu(sample)
+    assert proxy() == 65.0                       # /proc/stat still: hold the last fraction
+
+    write_stat(stat, busy=2500, idle=9500)       # every one of 1000 new jiffies was busy
+    assert proxy() == 85.0
 
 
-def test_sampler_never_raises_when_cgroup_files_are_missing(tmp_path):
-    sample = _cgroup_cpu_fraction(cgroup_file=tmp_path / "absent", cgroup_root=tmp_path / "nowhere")
+def test_host_sampler_never_raises_when_proc_stat_is_missing(tmp_path):
+    sample = _host_cpu_fraction(stat_path=tmp_path / "absent")
     assert sample() == 0.0
     assert heat_proxy_from_cpu(sample)() == 45.0
