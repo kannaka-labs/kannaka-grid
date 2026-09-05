@@ -1,0 +1,3 @@
+[submodule "thegrid"]
+	path = thegrid
+	url = https://github.com/EckmanTechLLC/thegrid.git

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kannaka-grid"
+version = "0.1.0"
+description = "thegrid artificial-life colony as a Kannaka constellation engine"
+requires-python = ">=3.12"
+dependencies = [
+    "nats-py>=2.7",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["grid*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["integration: runs a real thegrid colony; opt in with GRID_INTEGRATION=1"]
