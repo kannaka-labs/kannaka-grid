@@ -120,7 +120,11 @@ class Bridge:
             log.error("dropped %s: %s", subj, e)
             return
         if self.throttle.allow(event.kind):
-            if not self.mind.remember(memory_text(event), [self.colony, event.kind]):
+            # remember() shells out to `kannaka remember` with a 60 s timeout; run
+            # it off the stream-reader coroutine or the whole bridge stalls on it.
+            ok = await asyncio.to_thread(self.mind.remember, memory_text(event),
+                                         [self.colony, event.kind])
+            if not ok:
                 log.warning("mind refused memory for %s", event.kind)
 
     async def handle_state(self, state: dict) -> list[Event]:
