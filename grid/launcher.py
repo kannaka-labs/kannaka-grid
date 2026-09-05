@@ -25,25 +25,43 @@ def heat_proxy_from_cpu(sample: Callable[[], float]) -> Callable[[], float]:
     return proxy
 
 
-def _cgroup_cpu_fraction() -> Callable[[], float]:
-    """Fraction of one CPU this service's cgroup used since the last call."""
-    cgroup = Path("/sys/fs/cgroup")
-    for line in Path("/proc/self/cgroup").read_text().splitlines():
-        if line.startswith("0::"):
-            cgroup = cgroup / line[3:].lstrip("/")
-    last = [time.monotonic(), 0]
+def _cgroup_cpu_fraction(*, cgroup_file: Path = Path("/proc/self/cgroup"),
+                         cgroup_root: Path = Path("/sys/fs/cgroup"),
+                         clock: Callable[[], float] = time.monotonic) -> Callable[[], float]:
+    """Fraction of one CPU this service's cgroup used since the previous sample.
 
-    def read_usec() -> int:
-        for row in (cgroup / "cpu.stat").read_text().splitlines():
-            if row.startswith("usage_usec"):
-                return int(row.split()[1])
-        return 0
+    Never raises: the proxy exists to keep the colony alive, so a missing or
+    unreadable cgroup file reads as "no change since last time".
+    """
+    cgroup = cgroup_root
+    try:
+        for line in cgroup_file.read_text().splitlines():
+            if line.startswith("0::"):
+                cgroup = cgroup_root / line[3:].lstrip("/")
+    except OSError:
+        pass
+
+    def read_usec() -> int | None:
+        try:
+            for row in (cgroup / "cpu.stat").read_text().splitlines():
+                if row.startswith("usage_usec"):
+                    return int(row.split()[1])
+        except (OSError, ValueError, IndexError):
+            return None
+        return None
+
+    last = [clock(), read_usec() or 0]
+    fraction = [0.0]
 
     def sample() -> float:
-        now, usec = time.monotonic(), read_usec()
+        now, usec = clock(), read_usec()
+        if usec is None:
+            return fraction[0]
         elapsed, delta = now - last[0], usec - last[1]
         last[0], last[1] = now, usec
-        return (delta / 1_000_000) / elapsed if elapsed > 0 else 0.0
+        if elapsed > 0 and delta >= 0:
+            fraction[0] = (delta / 1_000_000) / elapsed
+        return fraction[0]
     return sample
 
 
