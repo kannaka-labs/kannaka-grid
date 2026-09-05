@@ -66,6 +66,7 @@ def colony(tmp_path):
     try:
         deadline = time.time() + 30
         while time.time() < deadline:
+            # process has exited, so stderr is at EOF and this read cannot block
             if proc.poll() is not None:
                 pytest.fail(f"colony exited early: {proc.stderr.read()[-2000:]}")
             try:
@@ -74,6 +75,7 @@ def colony(tmp_path):
             except httpx.HTTPError:
                 time.sleep(0.5)
         else:
+            stop()
             pytest.fail(f"colony did not come up: {proc.stderr.read()[-2000:]}")
     except BaseException:
         stop()
