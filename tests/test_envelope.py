@@ -32,4 +32,6 @@ def test_envelope_defaults_ts_to_now():
 
 def test_envelope_refuses_field_that_shadows_envelope_key():
     with pytest.raises(ValueError):
-        envelope(agent_id="a", colony="c", epoch=0, tick=0, **{"agent_id": "x"})
+        envelope(agent_id="a", colony="c", epoch=0, tick=0, **{"ts": 1})
+    with pytest.raises(ValueError):
+        envelope(agent_id="a", colony="c", epoch=0, tick=0, **{"schema_version": "2.0"})
