@@ -1,0 +1,1 @@
+with fusion: 45 ticks/30s · without: 45 ticks/30s

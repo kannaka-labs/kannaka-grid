@@ -1,0 +1,7 @@
+capture: {'subject': 'GRID.>', 'seconds': 300.0, 'messages': 22}
+   11  GRID.colony-one.event.lineage.extinct
+    3  GRID.colony-one.event.odin.proposed
+    1  GRID.colony-one.event.population.crash
+    2  GRID.colony-one.event.task.solved
+    5  GRID.colony-one.state
+receipts: {'1 epoch.started': False, '1 state': True, '2 storm': False, '5 chronicle': 0}

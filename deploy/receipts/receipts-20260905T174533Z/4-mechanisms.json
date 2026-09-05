@@ -1,0 +1,18 @@
+[
+ {
+  "mutation_type": "point_substitution",
+  "origin_births": 61,
+  "occurrences": 62,
+  "genomes": 61,
+  "max_generation_span": 7,
+  "later_reproductions": 112
+ },
+ {
+  "mutation_type": "segment_transfer",
+  "origin_births": 2,
+  "occurrences": 2,
+  "genomes": 2,
+  "max_generation_span": 0,
+  "later_reproductions": 0
+ }
+]
