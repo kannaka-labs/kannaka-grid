@@ -54,7 +54,9 @@ fi
 $VENV/bin/python -c "import grid, src.colony.live" && log "§0 receipt: grid and thegrid import" || die "§0 import check failed" 1
 
 # ---- §1 mind -------------------------------------------------------------------
-if [ ! -f $MEM/config.toml ]; then
+# (Re)derive the mind's config whenever it is missing or not yet wired to the
+# gateway, so a partial earlier run is repaired rather than trusted.
+if ! grep -q '^provider = "openai"' $MEM/config.toml 2>/dev/null; then
   [ -f "$HOME/.kannaka/config.toml" ] || die "no $HOME/.kannaka/config.toml to derive the mind's config from" 5
   MASTER=$(grep '^LITELLM_MASTER_KEY=' $GATEWAY_ENV | cut -d= -f2-)
   [ -n "$MASTER" ] || die "LITELLM_MASTER_KEY empty in $GATEWAY_ENV" 4
@@ -73,31 +75,45 @@ PY
   [ -n "$VKEY" ] || die "key mint returned nothing" 4
   log "deriving $MEM/config.toml from the host config"
   python3 - "$HOME/.kannaka/config.toml" "$MEM/config.toml" "$MEM" "$VKEY" <<'PY'
-import re, sys
+import sys
 src, dst, mem, vkey = sys.argv[1:5]
-text = open(src).read()
-def set_key(section, key, value):
-    global text
-    pat = re.compile(r'(\[' + re.escape(section) + r'\][^\[]*?^' + re.escape(key) + r'\s*=\s*)(.*)$', re.M | re.S)
-    if pat.search(text):
-        text = pat.sub(lambda m: m.group(1) + value, text, count=1)
-    else:
-        text = re.sub(r'(\[' + re.escape(section) + r'\]\n)', lambda m: m.group(1) + f'{key} = {value}\n', text, count=1)
-set_key("agent", "id", '"grid-colony-one"')
-set_key("agent", "display_name", '"Grid: colony-one"')
-set_key("agent", "kind", '"agent"')
-set_key("agent", "persona", '"The mind of an artificial-life colony. You remember its epochs, storms, lineages and the genomes that worked. You answer briefly and cite ticks and opcodes."')
-set_key("llm", "provider", '"openai"')
-set_key("llm", "base_url", '"http://127.0.0.1:4000/v1"')
-set_key("llm", "model", '"agent-brain"')
-set_key("llm", "api_key", f'"{vkey}"')
-set_key("hrm", "path", f"'{mem}/kannaka.hrm'")
-set_key("swarm", "role", '"worker"')
-open(dst, "w").write(text)
+WANT = {
+    "agent": {"id": '"grid-colony-one"', "display_name": '"Grid: colony-one"', "kind": '"agent"',
+              "persona": '"The mind of an artificial-life colony. You remember its epochs, storms, lineages and the genomes that worked. You answer briefly and cite ticks and opcodes."'},
+    "llm": {"provider": '"openai"', "base_url": '"http://127.0.0.1:4000/v1"', "model": '"agent-brain"', "api_key": f'"{vkey}"'},
+    "swarm": {"enabled": "true", "nats_url": '"nats://swarm.ninja-portal.com:4222"', "role": '"worker"'},
+    "hrm": {"path": f"'{mem}/kannaka.hrm'"},
+}
+out, section, pending = [], None, {}
+def flush():
+    for k, v in pending.items():
+        out.append(f"{k} = {v}\n")
+for line in open(src):
+    s = line.strip()
+    if s.startswith("[") and s.endswith("]"):
+        flush()
+        section = s[1:-1]
+        pending = dict(WANT.get(section, {}))
+        out.append(line)
+        continue
+    if section in WANT and "=" in s and not s.startswith("#"):
+        key = s.split("=", 1)[0].strip()
+        if key in pending:
+            out.append(f"{key} = {pending.pop(key)}\n")
+            continue
+    out.append(line)
+flush()
+for sec, keys in WANT.items():
+    if not any(l.strip() == f"[{sec}]" for l in out):
+        out.append(f"\n[{sec}]\n")
+        out.extend(f"{k} = {v}\n" for k, v in keys.items())
+open(dst, "w").write("".join(out))
 PY
   chmod 600 $MEM/config.toml
 fi
-grep -q 'id = "grid-colony-one"' $MEM/config.toml || die "mind config does not carry agent id grid-colony-one" 1
+grep -q '^id = "grid-colony-one"' $MEM/config.toml || die "mind config does not carry agent id grid-colony-one" 1
+grep -q '^provider = "openai"' $MEM/config.toml || die "mind config is not wired to the gateway" 1
+grep -q "^path = '$MEM/kannaka.hrm'" $MEM/config.toml || die "mind config hrm.path is not $MEM/kannaka.hrm" 1
 if [ ! -f $MEM/kannaka.hrm ]; then
   log "seeding the mind's store"
   KANNAKA_DATA_DIR=$MEM $KANNAKA remember "grid-colony-one mind initialised on $(hostname) $(date -u +%FT%TZ)" --category grid --tags colony-one,init >/dev/null

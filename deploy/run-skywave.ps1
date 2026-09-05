@@ -25,10 +25,18 @@ if ($LASTEXITCODE -ne 0) {
 }
 Step "reached $probe"
 
-Step "copying deploy/skywave to the host"
+Step "normalizing line endings locally and copying deploy/skywave to the host"
+# Never strip CRs on the host: a quoting accident there once turned "s/\r$//"
+# into "s/r$//" and ate the trailing r of every line ("grid-mind-dream.time").
+$staged = Join-Path $env:TEMP "grid-deploy-staged"
+New-Item -ItemType Directory -Force $staged | Out-Null
+foreach ($f in @("deploy.sh", "receipts.sh", "wait-and-deploy.sh", "bus_capture.py")) {
+    $text = (Get-Content -Raw (Join-Path "$repo\deploy\skywave" $f)) -replace "`r`n", "`n"
+    [IO.File]::WriteAllText((Join-Path $staged $f), $text, (New-Object Text.UTF8Encoding($false)))
+}
 ssh $SshHost 'mkdir -p ~/grid-deploy'
-scp -q "$repo\deploy\skywave\deploy.sh" "$repo\deploy\skywave\receipts.sh" "$repo\deploy\skywave\bus_capture.py" "${SshHost}:~/grid-deploy/"
-ssh $SshHost 'chmod +x ~/grid-deploy/*.sh; sed -i "s/\r$//" ~/grid-deploy/*.sh ~/grid-deploy/*.py'
+scp -q "$staged\*" "${SshHost}:~/grid-deploy/"
+ssh $SshHost 'chmod +x ~/grid-deploy/*.sh'
 
 if (-not $ReceiptsOnly) {
     Step "running deploy.sh (idempotent)"

@@ -1,0 +1,6 @@
+# Scripts that run on Linux hosts must never pick up CRLF from a Windows checkout.
+*.sh text eol=lf
+*.py text eol=lf
+deploy/systemd/* text eol=lf
+deploy/*.example text eol=lf
+*.ps1 text eol=crlf
