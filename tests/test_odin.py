@@ -24,6 +24,11 @@ class FakeMind:
 
     def __init__(self, answer=None, exc=None):
         self.answer, self.exc, self.asked, self.recalled = answer, exc, [], []
+        self.remembered: list[tuple[str, list[str]]] = []
+
+    def remember(self, text, tags, *, category="grid"):
+        self.remembered.append((text, tags))
+        return True
 
     async def recall(self, query, top_k=5):
         self.recalled.append(query)
@@ -132,3 +137,49 @@ async def test_closed_bus_is_fatal_for_the_relay(tmp_path):
     r = relay(tmp_path, FakeMind(answer='["harvest","fork"]'), ClosedBus())
     with pytest.raises(BusClosed):
         await r.poll_once()
+
+
+async def test_a_rejection_is_remembered_and_a_proposal_is_not(tmp_path):
+    write_request(tmp_path)
+    mind = FakeMind(answer='["teleport"]')
+    assert await relay(tmp_path, mind).poll_once() == "rejected"
+    assert len(mind.remembered) == 1
+    text, tags = mind.remembered[0]
+    assert text.startswith("Odin rejected a proposal for request r1:")
+    assert "teleport" in text and "parent genome" in text
+    assert tags == ["c", "odin.rejected"]
+
+    write_request(tmp_path, "r2")
+    good = FakeMind(answer='["harvest","fork"]')
+    assert await relay(tmp_path, good).poll_once() == "proposed"
+    assert good.remembered == []
+
+
+async def test_a_stale_proposal_is_renamed_and_counted(tmp_path):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "proposal.json").write_text(json.dumps({"genome": ["harvest"]}))
+    mind = FakeMind(answer='["harvest","fork"]')
+    r = relay(tmp_path, mind)
+    assert await r.poll_once() is None              # nothing to answer yet
+    assert not (tmp_path / "proposal.json").exists()
+    assert [p.name for p in tmp_path.glob("proposal.stale-*.json")]
+    assert r.stale_count == 1
+
+    write_request(tmp_path)                          # the next request is asked normally
+    assert await r.poll_once() == "proposed"
+    assert len(mind.asked) == 1
+
+
+def test_config_from_env_carries_the_mind_data_dir_and_binary(monkeypatch):
+    from grid.odin import RelayConfig
+    for k in ("ODIN_QUEUE", "MIND_AGENT_ID", "NATS_URL", "NATS_USER", "NATS_PASSWORD",
+              "MIND_DATA_DIR", "KANNAKA_BIN", "ODIN_POLL_S"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("COLONY_SLUG", "colony-one")
+    assert RelayConfig.from_env().mind_data_dir is None
+    assert RelayConfig.from_env().kannaka_bin == "kannaka"
+    monkeypatch.setenv("MIND_DATA_DIR", "/srv/grid/colony-one/memory")
+    monkeypatch.setenv("KANNAKA_BIN", "/home/nick/.local/bin/kannaka")
+    c = RelayConfig.from_env()
+    assert c.mind_data_dir == "/srv/grid/colony-one/memory"
+    assert c.kannaka_bin == "/home/nick/.local/bin/kannaka"

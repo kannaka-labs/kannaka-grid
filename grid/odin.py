@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .envelope import envelope, subject
-from .mind import ASK_TIMEOUT_S, Mind, MindError
+from .mind import ASK_TIMEOUT_S, REMEMBER_MIN_INTERVAL_S, Mind, MindError, Throttle
 from .natsio import Bus, BusClosed, BusError, BusTimeout
 from .proposal import Rejection, parse_request, render_prompt, validate, write_proposal
 
@@ -25,7 +25,7 @@ log = logging.getLogger("grid.odin")
 class Relay:
     def __init__(self, queue: Path, *, colony: str, agent_id: str, mind, bus,
                  timeout_s: float = ASK_TIMEOUT_S, retry_after_s: float = 60.0,
-                 clock=time.monotonic):
+                 clock=time.monotonic, throttle: Throttle | None = None):
         self.queue = Path(queue)
         self.colony = colony
         self.agent_id = agent_id
@@ -34,6 +34,8 @@ class Relay:
         self.timeout_s = timeout_s
         self.retry_after_s = retry_after_s
         self._clock = clock
+        self.throttle = throttle or Throttle(REMEMBER_MIN_INTERVAL_S, clock=clock)
+        self.stale_count = 0
         self._retry_not_before: dict[str, float] = {}
 
     async def _publish(self, kind: str, epoch: int, tick: int, **fields) -> None:
@@ -48,7 +50,16 @@ class Relay:
 
     async def poll_once(self) -> str | None:
         request_path = self.queue / "request.json"
-        if (self.queue / "proposal.json").exists() or not request_path.exists():
+        proposal_path = self.queue / "proposal.json"
+        if proposal_path.exists():
+            if request_path.exists():
+                return None                     # thegrid has not consumed it yet
+            # The request is gone, so thegrid will never read this proposal.
+            stale = self.queue / f"proposal.stale-{int(time.time())}.json"
+            proposal_path.rename(stale)
+            self.stale_count += 1
+            log.warning("stale proposal with no request: renamed to %s", stale.name)
+        if not request_path.exists():
             return None
         try:
             req = parse_request(request_path)
@@ -76,6 +87,13 @@ class Relay:
             log.info("rejected %s: %s", req.request_id, result.reason)
             request_path.unlink(missing_ok=True)   # let thegrid file a fresh request
             await self._publish("rejected", epoch, tick, request_id=req.request_id, reason=result.reason)
+            if self.throttle.allow("odin.rejected"):
+                # Spec 6: the mind learns what does not work, not only what does.
+                await asyncio.to_thread(
+                    self.mind.remember,
+                    f"Odin rejected a proposal for request {req.request_id}: "
+                    f"{result.reason} (parent genome {req.genome[:8]}...)",
+                    [self.colony, "odin.rejected"])
             return "rejected"
         if not write_proposal(self.queue, req, result):
             log.info("request %s vanished before the proposal landed", req.request_id)
@@ -93,6 +111,8 @@ class RelayConfig:
     nats_url: str
     nats_user: str | None
     nats_password: str | None
+    mind_data_dir: str | None
+    kannaka_bin: str
     poll_s: float
 
     @classmethod
@@ -108,6 +128,8 @@ class RelayConfig:
             nats_url=env("NATS_URL", "nats://swarm.ninja-portal.com:4222"),
             nats_user=env("NATS_USER") or None,
             nats_password=env("NATS_PASSWORD") or None,
+            mind_data_dir=env("MIND_DATA_DIR") or None,
+            kannaka_bin=env("KANNAKA_BIN", "kannaka"),
             poll_s=float(env("ODIN_POLL_S", "1")),
         )
 
@@ -123,7 +145,8 @@ async def run(cfg: RelayConfig) -> None:
             log.error("nats connect failed: %s; retrying in %.0fs", e, backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60.0)
-    mind = Mind(cfg.agent_id, bus)
+    mind = Mind(cfg.agent_id, bus, kannaka_bin=cfg.kannaka_bin,
+                data_dir=Path(cfg.mind_data_dir) if cfg.mind_data_dir else None)
     relay = Relay(cfg.queue, colony=cfg.colony, agent_id=cfg.agent_id, mind=mind, bus=bus)
     log.info("watching %s for %s", cfg.queue, cfg.agent_id)
     while True:

@@ -2,7 +2,8 @@ import json
 
 import pytest
 
-from grid.bridge import (Bridge, BridgeConfig, iter_sse_data, memory_text, state_properties)
+from grid.bridge import (Bridge, BridgeConfig, epoch_summary_text, iter_sse_data,
+                        memory_text, state_properties)
 from grid.chronicle import CHRONICLE_EVERY_TICKS
 from grid.distill import Event, Snapshot
 
@@ -114,6 +115,57 @@ async def test_memory_is_throttled_per_kind_but_events_still_publish():
     clock.t = 301.0
     await bridge.handle_state(state(tick=4, weather=dict(storm, storms=3)))
     assert sum(1 for _, tags in mind.remembered if "storm" in tags) == 2
+
+
+HISTORY = {"currentEpoch": 2,
+           "totals": {"genomes": 41, "births": 900, "epochs": 2},
+           "mutationMechanisms": [{"mutation_type": "point", "later_reproductions": 30},
+                                  {"mutation_type": "duplication", "later_reproductions": 4}],
+           "ecology": [{"epoch": 1, "bucket": 1, "lineage_top_avg": 0.31, "lineages_avg": 5.0},
+                       {"epoch": 1, "bucket": 2, "lineage_top_avg": 0.72, "lineages_avg": 3.5}]}
+
+
+def test_epoch_summary_text_is_one_grounded_line():
+    event = Event("epoch.retired", 1, 4000,
+                  {"ticks": 4000, "births": 900, "deaths": 880, "extinct": True})
+    assert epoch_summary_text(event, HISTORY) == (
+        "Colony epoch 1 retired at tick 4000: births=900 deaths=880 extinct=True; "
+        "genomes=41 epochs=2; mechanisms=point:30,duplication:4; "
+        "top lineage share avg=0.72; lineages avg=3.5")
+
+
+def test_epoch_summary_text_survives_a_summary_missing_every_key():
+    event = Event("epoch.retired", 1, 4000, {})
+    assert epoch_summary_text(event, {}).startswith("Colony epoch 1 retired at tick None")
+
+
+async def test_epoch_retired_remembers_one_summary_from_history():
+    bus, mind = FakeBus(), FakeMind()
+
+    async def history_fetch():
+        return HISTORY
+
+    bridge = Bridge(cfg(), bus=bus, mind=mind, history_fetch=history_fetch)
+    await bridge.handle_state(state(epoch=1, tick=4000))
+    before = len(mind.remembered)
+    await bridge.handle_state(state(epoch=2, tick=1))
+    summaries = [t for t, _ in mind.remembered[before:] if t.startswith("Colony epoch 1 retired")]
+    assert len(summaries) == 1
+    assert [tags for _, tags in mind.remembered[before:]].count(["colony-one", "epoch.retired"]) == 2
+
+
+async def test_a_failing_history_fetch_costs_the_summary_not_the_event():
+    bus, mind = FakeBus(), FakeMind()
+
+    async def history_fetch():
+        raise RuntimeError("colony busy")
+
+    bridge = Bridge(cfg(), bus=bus, mind=mind, history_fetch=history_fetch)
+    await bridge.handle_state(state(epoch=1, tick=4000))
+    events = await bridge.handle_state(state(epoch=2, tick=1))
+    assert "epoch.retired" in [e.kind for e in events]
+    assert "GRID.colony-one.event.epoch.retired" in [s for s, _ in bus.published]
+    assert not [t for t, _ in mind.remembered if t.startswith("Colony epoch 1 retired")]
 
 
 async def test_publish_state_goes_to_bus_and_flux():

@@ -13,7 +13,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Awaitable, Callable, Iterable, Iterator
 
 import httpx
 
@@ -36,6 +36,27 @@ def iter_sse_data(lines: Iterable[str]) -> Iterator[str]:
 def memory_text(event: Event) -> str:
     fields = " ".join(f"{k}={v}" for k, v in sorted(event.fields.items()))
     return f"Colony event {event.kind} at epoch {event.epoch} tick {event.tick}: {fields}".strip()
+
+
+def epoch_summary_text(event: Event, history: dict) -> str:
+    """One line about a retired epoch, from its event and /api/history.
+
+    Pure, and `.get` throughout: thegrid's summary grows keys between versions
+    and a missing one must cost the sentence a value, never the memory.
+    """
+    fields = event.fields
+    totals = history.get("totals") or {}
+    mechanisms = ",".join(f"{m.get('mutation_type')}:{m.get('later_reproductions')}"
+                          for m in history.get("mutationMechanisms") or [])
+    ecology = history.get("ecology") or []
+    latest = ecology[-1] if ecology else {}
+    return (f"Colony epoch {event.epoch} retired at tick {fields.get('ticks')}: "
+            f"births={fields.get('births')} deaths={fields.get('deaths')} "
+            f"extinct={fields.get('extinct')}; "
+            f"genomes={totals.get('genomes')} epochs={totals.get('epochs')}; "
+            f"mechanisms={mechanisms}; "
+            f"top lineage share avg={latest.get('lineage_top_avg')}; "
+            f"lineages avg={latest.get('lineages_avg')}")
 
 
 def state_properties(snap: Snapshot) -> dict:
@@ -80,11 +101,13 @@ class BridgeConfig:
 
 class Bridge:
     def __init__(self, cfg: BridgeConfig, *, bus, mind, flux=None, distiller: Distiller | None = None,
-                 throttle: Throttle | None = None, clock=time.monotonic):
+                 throttle: Throttle | None = None, clock=time.monotonic,
+                 history_fetch: Callable[[], Awaitable[dict]] | None = None):
         self.cfg = cfg
         self.bus = bus
         self.mind = mind
         self.flux = flux
+        self.history_fetch = history_fetch
         self.distiller = distiller or Distiller()
         self.throttle = throttle or Throttle(REMEMBER_MIN_INTERVAL_S, clock=clock)
         self.colony: str | None = None
@@ -127,6 +150,20 @@ class Bridge:
             if not ok:
                 log.warning("mind refused memory for %s", event.kind)
 
+    async def _remember_epoch(self, event: Event) -> None:
+        """The epoch summary spec 6 asks for. One per epoch, so never throttled."""
+        if self.history_fetch is None:
+            return
+        try:
+            history = await self.history_fetch()
+        except Exception as e:      # the epoch is still published; only the memory is lost
+            log.warning("epoch %d summary skipped: history fetch failed: %s", event.epoch, e)
+            return
+        ok = await asyncio.to_thread(self.mind.remember, epoch_summary_text(event, history),
+                                     [self.colony, "epoch.retired"])
+        if not ok:
+            log.warning("mind refused the epoch %d summary", event.epoch)
+
     async def handle_state(self, state: dict) -> list[Event]:
         self._bind(state)
         snap = Snapshot.from_state(state)
@@ -134,6 +171,8 @@ class Bridge:
         self.last = snap
         for event in events:
             await self._emit(event)
+            if event.kind == "epoch.retired":
+                await self._remember_epoch(event)
         return events
 
     async def poll_history(self, summary: dict) -> list[Event]:
@@ -213,6 +252,12 @@ class Bridge:
 async def _stream(cfg: BridgeConfig, bridge: Bridge) -> None:
     """Consume /api/stream until it drops; the caller reconnects."""
     async with httpx.AsyncClient(timeout=httpx.Timeout(10, read=None)) as client:
+        async def fetch_history() -> dict:
+            r = await client.get(f"{cfg.colony_url}/api/history")
+            r.raise_for_status()
+            return r.json()
+
+        bridge.history_fetch = fetch_history
         async with client.stream("GET", f"{cfg.colony_url}/api/stream") as response:
             response.raise_for_status()
             last_state, last_history = 0.0, 0.0
@@ -233,9 +278,7 @@ async def _stream(cfg: BridgeConfig, bridge: Bridge) -> None:
                     last_state = now
                 if now - last_history >= cfg.history_every_s:
                     try:
-                        r = await client.get(f"{cfg.colony_url}/api/history")
-                        r.raise_for_status()
-                        await bridge.poll_history(r.json())
+                        await bridge.poll_history(await fetch_history())
                     except BusClosed:
                         raise
                     except Exception as e:
