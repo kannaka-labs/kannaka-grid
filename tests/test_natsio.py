@@ -1,0 +1,99 @@
+import json
+
+import pytest
+
+from grid.natsio import Bus, BusError, BusTimeout
+
+
+class FakeMsg:
+    def __init__(self, data: bytes):
+        self.data = data
+
+
+class FakeNC:
+    def __init__(self):
+        self.published: list[tuple[str, bytes]] = []
+        self.flushed = 0
+        self.closed = False
+        self.reply: bytes | None = None
+        self.raise_timeout = False
+        self.fail_flush = False
+
+    async def publish(self, subject, data):
+        self.published.append((subject, data))
+
+    async def flush(self, timeout=None):
+        self.flushed += 1
+        if self.fail_flush:
+            raise RuntimeError("nats: -ERR permissions violation")
+
+    async def request(self, subject, data, timeout=None):
+        if self.raise_timeout:
+            import nats.errors
+            raise nats.errors.TimeoutError()
+        self.last_request = (subject, data, timeout)
+        return FakeMsg(self.reply or b"{}")
+
+    async def close(self):
+        self.closed = True
+
+
+async def make_bus(nc: FakeNC) -> Bus:
+    async def connect(**kwargs):
+        connect.kwargs = kwargs
+        return nc
+    bus = Bus("nats://example:4222", user="u", password="p", connect=connect)
+    await bus.connect()
+    bus._connect_kwargs = connect.kwargs
+    return bus
+
+
+async def test_connect_passes_url_and_creds():
+    bus = await make_bus(FakeNC())
+    assert bus._connect_kwargs["servers"] == ["nats://example:4222"]
+    assert bus._connect_kwargs["user"] == "u" and bus._connect_kwargs["password"] == "p"
+
+
+async def test_publish_encodes_json_and_flushes():
+    nc = FakeNC()
+    bus = await make_bus(nc)
+    await bus.publish("GRID.c.event.storm", {"a": 1})
+    assert nc.published == [("GRID.c.event.storm", json.dumps({"a": 1}, separators=(",", ":")).encode())]
+    assert nc.flushed == 1
+
+
+async def test_publish_raises_when_server_refuses():
+    nc = FakeNC()
+    nc.fail_flush = True
+    bus = await make_bus(nc)
+    with pytest.raises(BusError):
+        await bus.publish("GRID.c.event.storm", {"a": 1})
+
+
+async def test_request_decodes_reply_and_passes_timeout():
+    nc = FakeNC()
+    nc.reply = b'{"from":"m","text":"ok"}'
+    bus = await make_bus(nc)
+    assert await bus.request("KANNAKA.ask.m", {"text": "hi"}, timeout_s=7.5) == {"from": "m", "text": "ok"}
+    assert nc.last_request[0] == "KANNAKA.ask.m" and nc.last_request[2] == 7.5
+
+
+async def test_request_timeout_is_bus_timeout():
+    nc = FakeNC()
+    nc.raise_timeout = True
+    bus = await make_bus(nc)
+    with pytest.raises(BusTimeout):
+        await bus.request("KANNAKA.ask.m", {"text": "hi"}, timeout_s=1)
+
+
+async def test_publish_before_connect_is_an_error():
+    bus = Bus("nats://x:4222")
+    with pytest.raises(BusError):
+        await bus.publish("s", {})
+
+
+async def test_close_closes():
+    nc = FakeNC()
+    bus = await make_bus(nc)
+    await bus.close()
+    assert nc.closed
