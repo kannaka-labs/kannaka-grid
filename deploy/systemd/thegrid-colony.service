@@ -20,7 +20,7 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/srv/grid/colony-one/state
 MemoryMax=192M
-MemoryHigh=160M
+MemoryHigh=176M
 MemorySwapMax=0
 CPUQuota=5%
 

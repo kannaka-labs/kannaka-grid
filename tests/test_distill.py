@@ -129,6 +129,14 @@ def test_population_crash_within_window_then_rearms():
     assert kinds(d.feed(crash_snap(60 + CRASH_WINDOW_TICKS + 3, 20))) == ["population.crash"]
 
 
+def test_a_tick_that_rewinds_inside_one_epoch_restarts_the_windows():
+    d = Distiller()
+    assert kinds(d.feed(crash_snap(500, 100))) == ["epoch.started"]
+    # thegrid restarted from its state pickle: same epoch, an earlier tick.
+    assert kinds(d.feed(crash_snap(10, 40))) == []       # not a crash against tick 500
+    assert kinds(d.feed(crash_snap(20, 39))) == []       # nor against the stale peak
+
+
 def test_signal_dialect_needs_two_consecutive_hot_buckets_and_rearms():
     d = Distiller()
     d.feed(snap(epoch=1, tick=1))

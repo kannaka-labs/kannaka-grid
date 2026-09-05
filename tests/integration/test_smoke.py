@@ -32,7 +32,8 @@ def _finite_memory_max() -> bool:
 
 skip = pytest.mark.skipif(
     os.environ.get("GRID_INTEGRATION") != "1" or sys.platform != "linux" or not _finite_memory_max(),
-    reason="set GRID_INTEGRATION=1 on Linux inside a cgroup with finite memory.max")
+    reason="set GRID_INTEGRATION=1 on Linux inside a cgroup with finite memory.max, "
+           "with thegrid's aiohttp dependency installed in the venv (pip install -e thegrid)")
 
 
 def free_port() -> int:

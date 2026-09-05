@@ -114,6 +114,7 @@ class Bridge:
         self.agent_id: str | None = None
         self.last: Snapshot | None = None
         self.isa: list[str] = []
+        self.frames_handled: int = 0
         self._chronicled_phase: int = -1
         self._last_chronicle_tick: int = 0
         self._chronicle_task: asyncio.Task | None = None
@@ -169,6 +170,7 @@ class Bridge:
         snap = Snapshot.from_state(state)
         events = self.distiller.feed(snap)
         self.last = snap
+        self.frames_handled += 1
         for event in events:
             await self._emit(event)
             if event.kind == "epoch.retired":
@@ -251,7 +253,9 @@ class Bridge:
 
 async def _stream(cfg: BridgeConfig, bridge: Bridge) -> None:
     """Consume /api/stream until it drops; the caller reconnects."""
-    async with httpx.AsyncClient(timeout=httpx.Timeout(10, read=None)) as client:
+    # thegrid keepalives every 15 s, so a 60 s read timeout means a frozen
+    # colony drops the connection and the caller reconnects instead of hanging.
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10, read=60)) as client:
         async def fetch_history() -> dict:
             r = await client.get(f"{cfg.colony_url}/api/history")
             r.raise_for_status()
@@ -306,6 +310,7 @@ async def run(cfg: BridgeConfig) -> None:
     bridge = Bridge(cfg, bus=bus, mind=mind, flux=flux)
     backoff = 1.0
     while True:
+        frames = bridge.frames_handled
         try:
             await _stream(cfg, bridge)
             backoff = 1.0
@@ -313,6 +318,8 @@ async def run(cfg: BridgeConfig) -> None:
             log.error("nats gave up: %s; exiting for systemd to restart", e)
             raise SystemExit(75) from e
         except Exception as e:
+            if bridge.frames_handled > frames:
+                backoff = 1.0       # that connection worked; this is a fresh drop
             log.error("stream dropped: %s; reconnecting in %.0fs", e, backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60.0)

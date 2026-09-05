@@ -319,3 +319,35 @@ def test_config_from_env_defaults(monkeypatch):
     assert c.nats_url == "nats://swarm.ninja-portal.com:4222"
     assert c.flux_url is None and c.mind_agent_id is None
     assert c.state_every_s == 60 and c.history_every_s == 60
+
+
+async def test_reconnect_backoff_resets_after_a_stream_that_delivered_frames(monkeypatch):
+    from grid import bridge as bridge_mod
+
+    delays: list[float] = []
+    attempts = {"n": 0}
+
+    class ConnectingBus(FakeBus):
+        async def connect(self):
+            pass
+
+    async def fake_stream(config, bridge):
+        attempts["n"] += 1
+        if attempts["n"] == 3:          # this attempt actually read the colony
+            bridge.frames_handled += 1
+        raise RuntimeError("colony went away")
+
+    async def fake_sleep(seconds):
+        delays.append(seconds)
+        if len(delays) == 5:
+            raise KeyboardInterrupt     # the only way out of the daemon loop
+
+    monkeypatch.setattr(bridge_mod, "Bus", lambda *a, **k: ConnectingBus())
+    monkeypatch.setattr(bridge_mod, "Mind", lambda *a, **k: FakeMind())
+    monkeypatch.setattr(bridge_mod, "_stream", fake_stream)
+    monkeypatch.setattr(bridge_mod.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(KeyboardInterrupt):
+        await bridge_mod.run(cfg())
+    # A stream that worked before it dropped is not a failing config: back to 1 s.
+    assert delays == [1.0, 2.0, 1.0, 2.0, 4.0]

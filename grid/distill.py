@@ -132,6 +132,11 @@ class Distiller:
             events.append(Event("epoch.started", snap.epoch, snap.tick, {
                 "started_at": snap.started_at, "founders": len(snap.strains)}))
             self._reset_epoch()
+        elif snap.tick < prev.tick:
+            # Same epoch, earlier tick: thegrid restarted from its state pickle.
+            # The windows and hysteresis describe ticks that no longer happened,
+            # so drop them. The epoch number did not change, so nothing is emitted.
+            self._reset_epoch()
         else:
             events.extend(self._pair_events(prev, snap))
         events.extend(self._level_events(snap))
