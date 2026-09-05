@@ -330,6 +330,32 @@ earlier text where they differ.
   `memory.max` (thegrid refuses `max`) and drives the relay with a stub mind; no local
   `nats-server` is required.
 
+### Final-review reconciliation (2026-09-05)
+
+The whole-branch review found seven things the per-task reviews had not, all
+fixed on `feat/foundation`:
+
+1. **NATS lifecycle.** nats-py's default 60 reconnect attempts left the client
+   CLOSED for good after two minutes unreachable, with neither daemon exiting;
+   the bus now reconnects indefinitely, raises `BusClosed` once it cannot, and
+   both daemons exit 75 so systemd restarts them. Initial connect retries with
+   the same 1 s to 60 s backoff instead of burning a `StartLimitBurst` slot.
+2. **Heat proxy.** The proxy read the colony's own 5 %-quota cgroup, which can
+   never move thegrid's storm trigger; it reads whole-host `/proc/stat` now.
+3. **Permissions `-ERR`.** A refused publish reached only the client's error
+   callback, so `publish` returned cleanly and the message was lost; the bus
+   drains that callback's record after every flush and raises.
+4. **`remember` on the event loop.** The bridge's `subprocess.run(timeout=60)`
+   memory write ran on the stream reader; it runs in a thread now.
+5. **Three spec departures** built: the §6 epoch summary from `/api/history`,
+   §6's remembered Odin rejections, and §7's renamed-and-counted stale proposal.
+6. **Odin epoch/tick.** `Organism.telemetry()` carries neither, so every
+   `odin.*` envelope read 0/0 and the fixtures had invented the keys; the relay
+   reads `/api/state`, and an unparseable request is binned after three polls.
+7. **Minors**: a 60 s stream read timeout, a reconnect backoff that resets after
+   a stream that delivered frames, an epoch restart (a tick that rewinds inside
+   one epoch) resetting the Distiller's windows, and `MemoryHigh=176M`.
+
 ## 12. Acceptance criteria for v0.1
 
 1. A colony runs on Skywave under thegrid's cgroup limits with the observer on

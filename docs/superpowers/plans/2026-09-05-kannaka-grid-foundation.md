@@ -433,6 +433,14 @@ def test_population_crash_within_window_then_rearms():
     assert kinds(d.feed(crash_snap(60 + CRASH_WINDOW_TICKS + 3, 20))) == ["population.crash"]
 
 
+def test_a_tick_that_rewinds_inside_one_epoch_restarts_the_windows():
+    d = Distiller()
+    assert kinds(d.feed(crash_snap(500, 100))) == ["epoch.started"]
+    # thegrid restarted from its state pickle: same epoch, an earlier tick.
+    assert kinds(d.feed(crash_snap(10, 40))) == []       # not a crash against tick 500
+    assert kinds(d.feed(crash_snap(20, 39))) == []       # nor against the stale peak
+
+
 def test_signal_dialect_needs_two_consecutive_hot_buckets_and_rearms():
     d = Distiller()
     d.feed(snap(epoch=1, tick=1))
@@ -610,6 +618,11 @@ class Distiller:
             events.append(Event("epoch.started", snap.epoch, snap.tick, {
                 "started_at": snap.started_at, "founders": len(snap.strains)}))
             self._reset_epoch()
+        elif snap.tick < prev.tick:
+            # Same epoch, earlier tick: thegrid restarted from its state pickle.
+            # The windows and hysteresis describe ticks that no longer happened,
+            # so drop them. The epoch number did not change, so nothing is emitted.
+            self._reset_epoch()
         else:
             events.extend(self._pair_events(prev, snap))
         events.extend(self._level_events(snap))
@@ -695,7 +708,7 @@ class Distiller:
 - [ ] **Step 4: Run to verify they pass**
 
 Run: `python -m pytest tests/test_distill.py -q`
-Expected: `13 passed`
+Expected: `14 passed`
 
 - [ ] **Step 5: Mutation checks, then commit**
 
@@ -1130,7 +1143,7 @@ git commit -m "feat: chronicle questions and answer constraints"
 - Test: `tests/test_natsio.py`
 
 **Interfaces:**
-- Produces: `class Bus` with `__init__(self, url: str, *, user: str | None = None, password: str | None = None, connect=nats.connect)`, `async connect() -> None`, `async publish(subject: str, payload: dict) -> None` (encodes JSON, flushes, raises on failure), `async request(subject: str, payload: dict, timeout_s: float) -> dict` (raises `BusTimeout`), `async close() -> None`. Exceptions: `BusError(Exception)`, `BusTimeout(BusError)`.
+- Produces: `class Bus` with `__init__(self, url: str, *, user: str | None = None, password: str | None = None, connect=nats.connect)`, `async connect() -> None` (never stops reconnecting; installs the four lifecycle callbacks), `async publish(subject: str, payload: dict) -> None` (encodes JSON, flushes, raises on failure or on a permissions violation the error callback reported), `async request(subject: str, payload: dict, timeout_s: float) -> dict` (raises `BusTimeout`), `async close() -> None`. Exceptions: `BusError(Exception)`, `BusTimeout(BusError)`, `BusClosed(BusError)`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1138,9 +1151,10 @@ git commit -m "feat: chronicle questions and answer constraints"
 # tests/test_natsio.py
 import json
 
+import nats.errors
 import pytest
 
-from grid.natsio import Bus, BusError, BusTimeout
+from grid.natsio import Bus, BusClosed, BusError, BusTimeout
 
 
 class FakeMsg:
@@ -1153,12 +1167,17 @@ class FakeNC:
         self.published: list[tuple[str, bytes]] = []
         self.flushed = 0
         self.closed = False
+        self.is_closed = False
         self.reply: bytes | None = None
         self.raise_timeout = False
         self.fail_flush = False
+        self.error_cb = None            # the callback the bus registered at connect
+        self.error_on_publish = None    # reported through it, the way the server does
 
     async def publish(self, subject, data):
         self.published.append((subject, data))
+        if self.error_on_publish is not None:
+            await self.error_cb(self.error_on_publish)
 
     async def flush(self, timeout=None):
         self.flushed += 1
@@ -1183,6 +1202,7 @@ async def make_bus(nc: FakeNC) -> Bus:
     bus = Bus("nats://example:4222", user="u", password="p", connect=connect)
     await bus.connect()
     bus._connect_kwargs = connect.kwargs
+    nc.error_cb = connect.kwargs["error_cb"]
     return bus
 
 
@@ -1190,6 +1210,29 @@ async def test_connect_passes_url_and_creds():
     bus = await make_bus(FakeNC())
     assert bus._connect_kwargs["servers"] == ["nats://example:4222"]
     assert bus._connect_kwargs["user"] == "u" and bus._connect_kwargs["password"] == "p"
+
+
+async def test_connect_never_gives_up_reconnecting_and_installs_callbacks():
+    bus = await make_bus(FakeNC())
+    kwargs = bus._connect_kwargs
+    # 60 x 2 s is the nats-py default: two minutes unreachable and the client
+    # is CLOSED for good, with every later publish failing silently.
+    assert kwargs["max_reconnect_attempts"] == -1
+    assert kwargs["reconnect_time_wait"] == 2
+    assert {"disconnected_cb", "reconnected_cb", "closed_cb", "error_cb"} <= kwargs.keys()
+    assert all(callable(kwargs[k]) for k in
+               ("disconnected_cb", "reconnected_cb", "closed_cb", "error_cb"))
+
+
+async def test_publish_and_request_raise_bus_closed_once_the_client_gave_up():
+    nc = FakeNC()
+    bus = await make_bus(nc)
+    nc.is_closed = True
+    with pytest.raises(BusClosed):
+        await bus.publish("GRID.c.event.storm", {"a": 1})
+    with pytest.raises(BusClosed):
+        await bus.request("KANNAKA.ask.m", {"text": "hi"}, timeout_s=1)
+    assert nc.published == [] and nc.flushed == 0
 
 
 async def test_publish_encodes_json_and_flushes():
@@ -1206,6 +1249,25 @@ async def test_publish_raises_when_server_refuses():
     bus = await make_bus(nc)
     with pytest.raises(BusError):
         await bus.publish("GRID.c.event.storm", {"a": 1})
+
+
+async def test_publish_raises_when_the_server_refuses_the_subject():
+    nc = FakeNC()
+    bus = await make_bus(nc)
+    # flush is PING/PONG and succeeds; the refusal arrives on the error callback.
+    nc.error_on_publish = nats.errors.Error(
+        'nats: Permissions Violation for Publish to "GRID.c.event.storm"')
+    with pytest.raises(BusError, match="refused"):
+        await bus.publish("GRID.c.event.storm", {"a": 1})
+    assert nc.flushed == 1
+
+
+async def test_a_violation_on_another_subject_does_not_fail_this_publish():
+    nc = FakeNC()
+    bus = await make_bus(nc)
+    nc.error_on_publish = nats.errors.Error(
+        'nats: Permissions Violation for Publish to "KANNAKA.ask.other"')
+    await bus.publish("GRID.c.event.storm", {"a": 1})
 
 
 async def test_request_decodes_reply_and_passes_timeout():
@@ -1248,17 +1310,27 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'grid.natsio'`
 # grid/natsio.py
 """A thin, honest wrapper over nats-py.
 
-Honest means: a publish that the server refuses raises. The hive bridge once
-read the post-PING response and discarded it, so a permissions error looked
-like success and data was lost with the process still healthy. Not here.
+Honest means: a publish that the server refuses raises. nats-py does not raise
+for one by itself. A `Permissions Violation for Publish` arrives out of band on
+the client's error callback and leaves the connection open, and `flush()` is
+only PING/PONG, so a naive publish returns cleanly while the message is
+discarded. So the bus installs that callback, records every error it reports,
+and drains the record after each flush: an entry naming a permissions violation
+on the subject just published becomes a BusError. The hive bridge once read the
+post-PING response and discarded it, so a permissions error looked like success
+and data was lost with the process still healthy. Not here.
 """
 from __future__ import annotations
 
+import collections
 import json
+import logging
 from typing import Any, Callable
 
 import nats
 import nats.errors
+
+log = logging.getLogger("grid.natsio")
 
 
 class BusError(Exception):
@@ -1267,6 +1339,10 @@ class BusError(Exception):
 
 class BusTimeout(BusError):
     pass
+
+
+class BusClosed(BusError):
+    """The client gave up reconnecting; only a process restart fixes it."""
 
 
 def _encode(payload: dict) -> bytes:
@@ -1281,9 +1357,30 @@ class Bus:
         self.password = password
         self._connect = connect
         self._nc = None
+        self._errors: collections.deque[str] = collections.deque(maxlen=64)
 
     async def connect(self) -> None:
-        kwargs: dict[str, Any] = {"servers": [self.url], "name": "kannaka-grid"}
+        async def on_disconnected() -> None:
+            log.warning("nats disconnected from %s; reconnecting", self.url)
+
+        async def on_reconnected() -> None:
+            log.info("nats reconnected to %s", self.url)
+
+        async def on_closed() -> None:
+            log.warning("nats connection to %s closed for good", self.url)
+
+        async def on_error(e: Exception) -> None:
+            self._errors.append(str(e))
+            log.warning("nats error: %s", e)
+
+        kwargs: dict[str, Any] = {
+            "servers": [self.url], "name": "kannaka-grid",
+            # 60 attempts x 2 s is two minutes; after that nats-py closes the
+            # client for good and every publish fails silently forever.
+            "max_reconnect_attempts": -1, "reconnect_time_wait": 2,
+            "disconnected_cb": on_disconnected, "reconnected_cb": on_reconnected,
+            "closed_cb": on_closed, "error_cb": on_error,
+        }
         if self.user:
             kwargs["user"] = self.user
             kwargs["password"] = self.password
@@ -1296,14 +1393,22 @@ class Bus:
 
     async def publish(self, subject: str, payload: dict) -> None:
         nc = self._require()
+        if nc.is_closed:
+            raise BusClosed("connection closed for good")
         try:
             await nc.publish(subject, _encode(payload))
             await nc.flush(timeout=5)
         except Exception as e:  # nats-py raises a family of errors; all mean "not delivered"
             raise BusError(f"publish {subject} failed: {e}") from e
+        while self._errors:     # a refusal arrives on the callback, never on flush
+            entry = self._errors.popleft()
+            if "Permissions Violation" in entry and subject in entry:
+                raise BusError(f"publish {subject} refused: {entry}")
 
     async def request(self, subject: str, payload: dict, timeout_s: float) -> dict:
         nc = self._require()
+        if nc.is_closed:
+            raise BusClosed("connection closed for good")
         try:
             msg = await nc.request(subject, _encode(payload), timeout=timeout_s)
         except nats.errors.TimeoutError as e:
@@ -1324,7 +1429,7 @@ class Bus:
 - [ ] **Step 4: Run to verify they pass**
 
 Run: `python -m pytest tests/test_natsio.py -q`
-Expected: `7 passed`
+Expected: `11 passed`
 
 - [ ] **Step 5: Mutation check, then commit**
 
@@ -1703,7 +1808,8 @@ git commit -m "feat: mind client (remember via CLI, ask/recall via NATS) and thr
   - `memory_text(event: Event) -> str` — the one-line fact remembered per event.
   - `state_properties(snap: Snapshot) -> dict` — the scalar fields sent to Flux and `GRID.<colony>.state`.
   - `BridgeConfig` dataclass + `BridgeConfig.from_env() -> BridgeConfig`.
-  - `class Bridge(cfg, *, bus, mind, flux=None, distiller=None, throttle=None, clock=time.monotonic)` with `async handle_state(state: dict) -> list[Event]`, `async publish_state(snap) -> None`, `async poll_history(summary: dict) -> list[Event]`, `async maybe_chronicle() -> dict[str, str]`, `schedule_chronicle() -> None` (runs `maybe_chronicle` as a single in-flight asyncio task), `agent_id`, `colony` set on first state.
+  - `epoch_summary_text(event: Event, history: dict) -> str` — the one-line epoch summary built from `/api/history`.
+  - `class Bridge(cfg, *, bus, mind, flux=None, distiller=None, throttle=None, clock=time.monotonic, history_fetch=None)` with `async handle_state(state: dict) -> list[Event]`, `async publish_state(snap) -> None`, `async poll_history(summary: dict) -> list[Event]`, `async maybe_chronicle() -> dict[str, str]`, `schedule_chronicle() -> None` (runs `maybe_chronicle` as a single in-flight asyncio task), `agent_id`, `colony` set on first state.
   - `async run(cfg)` — the daemon loop; `main()` entry.
 
 Environment (all read in `BridgeConfig.from_env`): `COLONY_URL` (default `http://127.0.0.1:8787`), `NATS_URL` (default `nats://swarm.ninja-portal.com:4222`), `NATS_USER`, `NATS_PASSWORD`, `FLUX_URL` (optional), `MIND_AGENT_ID` (default `grid-<colony>` once the name is known; override allowed), `MIND_DATA_DIR`, `KANNAKA_BIN` (default `kannaka`), `STATE_EVERY_S` (60), `HISTORY_EVERY_S` (60).
@@ -1714,7 +1820,10 @@ Environment (all read in `BridgeConfig.from_env`): `COLONY_URL` (default `http:/
 # tests/test_bridge.py
 import json
 
-from grid.bridge import (Bridge, BridgeConfig, iter_sse_data, memory_text, state_properties)
+import pytest
+
+from grid.bridge import (Bridge, BridgeConfig, epoch_summary_text, iter_sse_data,
+                        memory_text, state_properties)
 from grid.chronicle import CHRONICLE_EVERY_TICKS
 from grid.distill import Event, Snapshot
 
@@ -1828,6 +1937,57 @@ async def test_memory_is_throttled_per_kind_but_events_still_publish():
     assert sum(1 for _, tags in mind.remembered if "storm" in tags) == 2
 
 
+HISTORY = {"currentEpoch": 2,
+           "totals": {"genomes": 41, "births": 900, "epochs": 2},
+           "mutationMechanisms": [{"mutation_type": "point", "later_reproductions": 30},
+                                  {"mutation_type": "duplication", "later_reproductions": 4}],
+           "ecology": [{"epoch": 1, "bucket": 1, "lineage_top_avg": 0.31, "lineages_avg": 5.0},
+                       {"epoch": 1, "bucket": 2, "lineage_top_avg": 0.72, "lineages_avg": 3.5}]}
+
+
+def test_epoch_summary_text_is_one_grounded_line():
+    event = Event("epoch.retired", 1, 4000,
+                  {"ticks": 4000, "births": 900, "deaths": 880, "extinct": True})
+    assert epoch_summary_text(event, HISTORY) == (
+        "Colony epoch 1 retired at tick 4000: births=900 deaths=880 extinct=True; "
+        "genomes=41 epochs=2; mechanisms=point:30,duplication:4; "
+        "top lineage share avg=0.72; lineages avg=3.5")
+
+
+def test_epoch_summary_text_survives_a_summary_missing_every_key():
+    event = Event("epoch.retired", 1, 4000, {})
+    assert epoch_summary_text(event, {}).startswith("Colony epoch 1 retired at tick None")
+
+
+async def test_epoch_retired_remembers_one_summary_from_history():
+    bus, mind = FakeBus(), FakeMind()
+
+    async def history_fetch():
+        return HISTORY
+
+    bridge = Bridge(cfg(), bus=bus, mind=mind, history_fetch=history_fetch)
+    await bridge.handle_state(state(epoch=1, tick=4000))
+    before = len(mind.remembered)
+    await bridge.handle_state(state(epoch=2, tick=1))
+    summaries = [t for t, _ in mind.remembered[before:] if t.startswith("Colony epoch 1 retired")]
+    assert len(summaries) == 1
+    assert [tags for _, tags in mind.remembered[before:]].count(["colony-one", "epoch.retired"]) == 2
+
+
+async def test_a_failing_history_fetch_costs_the_summary_not_the_event():
+    bus, mind = FakeBus(), FakeMind()
+
+    async def history_fetch():
+        raise RuntimeError("colony busy")
+
+    bridge = Bridge(cfg(), bus=bus, mind=mind, history_fetch=history_fetch)
+    await bridge.handle_state(state(epoch=1, tick=4000))
+    events = await bridge.handle_state(state(epoch=2, tick=1))
+    assert "epoch.retired" in [e.kind for e in events]
+    assert "GRID.colony-one.event.epoch.retired" in [s for s, _ in bus.published]
+    assert not [t for t, _ in mind.remembered if t.startswith("Colony epoch 1 retired")]
+
+
 async def test_publish_state_goes_to_bus_and_flux():
     bus, flux = FakeBus(), FakeFlux()
     bridge = Bridge(cfg(), bus=bus, mind=FakeMind(), flux=flux)
@@ -1907,6 +2067,21 @@ class RefusingMind(FakeMind):
         return False
 
 
+class ClosedBus(FakeBus):
+    """The client gave up reconnecting; nothing will be delivered again."""
+
+    async def publish(self, subject, payload):
+        from grid.natsio import BusClosed
+        raise BusClosed("connection closed for good")
+
+
+async def test_closed_bus_is_fatal_not_dropped():
+    from grid.natsio import BusClosed
+    bridge = Bridge(cfg(), bus=ClosedBus(), mind=FakeMind())
+    with pytest.raises(BusClosed):
+        await bridge.handle_state(state())
+
+
 async def test_refused_publish_is_dropped_not_raised():
     bridge = Bridge(cfg(), bus=FailingBus(), mind=FakeMind())
     events = await bridge.handle_state(state())
@@ -1964,6 +2139,38 @@ def test_config_from_env_defaults(monkeypatch):
     assert c.nats_url == "nats://swarm.ninja-portal.com:4222"
     assert c.flux_url is None and c.mind_agent_id is None
     assert c.state_every_s == 60 and c.history_every_s == 60
+
+
+async def test_reconnect_backoff_resets_after_a_stream_that_delivered_frames(monkeypatch):
+    from grid import bridge as bridge_mod
+
+    delays: list[float] = []
+    attempts = {"n": 0}
+
+    class ConnectingBus(FakeBus):
+        async def connect(self):
+            pass
+
+    async def fake_stream(config, bridge):
+        attempts["n"] += 1
+        if attempts["n"] == 3:          # this attempt actually read the colony
+            bridge.frames_handled += 1
+        raise RuntimeError("colony went away")
+
+    async def fake_sleep(seconds):
+        delays.append(seconds)
+        if len(delays) == 5:
+            raise KeyboardInterrupt     # the only way out of the daemon loop
+
+    monkeypatch.setattr(bridge_mod, "Bus", lambda *a, **k: ConnectingBus())
+    monkeypatch.setattr(bridge_mod, "Mind", lambda *a, **k: FakeMind())
+    monkeypatch.setattr(bridge_mod, "_stream", fake_stream)
+    monkeypatch.setattr(bridge_mod.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(KeyboardInterrupt):
+        await bridge_mod.run(cfg())
+    # A stream that worked before it dropped is not a failing config: back to 1 s.
+    assert delays == [1.0, 2.0, 1.0, 2.0, 4.0]
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -1990,7 +2197,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Awaitable, Callable, Iterable, Iterator
 
 import httpx
 
@@ -1999,7 +2206,7 @@ from .distill import Distiller, Event, Snapshot
 from .envelope import envelope, slug, subject
 from .flux import Flux
 from .mind import REMEMBER_MIN_INTERVAL_S, Mind, MindError, Throttle
-from .natsio import Bus, BusError
+from .natsio import Bus, BusClosed, BusError
 
 log = logging.getLogger("grid.bridge")
 
@@ -2013,6 +2220,27 @@ def iter_sse_data(lines: Iterable[str]) -> Iterator[str]:
 def memory_text(event: Event) -> str:
     fields = " ".join(f"{k}={v}" for k, v in sorted(event.fields.items()))
     return f"Colony event {event.kind} at epoch {event.epoch} tick {event.tick}: {fields}".strip()
+
+
+def epoch_summary_text(event: Event, history: dict) -> str:
+    """One line about a retired epoch, from its event and /api/history.
+
+    Pure, and `.get` throughout: thegrid's summary grows keys between versions
+    and a missing one must cost the sentence a value, never the memory.
+    """
+    fields = event.fields
+    totals = history.get("totals") or {}
+    mechanisms = ",".join(f"{m.get('mutation_type')}:{m.get('later_reproductions')}"
+                          for m in history.get("mutationMechanisms") or [])
+    ecology = history.get("ecology") or []
+    latest = ecology[-1] if ecology else {}
+    return (f"Colony epoch {event.epoch} retired at tick {fields.get('ticks')}: "
+            f"births={fields.get('births')} deaths={fields.get('deaths')} "
+            f"extinct={fields.get('extinct')}; "
+            f"genomes={totals.get('genomes')} epochs={totals.get('epochs')}; "
+            f"mechanisms={mechanisms}; "
+            f"top lineage share avg={latest.get('lineage_top_avg')}; "
+            f"lineages avg={latest.get('lineages_avg')}")
 
 
 def state_properties(snap: Snapshot) -> dict:
@@ -2057,17 +2285,20 @@ class BridgeConfig:
 
 class Bridge:
     def __init__(self, cfg: BridgeConfig, *, bus, mind, flux=None, distiller: Distiller | None = None,
-                 throttle: Throttle | None = None, clock=time.monotonic):
+                 throttle: Throttle | None = None, clock=time.monotonic,
+                 history_fetch: Callable[[], Awaitable[dict]] | None = None):
         self.cfg = cfg
         self.bus = bus
         self.mind = mind
         self.flux = flux
+        self.history_fetch = history_fetch
         self.distiller = distiller or Distiller()
         self.throttle = throttle or Throttle(REMEMBER_MIN_INTERVAL_S, clock=clock)
         self.colony: str | None = None
         self.agent_id: str | None = None
         self.last: Snapshot | None = None
         self.isa: list[str] = []
+        self.frames_handled: int = 0
         self._chronicled_phase: int = -1
         self._last_chronicle_tick: int = 0
         self._chronicle_task: asyncio.Task | None = None
@@ -2091,20 +2322,43 @@ class Bridge:
         subj = subject(self.colony, "event", event.kind)
         try:
             await self.bus.publish(subj, self._env(event.epoch, event.tick, kind=event.kind, **event.fields))
+        except BusClosed:
+            raise
         except BusError as e:
             log.error("dropped %s: %s", subj, e)
             return
         if self.throttle.allow(event.kind):
-            if not self.mind.remember(memory_text(event), [self.colony, event.kind]):
+            # remember() shells out to `kannaka remember` with a 60 s timeout; run
+            # it off the stream-reader coroutine or the whole bridge stalls on it.
+            ok = await asyncio.to_thread(self.mind.remember, memory_text(event),
+                                         [self.colony, event.kind])
+            if not ok:
                 log.warning("mind refused memory for %s", event.kind)
+
+    async def _remember_epoch(self, event: Event) -> None:
+        """The epoch summary spec 6 asks for. One per epoch, so never throttled."""
+        if self.history_fetch is None:
+            return
+        try:
+            history = await self.history_fetch()
+        except Exception as e:      # the epoch is still published; only the memory is lost
+            log.warning("epoch %d summary skipped: history fetch failed: %s", event.epoch, e)
+            return
+        ok = await asyncio.to_thread(self.mind.remember, epoch_summary_text(event, history),
+                                     [self.colony, "epoch.retired"])
+        if not ok:
+            log.warning("mind refused the epoch %d summary", event.epoch)
 
     async def handle_state(self, state: dict) -> list[Event]:
         self._bind(state)
         snap = Snapshot.from_state(state)
         events = self.distiller.feed(snap)
         self.last = snap
+        self.frames_handled += 1
         for event in events:
             await self._emit(event)
+            if event.kind == "epoch.retired":
+                await self._remember_epoch(event)
         return events
 
     async def poll_history(self, summary: dict) -> list[Event]:
@@ -2121,6 +2375,8 @@ class Bridge:
         extra = {k: v for k, v in props.items() if k not in ("epoch", "tick")}
         try:
             await self.bus.publish(subject(self.colony, "state"), self._env(snap.epoch, snap.tick, **extra))
+        except BusClosed:
+            raise
         except BusError as e:
             log.error("state publish failed: %s", e)
         if self.flux is not None:
@@ -2146,6 +2402,8 @@ class Bridge:
             q = chron.question(kind, colony=self.colony, epoch=snap.epoch, tick=snap.tick, since_tick=since)
             try:
                 raw = await self.mind.ask(q, recall_query=f"colony {self.colony} epoch {snap.epoch}")
+            except BusClosed:
+                raise
             except (MindError, BusError) as e:
                 log.warning("chronicle %s: mind unavailable: %s", kind, e)
                 continue
@@ -2157,6 +2415,8 @@ class Bridge:
             try:
                 await self.bus.publish(subject(self.colony, "chronicle", kind),
                                        self._env(snap.epoch, snap.tick, text=answer, since_tick=since))
+            except BusClosed:
+                raise
             except BusError as e:
                 log.error("chronicle %s publish failed: %s", kind, e)
         return out
@@ -2177,7 +2437,15 @@ class Bridge:
 
 async def _stream(cfg: BridgeConfig, bridge: Bridge) -> None:
     """Consume /api/stream until it drops; the caller reconnects."""
-    async with httpx.AsyncClient(timeout=httpx.Timeout(10, read=None)) as client:
+    # thegrid keepalives every 15 s, so a 60 s read timeout means a frozen
+    # colony drops the connection and the caller reconnects instead of hanging.
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10, read=60)) as client:
+        async def fetch_history() -> dict:
+            r = await client.get(f"{cfg.colony_url}/api/history")
+            r.raise_for_status()
+            return r.json()
+
+        bridge.history_fetch = fetch_history
         async with client.stream("GET", f"{cfg.colony_url}/api/stream") as response:
             response.raise_for_status()
             last_state, last_history = 0.0, 0.0
@@ -2187,6 +2455,8 @@ async def _stream(cfg: BridgeConfig, bridge: Bridge) -> None:
                 data = line[len("data:"):].strip()
                 try:
                     await bridge.handle_state(json.loads(data))
+                except BusClosed:       # fatal: the caller exits for a systemd restart
+                    raise
                 except Exception as e:  # one bad frame must not cost the connection
                     log.warning("skipped unreadable frame: %s", e)
                     continue
@@ -2196,9 +2466,9 @@ async def _stream(cfg: BridgeConfig, bridge: Bridge) -> None:
                     last_state = now
                 if now - last_history >= cfg.history_every_s:
                     try:
-                        r = await client.get(f"{cfg.colony_url}/api/history")
-                        r.raise_for_status()
-                        await bridge.poll_history(r.json())
+                        await bridge.poll_history(await fetch_history())
+                    except BusClosed:
+                        raise
                     except Exception as e:
                         log.warning("history poll failed: %s", e)
                     last_history = now
@@ -2207,7 +2477,15 @@ async def _stream(cfg: BridgeConfig, bridge: Bridge) -> None:
 
 async def run(cfg: BridgeConfig) -> None:
     bus = Bus(cfg.nats_url, user=cfg.nats_user, password=cfg.nats_password)
-    await bus.connect()
+    backoff = 1.0
+    while True:
+        try:
+            await bus.connect()
+            break
+        except Exception as e:      # a boot-time DNS or NATS blip must not burn a start slot
+            log.error("nats connect failed: %s; retrying in %.0fs", e, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
     mind = Mind(cfg.mind_agent_id or "grid-unbound", bus, kannaka_bin=cfg.kannaka_bin,
                 data_dir=Path(cfg.mind_data_dir) if cfg.mind_data_dir else None)
     flux = Flux(cfg.flux_url) if cfg.flux_url else None
@@ -2216,10 +2494,16 @@ async def run(cfg: BridgeConfig) -> None:
     bridge = Bridge(cfg, bus=bus, mind=mind, flux=flux)
     backoff = 1.0
     while True:
+        frames = bridge.frames_handled
         try:
             await _stream(cfg, bridge)
             backoff = 1.0
+        except BusClosed as e:      # EX_TEMPFAIL: only a restart gets a live client back
+            log.error("nats gave up: %s; exiting for systemd to restart", e)
+            raise SystemExit(75) from e
         except Exception as e:
+            if bridge.frames_handled > frames:
+                backoff = 1.0       # that connection worked; this is a fresh drop
             log.error("stream dropped: %s; reconnecting in %.0fs", e, backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60.0)
@@ -2238,7 +2522,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run to verify they pass**
 
 Run: `python -m pytest tests/test_bridge.py -q`
-Expected: `15 passed`
+Expected: `21 passed`
 
 - [ ] **Step 5: Mutation checks, then commit**
 
@@ -2260,8 +2544,8 @@ git commit -m "feat: bridge loop — events, state, history, chronicle over the 
 - Test: `tests/test_odin.py`
 
 **Interfaces:**
-- Consumes: `parse_request, render_prompt, validate, write_proposal, Rejection` (Task 4); `Mind, MindError` (Task 8); `Bus, BusError, BusTimeout` (Task 6); `envelope, subject` (Task 2).
-- Produces: `class Relay(queue: Path, *, colony: str, agent_id: str, mind, bus, timeout_s=ASK_TIMEOUT_S, retry_after_s=60.0, clock=time.monotonic)` with `async poll_once() -> str | None` returning `"proposed"`, `"rejected"`, `"deferred"`, or `None`; `async run(cfg)`; `RelayConfig.from_env()`; `main()`.
+- Consumes: `parse_request, render_prompt, validate, write_proposal, Rejection` (Task 4); `Mind, MindError, Throttle, REMEMBER_MIN_INTERVAL_S` (Task 8); `Bus, BusClosed, BusError, BusTimeout` (Task 6); `envelope, subject` (Task 2).
+- Produces: `class Relay(queue: Path, *, colony: str, agent_id: str, mind, bus, timeout_s=ASK_TIMEOUT_S, retry_after_s=60.0, clock=time.monotonic, throttle=None, state_fetch=None)` with `async poll_once() -> str | None` returning `"proposed"`, `"rejected"`, `"deferred"`, or `None`; `async run(cfg)`; `RelayConfig.from_env()`; `main()`.
 
 Rules (spec §5 plus one reconciliation): a rejected reply deletes `request.json` so thegrid can file a fresh one at the next qualifying birth — otherwise a permanently bad request would block the Odin path forever, since thegrid only writes a request when none exists. A mind timeout leaves the request in place and retries after `retry_after_s`.
 
@@ -2272,20 +2556,40 @@ Rules (spec §5 plus one reconciliation): a rejected reply deletes `request.json
 import json
 from pathlib import Path
 
-from grid.natsio import BusTimeout
+import pytest
+
+from grid.natsio import BusClosed, BusTimeout
 from grid.odin import Relay
 
 ISA = [{"name": n, "cost": 0.1, "effect": n} for n in ("nop", "harvest", "copy", "fork")]
+
+# thegrid's OdinMutator writes `parent: parent.telemetry()`; these are exactly
+# the keys Organism.telemetry() returns, and it carries no epoch or tick.
+PARENT = {
+    "age": 412, "energy": 90.0, "generation": 7, "births": 3, "harvested": 121.5,
+    "tasks_solved": {"nand": 2}, "genome_length": 3,
+    "signals_sent": 4, "signals_heard": 6, "signal_guided_moves": 1,
+    "post_signal_harvested": 3.25, "structures_built": 0, "neighbor_reads": 2,
+    "foreign_copies": 0, "moves": 88, "scans": 12, "guided_moves": 5,
+    "post_move_harvested": 9.5, "scratch_nonzero": 1, "forecast_attempts": 2,
+    "forecasts_solved": 1, "weather_cues_seen": 3, "weather_cue_signals": 1,
+    "experimental_ops": {}, "salvaged": 0.0, "stolen": 0.0, "robbed": 0.0,
+    "corruptions": 0, "corrupted": 0,
+}
 
 
 def write_request(queue: Path, request_id="r1") -> Path:
     queue.mkdir(parents=True, exist_ok=True)
     p = queue / "request.json"
     p.write_text(json.dumps({"request_id": request_id, "created_at": 1.0,
-                             "parent": {"id": 1, "energy": 90.0, "tick": 321, "epoch": 2},
+                             "parent": dict(PARENT),
                              "genome": ["harvest", "copy", "fork"], "instruction_set": ISA,
                              "ecology": {}, "directive": "author one variant"}))
     return p
+
+
+async def state_of(epoch: int, tick: int) -> dict:
+    return {"epoch": epoch, "tick": tick}
 
 
 class FakeMind:
@@ -2293,6 +2597,11 @@ class FakeMind:
 
     def __init__(self, answer=None, exc=None):
         self.answer, self.exc, self.asked, self.recalled = answer, exc, [], []
+        self.remembered: list[tuple[str, list[str]]] = []
+
+    def remember(self, text, tags, *, category="grid"):
+        self.remembered.append((text, tags))
+        return True
 
     async def recall(self, query, top_k=5):
         self.recalled.append(query)
@@ -2321,9 +2630,9 @@ class Clock:
         return self.t
 
 
-def relay(tmp_path, mind, bus=None, clock=None) -> Relay:
+def relay(tmp_path, mind, bus=None, clock=None, state_fetch=None) -> Relay:
     return Relay(tmp_path, colony="c", agent_id="grid-c", mind=mind, bus=bus or FakeBus(),
-                 clock=clock or Clock())
+                 clock=clock or Clock(), state_fetch=state_fetch)
 
 
 async def test_no_request_is_a_noop(tmp_path):
@@ -2334,7 +2643,7 @@ async def test_valid_reply_writes_proposal_and_publishes_proposed(tmp_path):
     write_request(tmp_path)
     bus = FakeBus()
     mind = FakeMind(answer='["harvest","harvest","copy","fork"]')
-    r = relay(tmp_path, mind, bus)
+    r = relay(tmp_path, mind, bus, state_fetch=lambda: state_of(2, 321))
     assert await r.poll_once() == "proposed"
     assert json.loads((tmp_path / "proposal.json").read_text()) == {"genome": ["harvest", "harvest", "copy", "fork"]}
     assert "fork-early won" in mind.asked[0]                       # recall reached the prompt
@@ -2387,6 +2696,112 @@ async def test_replaced_request_is_asked_again(tmp_path):
     write_request(tmp_path, "r2")
     assert await r.poll_once() == "proposed"
     assert len(mind.asked) == 2
+
+
+class ClosedBus(FakeBus):
+    """The client gave up reconnecting; nothing will be delivered again."""
+
+    async def publish(self, subject, payload):
+        raise BusClosed("connection closed for good")
+
+
+async def test_closed_bus_is_fatal_for_the_relay(tmp_path):
+    write_request(tmp_path)
+    r = relay(tmp_path, FakeMind(answer='["harvest","fork"]'), ClosedBus())
+    with pytest.raises(BusClosed):
+        await r.poll_once()
+
+
+async def test_a_rejection_is_remembered_and_a_proposal_is_not(tmp_path):
+    write_request(tmp_path)
+    mind = FakeMind(answer='["teleport"]')
+    assert await relay(tmp_path, mind).poll_once() == "rejected"
+    assert len(mind.remembered) == 1
+    text, tags = mind.remembered[0]
+    assert text.startswith("Odin rejected a proposal for request r1:")
+    assert "teleport" in text and "parent genome" in text
+    assert tags == ["c", "odin.rejected"]
+
+    write_request(tmp_path, "r2")
+    good = FakeMind(answer='["harvest","fork"]')
+    assert await relay(tmp_path, good).poll_once() == "proposed"
+    assert good.remembered == []
+
+
+async def test_a_stale_proposal_is_renamed_and_counted(tmp_path):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "proposal.json").write_text(json.dumps({"genome": ["harvest"]}))
+    mind = FakeMind(answer='["harvest","fork"]')
+    r = relay(tmp_path, mind)
+    assert await r.poll_once() is None              # nothing to answer yet
+    assert not (tmp_path / "proposal.json").exists()
+    assert [p.name for p in tmp_path.glob("proposal.stale-*.json")]
+    assert r.stale_count == 1
+
+    write_request(tmp_path)                          # the next request is asked normally
+    assert await r.poll_once() == "proposed"
+    assert len(mind.asked) == 1
+
+
+def test_config_from_env_carries_the_mind_data_dir_and_binary(monkeypatch):
+    from grid.odin import RelayConfig
+    for k in ("ODIN_QUEUE", "MIND_AGENT_ID", "NATS_URL", "NATS_USER", "NATS_PASSWORD",
+              "MIND_DATA_DIR", "KANNAKA_BIN", "ODIN_POLL_S"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("COLONY_SLUG", "colony-one")
+    assert RelayConfig.from_env().mind_data_dir is None
+    assert RelayConfig.from_env().kannaka_bin == "kannaka"
+    monkeypatch.setenv("MIND_DATA_DIR", "/srv/grid/colony-one/memory")
+    monkeypatch.setenv("KANNAKA_BIN", "/home/nick/.local/bin/kannaka")
+    c = RelayConfig.from_env()
+    assert c.mind_data_dir == "/srv/grid/colony-one/memory"
+    assert c.kannaka_bin == "/home/nick/.local/bin/kannaka"
+
+async def test_epoch_and_tick_fall_back_to_zero_when_the_colony_is_unreachable(tmp_path):
+    write_request(tmp_path)
+    bus = FakeBus()
+
+    async def broken():
+        raise RuntimeError("connection refused")
+
+    r = relay(tmp_path, FakeMind(answer='["harvest","fork"]'), bus, state_fetch=broken)
+    assert await r.poll_once() == "proposed"
+    payload = bus.published[0][1]
+    assert payload["epoch"] == 0 and payload["tick"] == 0
+
+
+async def test_an_unparseable_request_is_binned_after_three_polls(tmp_path):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    request = tmp_path / "request.json"
+    request.write_text("{not json at all")
+    mind = FakeMind(answer='["harvest","fork"]')
+    r = relay(tmp_path, mind, state_fetch=lambda: state_of(3, 90))
+    assert await r.poll_once() is None
+    assert await r.poll_once() is None
+    assert request.exists()                    # two strikes leave it for thegrid to fix
+    assert await r.poll_once() == "rejected"
+    assert not request.exists()
+    subj, payload = r.bus.published[0]
+    assert subj == "GRID.c.event.odin.rejected"
+    assert payload["reason"] == "unparseable request"
+    assert payload["epoch"] == 3 and payload["tick"] == 90
+    assert not mind.asked
+
+
+async def test_a_good_parse_resets_the_unparseable_count(tmp_path):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    request = tmp_path / "request.json"
+    request.write_text("{not json at all")
+    mind = FakeMind(answer='["harvest","fork"]')
+    r = relay(tmp_path, mind)
+    assert await r.poll_once() is None
+    assert await r.poll_once() is None
+    write_request(tmp_path)
+    assert await r.poll_once() == "proposed"
+    (tmp_path / "proposal.json").unlink()
+    request.write_text("{not json at all")
+    assert await r.poll_once() is None          # back to strike one, not binned
+    assert request.exists()
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -2413,19 +2828,25 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Awaitable, Callable
+
+import httpx
 
 from .envelope import envelope, subject
-from .mind import ASK_TIMEOUT_S, Mind, MindError
-from .natsio import Bus, BusError, BusTimeout
+from .mind import ASK_TIMEOUT_S, REMEMBER_MIN_INTERVAL_S, Mind, MindError, Throttle
+from .natsio import Bus, BusClosed, BusError, BusTimeout
 from .proposal import Rejection, parse_request, render_prompt, validate, write_proposal
 
 log = logging.getLogger("grid.odin")
+
+UNPARSEABLE_LIMIT = 3       # consecutive failed parses before the file is binned
 
 
 class Relay:
     def __init__(self, queue: Path, *, colony: str, agent_id: str, mind, bus,
                  timeout_s: float = ASK_TIMEOUT_S, retry_after_s: float = 60.0,
-                 clock=time.monotonic):
+                 clock=time.monotonic, throttle: Throttle | None = None,
+                 state_fetch: Callable[[], Awaitable[dict]] | None = None):
         self.queue = Path(queue)
         self.colony = colony
         self.agent_id = agent_id
@@ -2434,44 +2855,90 @@ class Relay:
         self.timeout_s = timeout_s
         self.retry_after_s = retry_after_s
         self._clock = clock
+        self.state_fetch = state_fetch
+        self.throttle = throttle or Throttle(REMEMBER_MIN_INTERVAL_S, clock=clock)
+        self.stale_count = 0
         self._retry_not_before: dict[str, float] = {}
+        self._unparseable: dict[str, int] = {}
 
     async def _publish(self, kind: str, epoch: int, tick: int, **fields) -> None:
         try:
             await self.bus.publish(subject(self.colony, "event", f"odin.{kind}"),
                                    envelope(agent_id=self.agent_id, colony=self.colony,
                                             epoch=epoch, tick=tick, kind=f"odin.{kind}", **fields))
+        except BusClosed:
+            raise
         except BusError as e:
             log.error("odin.%s publish failed: %s", kind, e)
 
+    async def _epoch_tick(self) -> tuple[int, int]:
+        """thegrid's Organism.telemetry() carries no epoch or tick; /api/state does."""
+        if self.state_fetch is None:
+            return 0, 0
+        try:
+            state = await self.state_fetch()
+            return int(state.get("epoch", 0) or 0), int(state.get("tick", 0) or 0)
+        except Exception as e:      # an envelope with 0/0 beats no envelope at all
+            log.warning("epoch/tick unavailable from the colony: %s", e)
+            return 0, 0
+
     async def poll_once(self) -> str | None:
         request_path = self.queue / "request.json"
-        if (self.queue / "proposal.json").exists() or not request_path.exists():
+        proposal_path = self.queue / "proposal.json"
+        if proposal_path.exists():
+            if request_path.exists():
+                return None                     # thegrid has not consumed it yet
+            # The request is gone, so thegrid will never read this proposal.
+            stale = self.queue / f"proposal.stale-{int(time.time())}.json"
+            proposal_path.rename(stale)
+            self.stale_count += 1
+            log.warning("stale proposal with no request: renamed to %s", stale.name)
+        if not request_path.exists():
             return None
+        key = str(request_path)
         try:
             req = parse_request(request_path)
         except ValueError as e:
-            log.error("unreadable request: %s", e)
-            return None
+            seen = self._unparseable[key] = self._unparseable.get(key, 0) + 1
+            log.error("unreadable request (%d/%d): %s", seen, UNPARSEABLE_LIMIT, e)
+            if seen < UNPARSEABLE_LIMIT:
+                return None
+            # thegrid writes a request only when none exists, so leaving a file
+            # nobody can read here would block the Odin path forever.
+            request_path.unlink(missing_ok=True)
+            del self._unparseable[key]
+            epoch, tick = await self._epoch_tick()
+            await self._publish("rejected", epoch, tick, request_id=None,
+                                reason="unparseable request")
+            return "rejected"
+        self._unparseable.pop(key, None)        # consecutive, so a good parse resets
         if self._clock() < self._retry_not_before.get(req.request_id, 0.0):
             return None
-        epoch = int(req.parent.get("epoch", 0) or 0)
-        tick = int(req.parent.get("tick", 0) or 0)
 
         recall = await self.mind.recall(f"colony {self.colony} genome lineage {' '.join(req.genome[:6])}")
         prompt = render_prompt(req, recall)
         try:
             reply = await self.mind.ask(prompt, recall_query=f"colony {self.colony}", timeout_s=self.timeout_s)
+        except BusClosed:
+            raise
         except (BusTimeout, BusError, MindError) as e:
             log.warning("mind unavailable for %s: %s; retry in %.0fs", req.request_id, e, self.retry_after_s)
             self._retry_not_before[req.request_id] = self._clock() + self.retry_after_s
             return "deferred"
 
         result = validate(reply, req)
+        epoch, tick = await self._epoch_tick()
         if isinstance(result, Rejection):
             log.info("rejected %s: %s", req.request_id, result.reason)
             request_path.unlink(missing_ok=True)   # let thegrid file a fresh request
             await self._publish("rejected", epoch, tick, request_id=req.request_id, reason=result.reason)
+            if self.throttle.allow("odin.rejected"):
+                # Spec 6: the mind learns what does not work, not only what does.
+                await asyncio.to_thread(
+                    self.mind.remember,
+                    f"Odin rejected a proposal for request {req.request_id}: "
+                    f"{result.reason} (parent genome {req.genome[:8]}...)",
+                    [self.colony, "odin.rejected"])
             return "rejected"
         if not write_proposal(self.queue, req, result):
             log.info("request %s vanished before the proposal landed", req.request_id)
@@ -2485,10 +2952,13 @@ class Relay:
 class RelayConfig:
     queue: Path
     colony: str
+    colony_url: str
     agent_id: str
     nats_url: str
     nats_user: str | None
     nats_password: str | None
+    mind_data_dir: str | None
+    kannaka_bin: str
     poll_s: float
 
     @classmethod
@@ -2500,28 +2970,50 @@ class RelayConfig:
         return cls(
             queue=Path(env("ODIN_QUEUE", f"/srv/grid/{colony}/state/operator")),
             colony=colony,
+            colony_url=env("COLONY_URL", "http://127.0.0.1:8787").rstrip("/"),
             agent_id=env("MIND_AGENT_ID", f"grid-{colony}"),
             nats_url=env("NATS_URL", "nats://swarm.ninja-portal.com:4222"),
             nats_user=env("NATS_USER") or None,
             nats_password=env("NATS_PASSWORD") or None,
+            mind_data_dir=env("MIND_DATA_DIR") or None,
+            kannaka_bin=env("KANNAKA_BIN", "kannaka"),
             poll_s=float(env("ODIN_POLL_S", "1")),
         )
 
 
 async def run(cfg: RelayConfig) -> None:
     bus = Bus(cfg.nats_url, user=cfg.nats_user, password=cfg.nats_password)
-    await bus.connect()
-    mind = Mind(cfg.agent_id, bus)
-    relay = Relay(cfg.queue, colony=cfg.colony, agent_id=cfg.agent_id, mind=mind, bus=bus)
-    log.info("watching %s for %s", cfg.queue, cfg.agent_id)
+    backoff = 1.0
     while True:
         try:
-            outcome = await relay.poll_once()
-            if outcome:
-                log.info("%s", outcome)
-        except Exception as e:  # one bad poll must not kill the relay
-            log.exception("poll failed: %s", e)
-        await asyncio.sleep(cfg.poll_s)
+            await bus.connect()
+            break
+        except Exception as e:      # a boot-time DNS or NATS blip must not burn a start slot
+            log.error("nats connect failed: %s; retrying in %.0fs", e, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
+    mind = Mind(cfg.agent_id, bus, kannaka_bin=cfg.kannaka_bin,
+                data_dir=Path(cfg.mind_data_dir) if cfg.mind_data_dir else None)
+    async with httpx.AsyncClient(timeout=2) as client:
+        async def fetch_state() -> dict:
+            r = await client.get(f"{cfg.colony_url}/api/state")
+            r.raise_for_status()
+            return r.json()
+
+        relay = Relay(cfg.queue, colony=cfg.colony, agent_id=cfg.agent_id, mind=mind, bus=bus,
+                      state_fetch=fetch_state)
+        log.info("watching %s for %s", cfg.queue, cfg.agent_id)
+        while True:
+            try:
+                outcome = await relay.poll_once()
+                if outcome:
+                    log.info("%s", outcome)
+            except BusClosed as e:  # EX_TEMPFAIL: only a restart gets a live client back
+                log.error("nats gave up: %s; exiting for systemd to restart", e)
+                raise SystemExit(75) from e
+            except Exception as e:  # one bad poll must not kill the relay
+                log.exception("poll failed: %s", e)
+            await asyncio.sleep(cfg.poll_s)
 
 
 def main() -> None:
@@ -2537,7 +3029,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run to verify they pass**
 
 Run: `python -m pytest tests/test_odin.py -q`
-Expected: `6 passed`
+Expected: `13 passed`
 
 - [ ] **Step 5: Mutation checks, then commit**
 
@@ -2559,7 +3051,7 @@ git commit -m "feat: Odin relay — request to mind to validated atomic proposal
 - Test: `tests/test_launcher.py`
 
 **Interfaces:**
-- Produces: `heat_proxy_from_cpu(sample: Callable[[], float]) -> Callable[[], float]` (maps a 0..1 CPU fraction to °C: `45 + 40 * fraction`), `install_heat_proxy(substrate_module) -> str` (returns `"k10temp"` when the real sensor works, else `"proxy"` after replacing `substrate_module.cpu_temperature_c`), `main(argv)`.
+- Produces: `heat_proxy_from_cpu(sample: Callable[[], float]) -> Callable[[], float]` (maps a 0..1 CPU fraction to °C: `45 + 40 * fraction`), `install_heat_proxy(substrate_module, cpu_fraction=None) -> str` (returns `"k10temp"` when the real sensor works, else `"proxy"` after replacing `substrate_module.cpu_temperature_c` with a whole-host `/proc/stat` sampler), `_host_cpu_fraction(*, stat_path=Path("/proc/stat"), clock=time.monotonic)`, `main(argv)`.
 
 Why: thegrid's `SubstrateWorld.__init__` calls `cpu_temperature_c()`, which raises `RuntimeError` when no `k10temp` hwmon exists (`thegrid/src/colony/substrate.py:31-47`), and `live.main()` hard-codes `physical=True`. A Proxmox VM has no such sensor. The launcher keeps memory and CPU accounting on real cgroup readings and supplies only the temperature, from the service's own cgroup CPU usage, when the sensor is absent. This is the one item to raise upstream with EckmanTechLLC (a `--heat simulated` flag would remove the launcher).
 
@@ -2570,7 +3062,7 @@ Why: thegrid's `SubstrateWorld.__init__` calls `cpu_temperature_c()`, which rais
 import types
 from pathlib import Path
 
-from grid.launcher import _cgroup_cpu_fraction, heat_proxy_from_cpu, install_heat_proxy
+from grid.launcher import _host_cpu_fraction, heat_proxy_from_cpu, install_heat_proxy
 
 
 def test_heat_proxy_maps_cpu_fraction_to_celsius():
@@ -2594,29 +3086,32 @@ def test_install_replaces_missing_sensor_with_proxy():
     assert mod.cpu_temperature_c() == 65.0
 
 
-def write_cgroup(tmp_path: Path, usage_usec: int) -> tuple[Path, Path]:
-    cgroup_file = tmp_path / "proc-self-cgroup"
-    cgroup_file.write_text("0::/system.slice/thegrid-colony.service\n")
-    root = tmp_path / "sys-fs-cgroup"
-    stat_dir = root / "system.slice" / "thegrid-colony.service"
-    stat_dir.mkdir(parents=True, exist_ok=True)
-    (stat_dir / "cpu.stat").write_text(f"usage_usec {usage_usec}\nuser_usec 1\n")
-    return cgroup_file, root
+def write_stat(path: Path, busy: int, idle: int) -> None:
+    """A /proc/stat-shaped file: user nice system idle iowait irq softirq steal."""
+    lines = [f"cpu  {busy} 0 0 {idle} 0 0 0 0",
+             f"cpu0 {busy} 0 0 {idle} 0 0 0 0",
+             "intr 12345 0 0"]
+    path.write_text("\n".join(lines) + "\n")
 
 
-def test_sampler_seeds_baseline_so_first_sample_is_not_full_heat(tmp_path):
-    cgroup_file, root = write_cgroup(tmp_path, 5_000_000)
-    t = [100.0]
-    sample = _cgroup_cpu_fraction(cgroup_file=cgroup_file, cgroup_root=root, clock=lambda: t[0])
-    t[0] = 101.0
-    assert sample() == 0.0                          # no usage since construction
-    write_cgroup(tmp_path, 5_500_000)
-    t[0] = 102.0
-    assert sample() == 0.5                          # 0.5 s of CPU over 1 s
+def test_host_sampler_seeds_its_baseline_so_the_first_sample_is_not_full_heat(tmp_path):
+    stat = tmp_path / "proc-stat"
+    write_stat(stat, busy=1000, idle=9000)
+    sample = _host_cpu_fraction(stat_path=stat)
+    assert sample() == 0.0                       # nothing moved since construction
+
+    write_stat(stat, busy=1500, idle=9500)       # 500 of 1000 new jiffies were busy
+    assert sample() == 0.5
+
+    proxy = heat_proxy_from_cpu(sample)
+    assert proxy() == 65.0                       # /proc/stat still: hold the last fraction
+
+    write_stat(stat, busy=2500, idle=9500)       # every one of 1000 new jiffies was busy
+    assert proxy() == 85.0
 
 
-def test_sampler_never_raises_when_cgroup_files_are_missing(tmp_path):
-    sample = _cgroup_cpu_fraction(cgroup_file=tmp_path / "absent", cgroup_root=tmp_path / "nowhere")
+def test_host_sampler_never_raises_when_proc_stat_is_missing(tmp_path):
+    sample = _host_cpu_fraction(stat_path=tmp_path / "absent")
     assert sample() == 0.0
     assert heat_proxy_from_cpu(sample)() == 45.0
 ```
@@ -2637,6 +3132,14 @@ thegrid is imported from THEGRID_DIR (default: the submodule beside this
 package, or /srv/grid/thegrid on Skywave). Nothing under it is modified; the
 only intervention is replacing `substrate.cpu_temperature_c` when the real
 one raises. Memory pressure and CPU usage remain real cgroup readings.
+
+The proxy reads the WHOLE HOST, not the colony's cgroup. thegrid's substrate
+fires a storm when its fast heat EMA rises 1.5 C over a slow baseline, and the
+colony is capped at CPUQuota=5%: its own work could never move a cgroup-derived
+number that far, so `storm` and `thermal.throttle` could never fire. Reading
+the host means the mind's own LLM calls, the KAX machines, and any other load
+on the box are the colony's weather -- which is exactly what thegrid's
+substrate intends by "the weather is Odin itself".
 """
 from __future__ import annotations
 
@@ -2657,42 +3160,39 @@ def heat_proxy_from_cpu(sample: Callable[[], float]) -> Callable[[], float]:
     return proxy
 
 
-def _cgroup_cpu_fraction(*, cgroup_file: Path = Path("/proc/self/cgroup"),
-                         cgroup_root: Path = Path("/sys/fs/cgroup"),
-                         clock: Callable[[], float] = time.monotonic) -> Callable[[], float]:
-    """Fraction of one CPU this service's cgroup used since the previous sample.
+def _host_cpu_fraction(*, stat_path: Path = Path("/proc/stat"),
+                       clock: Callable[[], float] = time.monotonic) -> Callable[[], float]:
+    """Fraction of the whole machine's CPU that was busy since the previous sample.
 
     Never raises: the proxy exists to keep the colony alive, so a missing or
-    unreadable cgroup file reads as "no change since last time".
+    unreadable /proc/stat reads as "no change since last time".
     """
-    cgroup = cgroup_root
-    try:
-        for line in cgroup_file.read_text().splitlines():
-            if line.startswith("0::"):
-                cgroup = cgroup_root / line[3:].lstrip("/")
-    except OSError:
-        pass
-
-    def read_usec() -> int | None:
+    def read_totals() -> tuple[int, int] | None:
+        """(busy, total) jiffies across every CPU, or None if unreadable."""
         try:
-            for row in (cgroup / "cpu.stat").read_text().splitlines():
-                if row.startswith("usage_usec"):
-                    return int(row.split()[1])
+            for line in stat_path.read_text().splitlines():
+                if line.startswith("cpu "):
+                    # user nice system idle iowait irq softirq steal [guest...]
+                    fields = [int(v) for v in line.split()[1:]]
+                    total = sum(fields)
+                    return total - fields[3] - fields[4], total
         except (OSError, ValueError, IndexError):
             return None
         return None
 
-    last = [clock(), read_usec() or 0]
+    last = [read_totals()]          # seeded now, so the first sample is a delta
     fraction = [0.0]
 
     def sample() -> float:
-        now, usec = clock(), read_usec()
-        if usec is None:
+        current = read_totals()
+        if current is None:
             return fraction[0]
-        elapsed, delta = now - last[0], usec - last[1]
-        last[0], last[1] = now, usec
-        if elapsed > 0 and delta >= 0:
-            fraction[0] = (delta / 1_000_000) / elapsed
+        previous, last[0] = last[0], current
+        if previous is None:
+            return fraction[0]
+        busy_delta, total_delta = current[0] - previous[0], current[1] - previous[1]
+        if total_delta > 0:
+            fraction[0] = min(1.0, max(0.0, busy_delta / total_delta))
         return fraction[0]
     return sample
 
@@ -2702,7 +3202,7 @@ def install_heat_proxy(substrate_module, cpu_fraction: Callable[[], float] | Non
         substrate_module.cpu_temperature_c()
         return "k10temp"
     except RuntimeError:
-        substrate_module.cpu_temperature_c = heat_proxy_from_cpu(cpu_fraction or _cgroup_cpu_fraction())
+        substrate_module.cpu_temperature_c = heat_proxy_from_cpu(cpu_fraction or _host_cpu_fraction())
         return "proxy"
 
 
@@ -2730,7 +3230,7 @@ Expected: `5 passed`
 
 ```bash
 git add grid/launcher.py tests/test_launcher.py
-git commit -m "feat: colony launcher with cgroup-derived heat proxy when k10temp is absent"
+git commit -m "feat: colony launcher with a whole-host heat proxy when k10temp is absent"
 ```
 
 ---
@@ -2824,7 +3324,7 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/srv/grid/colony-one/state
 MemoryMax=192M
-MemoryHigh=160M
+MemoryHigh=176M
 MemorySwapMax=0
 CPUQuota=5%
 
@@ -2979,6 +3479,7 @@ Host facts: `NickFlach/kax-computer` `docs/DEPLOY.md` (WARP on, `ssh debain1`, u
 ```bash
 sudo install -d -o nick -g nick /srv/grid
 cd /srv/grid && git clone --recurse-submodules https://github.com/NickFlach/kannaka-grid.git
+cd /srv/grid/kannaka-grid
 ln -s /srv/grid/kannaka-grid/thegrid /srv/grid/thegrid
 python3 -m venv /srv/grid/venv && /srv/grid/venv/bin/pip install -e "/srv/grid/kannaka-grid[dev]" -e /srv/grid/thegrid
 install -d -o nick -g nick /srv/grid/colony-one/state /srv/grid/colony-one/state/operator /srv/grid/colony-one/memory
@@ -2987,6 +3488,7 @@ cp deploy/grid.env.example /srv/grid/grid.env && chmod 600 /srv/grid/grid.env
 Receipt: `/srv/grid/venv/bin/python -c "import grid, src.colony.live"` prints nothing.
 
 ## 1. Mind
+All commands run from `/srv/grid/kannaka-grid`.
 ```bash
 KANNAKA_DATA_DIR=/srv/grid/colony-one/memory kannaka init      # scaffold
 # mint a LiteLLM virtual key the same way create_machine.py does (budget 0.5/30d, model agent-brain)
@@ -2999,6 +3501,7 @@ Sudoers line for the dream restart: `nick ALL=(root) NOPASSWD: /usr/bin/systemct
 Receipt: `kannaka swarm peers` lists `grid-colony-one` with `ask` in capabilities.
 
 ## 2. Colony
+All commands run from `/srv/grid/kannaka-grid`.
 ```bash
 sudo cp deploy/systemd/thegrid-colony.service /etc/systemd/system/ && sudo systemctl daemon-reload
 sudo systemctl enable --now thegrid-colony.service
@@ -3008,15 +3511,16 @@ curl -s 127.0.0.1:8787/api/state | python3 -c "import json,sys; s=json.load(sys.
 Receipt: name `colony-one`, tick increasing between two calls.
 
 ## 3. Bridge and relay
+All commands run from `/srv/grid/kannaka-grid`.
 ```bash
 sudo cp deploy/systemd/grid-bridge.service deploy/systemd/grid-odin.service /etc/systemd/system/ && sudo systemctl daemon-reload
 sudo systemctl enable --now grid-bridge.service grid-odin.service
 ```
 Receipts (acceptance criteria, spec §12):
 1. `journalctl -u grid-bridge -f` shows no `dropped` lines; from the operator seat, `kannaka swarm tail --subject 'GRID.>'` (or the nats app's capture) shows `GRID.colony-one.event.epoch.started` then `.state` every 60 s.
-2. Within one storm cycle (1000 ticks at 10 t/s ≈ 2 min) a `GRID.colony-one.event.storm` message appears.
+2. Storms fire when host load rises (≈ +4 % of all CPUs sustained lifts the proxy ≥ 1.5 °C). Force one: `timeout 30 python3 -c 'while True: pass'` in two shells, then within ~1000 ticks `GRID.colony-one.event.storm` appears.
 3. `KANNAKA_DATA_DIR=/srv/grid/colony-one/memory kannaka status` shows memory count rising; `kannaka recall "storm"` against that dir returns a colony fact.
-4. `ls /srv/grid/colony-one/state/operator` shows `request.json` then `proposal.json`; `journalctl -u grid-odin` logs `proposed`; `/api/state` (thegrid's own telemetry for the Odin mutator) shows accepted ≥ 1 once a birth consumes it.
+4. `ls /srv/grid/colony-one/state/operator` shows `request.json` then `proposal.json`; both vanish from the operator dir after a later birth (thegrid consumes them together); `journalctl -u grid-odin` shows `proposed`; `curl -s 127.0.0.1:8787/api/history | python3 -c "import json,sys; print(json.load(sys.stdin)['mutationMechanisms'])"` lists the mutation types thegrid recorded for the epoch.
 5. After tick 2000, three `GRID.colony-one.chronicle.*` messages appear.
 6. `sudo systemctl stop grid-bridge grid-odin grid-mind`; the colony's tick rate in `/api/state` is unchanged over 60 s. Start them again.
 
@@ -3095,7 +3599,8 @@ def _finite_memory_max() -> bool:
 
 skip = pytest.mark.skipif(
     os.environ.get("GRID_INTEGRATION") != "1" or sys.platform != "linux" or not _finite_memory_max(),
-    reason="set GRID_INTEGRATION=1 on Linux inside a cgroup with finite memory.max")
+    reason="set GRID_INTEGRATION=1 on Linux inside a cgroup with finite memory.max, "
+           "with thegrid's aiohttp dependency installed in the venv (pip install -e thegrid)")
 
 
 def free_port() -> int:
@@ -3114,20 +3619,39 @@ def colony(tmp_path):
                              "--ticks-per-second", "50", "--mutator", "odin", "--name", "smoke",
                              "--state", str(state)], env=env, cwd=ROOT,
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-    base = f"http://127.0.0.1:{port}"
-    deadline = time.time() + 30
-    while time.time() < deadline:
+
+    def stop() -> None:
+        if proc.poll() is not None:
+            return
+        proc.terminate()
         try:
-            if httpx.get(f"{base}/api/state", timeout=1).status_code == 200:
-                break
-        except httpx.HTTPError:
-            time.sleep(0.5)
-    else:
-        proc.kill()
-        pytest.fail(f"colony did not come up: {proc.stderr.read()[-2000:]}")
-    yield base, state.parent / "operator"
-    proc.terminate()
-    proc.wait(10)
+            proc.wait(10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+    base = f"http://127.0.0.1:{port}"
+    try:
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            # process has exited, so stderr is at EOF and this read cannot block
+            if proc.poll() is not None:
+                pytest.fail(f"colony exited early: {proc.stderr.read()[-2000:]}")
+            try:
+                if httpx.get(f"{base}/api/state", timeout=1).status_code == 200:
+                    break
+            except httpx.HTTPError:
+                time.sleep(0.5)
+        else:
+            stop()
+            pytest.fail(f"colony did not come up: {proc.stderr.read()[-2000:]}")
+    except BaseException:
+        stop()
+        raise
+    try:
+        yield base, state.parent / "operator"
+    finally:
+        stop()
 
 
 @skip
@@ -3167,7 +3691,17 @@ async def test_relay_answers_a_request_written_by_thegrid_shape(colony):
     queue.mkdir(exist_ok=True)
     (queue / "request.json").write_text(json.dumps({
         "request_id": "smoke1", "created_at": time.time(),
-        "parent": {"id": 1, "energy": 90.0, "tick": 10, "epoch": 1},
+        # exactly what thegrid's OdinMutator writes: Organism.telemetry(), which
+        # carries no epoch and no tick.
+        "parent": {"age": 120, "energy": 90.0, "generation": 2, "births": 1,
+                   "harvested": 40.0, "tasks_solved": {}, "genome_length": 6,
+                   "signals_sent": 0, "signals_heard": 0, "signal_guided_moves": 0,
+                   "post_signal_harvested": 0.0, "structures_built": 0,
+                   "neighbor_reads": 0, "foreign_copies": 0, "moves": 31, "scans": 4,
+                   "guided_moves": 0, "post_move_harvested": 0.0, "scratch_nonzero": 0,
+                   "forecast_attempts": 0, "forecasts_solved": 0, "weather_cues_seen": 0,
+                   "weather_cue_signals": 0, "experimental_ops": {}, "salvaged": 0.0,
+                   "stolen": 0.0, "robbed": 0.0, "corruptions": 0, "corrupted": 0},
         "genome": ["harvest", "alloc", "copy", "ifnotdone", "jmpb", "fork"],
         "instruction_set": [{"name": n, "cost": 0.1, "effect": n} for n in
                             ("nop", "harvest", "alloc", "copy", "ifnotdone", "jmpb", "fork")],
