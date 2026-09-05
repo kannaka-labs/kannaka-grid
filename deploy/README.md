@@ -6,6 +6,7 @@ Host facts: `NickFlach/kax-computer` `docs/DEPLOY.md` (WARP on, `ssh debain1`, u
 ```bash
 sudo install -d -o nick -g nick /srv/grid
 cd /srv/grid && git clone --recurse-submodules https://github.com/NickFlach/kannaka-grid.git
+cd /srv/grid/kannaka-grid
 ln -s /srv/grid/kannaka-grid/thegrid /srv/grid/thegrid
 python3 -m venv /srv/grid/venv && /srv/grid/venv/bin/pip install -e "/srv/grid/kannaka-grid[dev]" -e /srv/grid/thegrid
 install -d -o nick -g nick /srv/grid/colony-one/state /srv/grid/colony-one/state/operator /srv/grid/colony-one/memory
@@ -14,6 +15,7 @@ cp deploy/grid.env.example /srv/grid/grid.env && chmod 600 /srv/grid/grid.env
 Receipt: `/srv/grid/venv/bin/python -c "import grid, src.colony.live"` prints nothing.
 
 ## 1. Mind
+All commands run from `/srv/grid/kannaka-grid`.
 ```bash
 KANNAKA_DATA_DIR=/srv/grid/colony-one/memory kannaka init      # scaffold
 # mint a LiteLLM virtual key the same way create_machine.py does (budget 0.5/30d, model agent-brain)
@@ -26,6 +28,7 @@ Sudoers line for the dream restart: `nick ALL=(root) NOPASSWD: /usr/bin/systemct
 Receipt: `kannaka swarm peers` lists `grid-colony-one` with `ask` in capabilities.
 
 ## 2. Colony
+All commands run from `/srv/grid/kannaka-grid`.
 ```bash
 sudo cp deploy/systemd/thegrid-colony.service /etc/systemd/system/ && sudo systemctl daemon-reload
 sudo systemctl enable --now thegrid-colony.service
@@ -35,6 +38,7 @@ curl -s 127.0.0.1:8787/api/state | python3 -c "import json,sys; s=json.load(sys.
 Receipt: name `colony-one`, tick increasing between two calls.
 
 ## 3. Bridge and relay
+All commands run from `/srv/grid/kannaka-grid`.
 ```bash
 sudo cp deploy/systemd/grid-bridge.service deploy/systemd/grid-odin.service /etc/systemd/system/ && sudo systemctl daemon-reload
 sudo systemctl enable --now grid-bridge.service grid-odin.service
