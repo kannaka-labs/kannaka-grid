@@ -1,0 +1,240 @@
+"""The bridge: colony stream in, GRID.* events / state / chronicle out.
+
+A thin loop over the pure cores. Everything with a network has an injectable
+fake so the loop's decisions are tested without one.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Iterator
+
+import httpx
+
+from . import chronicle as chron
+from .distill import Distiller, Event, Snapshot
+from .envelope import envelope, slug, subject
+from .flux import Flux
+from .mind import REMEMBER_MIN_INTERVAL_S, Mind, MindError, Throttle
+from .natsio import Bus, BusError
+
+log = logging.getLogger("grid.bridge")
+
+
+def iter_sse_data(lines: Iterable[str]) -> Iterator[str]:
+    for line in lines:
+        if line.startswith("data:"):
+            yield line[len("data:"):].strip()
+
+
+def memory_text(event: Event) -> str:
+    fields = " ".join(f"{k}={v}" for k, v in sorted(event.fields.items()))
+    return f"Colony event {event.kind} at epoch {event.epoch} tick {event.tick}: {fields}".strip()
+
+
+def state_properties(snap: Snapshot) -> dict:
+    return {
+        "epoch": snap.epoch, "tick": snap.tick, "population": snap.population,
+        "generation": snap.generation, "births": snap.births, "deaths": snap.deaths,
+        "heat": snap.heat, "cost": snap.cost, "memory": snap.memory, "storms": snap.storms,
+        "dominant": snap.dominant, "lineage_top": round(snap.lineage_top, 4),
+        "novel_ops": snap.novel_ops,
+    }
+
+
+@dataclass(frozen=True)
+class BridgeConfig:
+    colony_url: str
+    nats_url: str
+    nats_user: str | None
+    nats_password: str | None
+    flux_url: str | None
+    mind_agent_id: str | None
+    mind_data_dir: str | None
+    kannaka_bin: str
+    state_every_s: float
+    history_every_s: float
+
+    @classmethod
+    def from_env(cls) -> "BridgeConfig":
+        env = os.environ.get
+        return cls(
+            colony_url=env("COLONY_URL", "http://127.0.0.1:8787").rstrip("/"),
+            nats_url=env("NATS_URL", "nats://swarm.ninja-portal.com:4222"),
+            nats_user=env("NATS_USER") or None,
+            nats_password=env("NATS_PASSWORD") or None,
+            flux_url=env("FLUX_URL") or None,
+            mind_agent_id=env("MIND_AGENT_ID") or None,
+            mind_data_dir=env("MIND_DATA_DIR") or None,
+            kannaka_bin=env("KANNAKA_BIN", "kannaka"),
+            state_every_s=float(env("STATE_EVERY_S", "60")),
+            history_every_s=float(env("HISTORY_EVERY_S", "60")),
+        )
+
+
+class Bridge:
+    def __init__(self, cfg: BridgeConfig, *, bus, mind, flux=None, distiller: Distiller | None = None,
+                 throttle: Throttle | None = None, clock=time.monotonic):
+        self.cfg = cfg
+        self.bus = bus
+        self.mind = mind
+        self.flux = flux
+        self.distiller = distiller or Distiller()
+        self.throttle = throttle or Throttle(REMEMBER_MIN_INTERVAL_S, clock=clock)
+        self.colony: str | None = None
+        self.agent_id: str | None = None
+        self.last: Snapshot | None = None
+        self.isa: list[str] = []
+        self._chronicled_phase: int = -1
+        self._last_chronicle_tick: int = 0
+
+    # -- identity ------------------------------------------------------------
+
+    def _bind(self, state: dict) -> None:
+        if self.colony is None:
+            self.colony = slug(str(state["name"]))
+            self.agent_id = self.cfg.mind_agent_id or f"grid-{self.colony}"
+            if hasattr(self.mind, "agent_id") and self.cfg.mind_agent_id is None:
+                self.mind.agent_id = self.agent_id
+        self.isa = [str(op) for op in state.get("isa", [])] or self.isa
+
+    def _env(self, epoch: int, tick: int, **fields) -> dict:
+        return envelope(agent_id=self.agent_id, colony=self.colony, epoch=epoch, tick=tick, **fields)
+
+    # -- events --------------------------------------------------------------
+
+    async def _emit(self, event: Event) -> None:
+        subj = subject(self.colony, "event", event.kind)
+        try:
+            await self.bus.publish(subj, self._env(event.epoch, event.tick, kind=event.kind, **event.fields))
+        except BusError as e:
+            log.error("dropped %s: %s", subj, e)
+            return
+        if self.throttle.allow(event.kind):
+            if not self.mind.remember(memory_text(event), [self.colony, event.kind]):
+                log.warning("mind refused memory for %s", event.kind)
+
+    async def handle_state(self, state: dict) -> list[Event]:
+        self._bind(state)
+        snap = Snapshot.from_state(state)
+        events = self.distiller.feed(snap)
+        self.last = snap
+        for event in events:
+            await self._emit(event)
+        return events
+
+    async def poll_history(self, summary: dict) -> list[Event]:
+        events = self.distiller.feed_history(summary)
+        for event in events:
+            await self._emit(event)
+        return events
+
+    # -- state -----------------------------------------------------------------
+
+    async def publish_state(self, snap: Snapshot) -> None:
+        props = state_properties(snap)
+        # epoch/tick already travel in the envelope; passing them twice is a clash.
+        extra = {k: v for k, v in props.items() if k not in ("epoch", "tick")}
+        try:
+            await self.bus.publish(subject(self.colony, "state"), self._env(snap.epoch, snap.tick, **extra))
+        except BusError as e:
+            log.error("state publish failed: %s", e)
+        if self.flux is not None:
+            try:
+                await self.flux.upsert(f"grid:{self.colony}", props)
+            except Exception as e:  # Flux is optional; never let it stall the bridge
+                log.warning("flux upsert failed: %s", e)
+
+    # -- chronicle ---------------------------------------------------------------
+
+    async def maybe_chronicle(self) -> dict[str, str]:
+        snap = self.last
+        if snap is None:
+            return {}
+        phase = snap.tick // chron.CHRONICLE_EVERY_TICKS
+        if phase == 0 or phase == self._chronicled_phase:
+            return {}
+        self._chronicled_phase = phase
+        since = self._last_chronicle_tick
+        self._last_chronicle_tick = snap.tick
+        out: dict[str, str] = {}
+        for kind in chron.KINDS:
+            q = chron.question(kind, colony=self.colony, epoch=snap.epoch, tick=snap.tick, since_tick=since)
+            try:
+                raw = await self.mind.ask(q, recall_query=f"colony {self.colony} epoch {snap.epoch}")
+            except (MindError, BusError) as e:
+                log.warning("chronicle %s: mind unavailable: %s", kind, e)
+                continue
+            answer = chron.check(kind, raw, isa=self.isa)
+            if answer is None:
+                log.info("chronicle %s failed its check: %r", kind, raw[:120])
+                continue
+            out[kind] = answer
+            try:
+                await self.bus.publish(subject(self.colony, "chronicle", kind),
+                                       self._env(snap.epoch, snap.tick, text=answer, since_tick=since))
+            except BusError as e:
+                log.error("chronicle %s publish failed: %s", kind, e)
+        return out
+
+
+# -- daemon --------------------------------------------------------------------
+
+async def _stream(cfg: BridgeConfig, bridge: Bridge) -> None:
+    """Consume /api/stream until it drops; the caller reconnects."""
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10, read=None)) as client:
+        async with client.stream("GET", f"{cfg.colony_url}/api/stream") as response:
+            response.raise_for_status()
+            last_state, last_history = 0.0, 0.0
+            async for line in response.aiter_lines():
+                for data in iter_sse_data([line]):
+                    await bridge.handle_state(json.loads(data))
+                    now = time.monotonic()
+                    if now - last_state >= cfg.state_every_s and bridge.last is not None:
+                        await bridge.publish_state(bridge.last)
+                        last_state = now
+                    if now - last_history >= cfg.history_every_s:
+                        try:
+                            r = await client.get(f"{cfg.colony_url}/api/history")
+                            r.raise_for_status()
+                            await bridge.poll_history(r.json())
+                        except Exception as e:
+                            log.warning("history poll failed: %s", e)
+                        last_history = now
+                    await bridge.maybe_chronicle()
+
+
+async def run(cfg: BridgeConfig) -> None:
+    bus = Bus(cfg.nats_url, user=cfg.nats_user, password=cfg.nats_password)
+    await bus.connect()
+    mind = Mind(cfg.mind_agent_id or "grid-unbound", bus, kannaka_bin=cfg.kannaka_bin,
+                data_dir=Path(cfg.mind_data_dir) if cfg.mind_data_dir else None)
+    flux = Flux(cfg.flux_url) if cfg.flux_url else None
+    if flux is None:
+        log.info("FLUX_URL unset; Flux publishing skipped")
+    bridge = Bridge(cfg, bus=bus, mind=mind, flux=flux)
+    backoff = 1.0
+    while True:
+        try:
+            await _stream(cfg, bridge)
+            backoff = 1.0
+        except Exception as e:
+            log.error("stream dropped: %s; reconnecting in %.0fs", e, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr,
+                        format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    asyncio.run(run(BridgeConfig.from_env()))
+
+
+if __name__ == "__main__":
+    main()
