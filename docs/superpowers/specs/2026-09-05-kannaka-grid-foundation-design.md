@@ -247,8 +247,8 @@ other tenant on Skywave.
 /srv/grid/
   thegrid/                      # submodule checkout, pinned
   <colony>/
-    state/                      # thegrid state dir (SQLite fossils, snapshots)
-    operator/                   # Odin queue: request.json / proposal.json
+    state/                      # thegrid state dir (colony.pkl, SQLite fossils)
+      operator/                 # Odin queue: request.json / proposal.json (thegrid derives it from --state)
     memory/                     # KANNAKA_DATA_DIR for the mind
   grid.env                      # COLONY_URL, NATS creds file ref, FLUX_URL, thresholds
 systemd/
@@ -274,6 +274,54 @@ earlier one being absent.
   subjects defined in §4 and §6.
 - **Colony Two / Three** (thegrid's experimental branches). v0.1 runs the
   `main` reference habitat only.
+
+## 11a. Reconciliation against thegrid and kannaka interfaces (2026-09-05, pre-plan)
+
+Read the pinned sources before writing the plan; these facts override the
+earlier text where they differ.
+
+- **thegrid fails closed without an AMD k10temp sensor.** `SubstrateWorld.__init__`
+  calls `cpu_temperature_c()`, which raises when no `k10temp` hwmon exists, and
+  `live.main()` hard-codes `physical=True`. A Proxmox VM has no such sensor.
+  v0.1 therefore runs the colony through `grid/launcher.py`, which imports
+  thegrid as a library and replaces only `substrate.cpu_temperature_c` with a
+  cgroup-CPU-derived proxy when the real one raises. Memory pressure and CPU
+  usage stay real cgroup readings. thegrid's source is untouched. This is the
+  first thing to raise upstream (a `--heat simulated` flag would retire the launcher).
+- **Bind address is a CLI flag** (`--host`), so the observer binds `127.0.0.1`. §3.1's
+  "to be verified" is resolved.
+- **Odin queue path** is `<state dir>/operator/`, derived from `--state`'s parent
+  (`Habitat.__init__`), so with `--state /srv/grid/<colony>/state/colony.pkl` the queue
+  is `/srv/grid/<colony>/state/operator/`. §10's tree is corrected accordingly.
+- **A rejected reply deletes `request.json`.** thegrid writes a request only when
+  none exists, so a permanently bad request would otherwise block the Odin path
+  forever. thegrid itself tolerates the file vanishing (`unlink(missing_ok=True)`).
+  A mind timeout leaves the request in place and retries after 60 s.
+- **Ask timeout is 180 s, not 30 s.** kannaka's serve loop notes heavy asks take
+  minutes and replies on a fresh connection. thegrid consumes a proposal only at a
+  later birth, so a late proposal costs nothing.
+- **Ask/recall wire contract** (from `src/bin/handlers/swarm.rs` and `ask.rs`):
+  `KANNAKA.ask.<id>` request `{"from","text","recall_query","no_tools","mode":"full_recall"}`
+  → `{"from","text","mode_used"}` or `{"from","error"}`; `KANNAKA.recall.<id>` request
+  `{"query","top_k"}` → `{"from","query","results":[{id,content,similarity,strength,age_hours,phase}]}`.
+- **The serve daemon is read-only and holds the store in RAM** (`KANNAKA_READONLY`),
+  so memories the bridge writes with `kannaka remember` become visible to asks only
+  after a restart. The 6-hour dream timer therefore restarts `grid-mind.service`
+  after dreaming. Known v0.1 limit; a hot-reload is an upstream kannaka item.
+- **Mind LLM config**: kannaka's `[llm] provider = "openai"` client posts to
+  `<base_url>/chat/completions`, so the mind points at the LiteLLM gateway with
+  `base_url = "http://127.0.0.1:4000/v1"`, `model = "agent-brain"`, and a per-node
+  virtual key.
+- **`signal.dialect`** is derived from `/api/history` ecology buckets
+  (`signals_avg > 8` for 2 consecutive buckets of the current epoch), because the live
+  snapshot does not expose the active-signal count. The event's `tick` is the bucket id.
+- **`epoch.started` payload** is `{epoch, started_at, founders}`; the snapshot carries
+  `startedAt`, not the seed.
+- **Flux body** carries both kannaka's camelCase keys (`streamId/sourceId/entityId`) and
+  thegrid's snake_case keys until the live Flux confirms which it reads.
+- **Integration smoke** runs a real short colony under a cgroup with finite
+  `memory.max` (thegrid refuses `max`) and drives the relay with a stub mind; no local
+  `nats-server` is required.
 
 ## 12. Acceptance criteria for v0.1
 
