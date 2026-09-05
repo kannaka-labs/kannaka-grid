@@ -1,5 +1,5 @@
 <#
-deploy/run-skywave.ps1 — drive the Skywave runbook from the Windows operator seat.
+deploy/run-skywave.ps1 - drive the Skywave runbook from the Windows operator seat.
 
 Prerequisites on this box: Cloudflare WARP connected to the ae0rm org (see
 deploy/warp-connect.ps1), an SSH key authorized for nick@skywave, and a
@@ -33,7 +33,7 @@ ssh $SshHost 'chmod +x ~/grid-deploy/*.sh; sed -i "s/\r$//" ~/grid-deploy/*.sh ~
 if (-not $ReceiptsOnly) {
     Step "running deploy.sh (idempotent)"
     ssh -t $SshHost 'bash ~/grid-deploy/deploy.sh'
-    if ($LASTEXITCODE -ne 0) { throw "deploy.sh exited $LASTEXITCODE — read the last [deploy] FAIL line above" }
+    if ($LASTEXITCODE -ne 0) { throw "deploy.sh exited $LASTEXITCODE - read the last [deploy] FAIL line above" }
 }
 
 if (-not $DeployOnly) {

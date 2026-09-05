@@ -1,5 +1,5 @@
 <#
-deploy/warp-connect.ps1 — enroll this box in the ae0rm Zero Trust org and
+deploy/warp-connect.ps1 - enroll this box in the ae0rm Zero Trust org and
 connect WARP, so 10.30.0.20 (skywave) becomes reachable.
 
 Two moments need a human: the installer's UAC prompt (if WARP is not yet
@@ -35,10 +35,10 @@ if ($reg -match $Org) {
     }
     $help = (& $cli --help 2>&1) -join " "
     if ($help -match "teams-enroll") {
-        Step "enrolling with teams-enroll $Org — complete the login in the browser that opens"
+        Step "enrolling with teams-enroll $Org - complete the login in the browser that opens"
         & $cli --accept-tos teams-enroll $Org
     } else {
-        Step "enrolling with registration new $Org — complete the login in the browser that opens"
+        Step "enrolling with registration new $Org - complete the login in the browser that opens"
         & $cli --accept-tos registration new $Org
     }
     $deadline = (Get-Date).AddMinutes(10)
@@ -61,4 +61,4 @@ if ($status -notmatch "Connected") { throw "WARP did not reach Connected" }
 
 Step "probing skywave 10.30.0.20:22"
 $t = Test-NetConnection -ComputerName 10.30.0.20 -Port 22 -WarningAction SilentlyContinue
-if ($t.TcpTestSucceeded) { Step "skywave reachable — run deploy\run-skywave.ps1" } else { throw "WARP connected but 10.30.0.20:22 is not reachable; check the org's split-tunnel / private network route for 10.30.0.0/24" }
+if ($t.TcpTestSucceeded) { Step "skywave reachable - run deploy\run-skywave.ps1" } else { throw "WARP connected but 10.30.0.20:22 is not reachable; check the org's split-tunnel / private network route for 10.30.0.0/24" }
