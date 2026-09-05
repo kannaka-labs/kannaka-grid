@@ -1,8 +1,14 @@
 """A thin, honest wrapper over nats-py.
 
-Honest means: a publish that the server refuses raises. The hive bridge once
-read the post-PING response and discarded it, so a permissions error looked
-like success and data was lost with the process still healthy. Not here.
+Honest means: a publish that the server refuses raises. nats-py does not raise
+for one by itself. A `Permissions Violation for Publish` arrives out of band on
+the client's error callback and leaves the connection open, and `flush()` is
+only PING/PONG, so a naive publish returns cleanly while the message is
+discarded. So the bus installs that callback, records every error it reports,
+and drains the record after each flush: an entry naming a permissions violation
+on the subject just published becomes a BusError. The hive bridge once read the
+post-PING response and discarded it, so a permissions error looked like success
+and data was lost with the process still healthy. Not here.
 """
 from __future__ import annotations
 
@@ -84,6 +90,10 @@ class Bus:
             await nc.flush(timeout=5)
         except Exception as e:  # nats-py raises a family of errors; all mean "not delivered"
             raise BusError(f"publish {subject} failed: {e}") from e
+        while self._errors:     # a refusal arrives on the callback, never on flush
+            entry = self._errors.popleft()
+            if "Permissions Violation" in entry and subject in entry:
+                raise BusError(f"publish {subject} refused: {entry}")
 
     async def request(self, subject: str, payload: dict, timeout_s: float) -> dict:
         nc = self._require()

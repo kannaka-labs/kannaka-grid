@@ -200,9 +200,10 @@ other tenant on Skywave.
 - Bridge reconnects to `/api/stream` with exponential backoff (1 s → 60 s).
   Events come from snapshot pairs, so a gap loses that gap's events and no
   more. Epoch changes are read from the `epoch` field, never inferred.
-- NATS via `nats-py`, which raises on server `-ERR`. Publishes are awaited;
-  a failed publish is logged with the subject and the event is dropped, never
-  silently "recorded".
+- NATS via `nats-py`; a refused publish surfaces through the client's error
+  callback, which the bus drains after every flush and turns into a `BusError`.
+  Publishes are awaited; a failed publish is logged with the subject and the
+  event is dropped, never silently "recorded".
 - Flux optional; absent URL → skip, one log line.
 - Relay writes only atomically and only against a matching live request.
   Stale `proposal.json` files (request gone) are renamed `.stale-<ts>.json`
