@@ -123,7 +123,17 @@ async def test_relay_answers_a_request_written_by_thegrid_shape(colony):
     queue.mkdir(exist_ok=True)
     (queue / "request.json").write_text(json.dumps({
         "request_id": "smoke1", "created_at": time.time(),
-        "parent": {"id": 1, "energy": 90.0, "tick": 10, "epoch": 1},
+        # exactly what thegrid's OdinMutator writes: Organism.telemetry(), which
+        # carries no epoch and no tick.
+        "parent": {"age": 120, "energy": 90.0, "generation": 2, "births": 1,
+                   "harvested": 40.0, "tasks_solved": {}, "genome_length": 6,
+                   "signals_sent": 0, "signals_heard": 0, "signal_guided_moves": 0,
+                   "post_signal_harvested": 0.0, "structures_built": 0,
+                   "neighbor_reads": 0, "foreign_copies": 0, "moves": 31, "scans": 4,
+                   "guided_moves": 0, "post_move_harvested": 0.0, "scratch_nonzero": 0,
+                   "forecast_attempts": 0, "forecasts_solved": 0, "weather_cues_seen": 0,
+                   "weather_cue_signals": 0, "experimental_ops": {}, "salvaged": 0.0,
+                   "stolen": 0.0, "robbed": 0.0, "corruptions": 0, "corrupted": 0},
         "genome": ["harvest", "alloc", "copy", "ifnotdone", "jmpb", "fork"],
         "instruction_set": [{"name": n, "cost": 0.1, "effect": n} for n in
                             ("nop", "harvest", "alloc", "copy", "ifnotdone", "jmpb", "fork")],

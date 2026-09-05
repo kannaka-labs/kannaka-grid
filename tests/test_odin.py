@@ -8,15 +8,33 @@ from grid.odin import Relay
 
 ISA = [{"name": n, "cost": 0.1, "effect": n} for n in ("nop", "harvest", "copy", "fork")]
 
+# thegrid's OdinMutator writes `parent: parent.telemetry()`; these are exactly
+# the keys Organism.telemetry() returns, and it carries no epoch or tick.
+PARENT = {
+    "age": 412, "energy": 90.0, "generation": 7, "births": 3, "harvested": 121.5,
+    "tasks_solved": {"nand": 2}, "genome_length": 3,
+    "signals_sent": 4, "signals_heard": 6, "signal_guided_moves": 1,
+    "post_signal_harvested": 3.25, "structures_built": 0, "neighbor_reads": 2,
+    "foreign_copies": 0, "moves": 88, "scans": 12, "guided_moves": 5,
+    "post_move_harvested": 9.5, "scratch_nonzero": 1, "forecast_attempts": 2,
+    "forecasts_solved": 1, "weather_cues_seen": 3, "weather_cue_signals": 1,
+    "experimental_ops": {}, "salvaged": 0.0, "stolen": 0.0, "robbed": 0.0,
+    "corruptions": 0, "corrupted": 0,
+}
+
 
 def write_request(queue: Path, request_id="r1") -> Path:
     queue.mkdir(parents=True, exist_ok=True)
     p = queue / "request.json"
     p.write_text(json.dumps({"request_id": request_id, "created_at": 1.0,
-                             "parent": {"id": 1, "energy": 90.0, "tick": 321, "epoch": 2},
+                             "parent": dict(PARENT),
                              "genome": ["harvest", "copy", "fork"], "instruction_set": ISA,
                              "ecology": {}, "directive": "author one variant"}))
     return p
+
+
+async def state_of(epoch: int, tick: int) -> dict:
+    return {"epoch": epoch, "tick": tick}
 
 
 class FakeMind:
@@ -57,9 +75,9 @@ class Clock:
         return self.t
 
 
-def relay(tmp_path, mind, bus=None, clock=None) -> Relay:
+def relay(tmp_path, mind, bus=None, clock=None, state_fetch=None) -> Relay:
     return Relay(tmp_path, colony="c", agent_id="grid-c", mind=mind, bus=bus or FakeBus(),
-                 clock=clock or Clock())
+                 clock=clock or Clock(), state_fetch=state_fetch)
 
 
 async def test_no_request_is_a_noop(tmp_path):
@@ -70,7 +88,7 @@ async def test_valid_reply_writes_proposal_and_publishes_proposed(tmp_path):
     write_request(tmp_path)
     bus = FakeBus()
     mind = FakeMind(answer='["harvest","harvest","copy","fork"]')
-    r = relay(tmp_path, mind, bus)
+    r = relay(tmp_path, mind, bus, state_fetch=lambda: state_of(2, 321))
     assert await r.poll_once() == "proposed"
     assert json.loads((tmp_path / "proposal.json").read_text()) == {"genome": ["harvest", "harvest", "copy", "fork"]}
     assert "fork-early won" in mind.asked[0]                       # recall reached the prompt
@@ -183,3 +201,49 @@ def test_config_from_env_carries_the_mind_data_dir_and_binary(monkeypatch):
     c = RelayConfig.from_env()
     assert c.mind_data_dir == "/srv/grid/colony-one/memory"
     assert c.kannaka_bin == "/home/nick/.local/bin/kannaka"
+
+async def test_epoch_and_tick_fall_back_to_zero_when_the_colony_is_unreachable(tmp_path):
+    write_request(tmp_path)
+    bus = FakeBus()
+
+    async def broken():
+        raise RuntimeError("connection refused")
+
+    r = relay(tmp_path, FakeMind(answer='["harvest","fork"]'), bus, state_fetch=broken)
+    assert await r.poll_once() == "proposed"
+    payload = bus.published[0][1]
+    assert payload["epoch"] == 0 and payload["tick"] == 0
+
+
+async def test_an_unparseable_request_is_binned_after_three_polls(tmp_path):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    request = tmp_path / "request.json"
+    request.write_text("{not json at all")
+    mind = FakeMind(answer='["harvest","fork"]')
+    r = relay(tmp_path, mind, state_fetch=lambda: state_of(3, 90))
+    assert await r.poll_once() is None
+    assert await r.poll_once() is None
+    assert request.exists()                    # two strikes leave it for thegrid to fix
+    assert await r.poll_once() == "rejected"
+    assert not request.exists()
+    subj, payload = r.bus.published[0]
+    assert subj == "GRID.c.event.odin.rejected"
+    assert payload["reason"] == "unparseable request"
+    assert payload["epoch"] == 3 and payload["tick"] == 90
+    assert not mind.asked
+
+
+async def test_a_good_parse_resets_the_unparseable_count(tmp_path):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    request = tmp_path / "request.json"
+    request.write_text("{not json at all")
+    mind = FakeMind(answer='["harvest","fork"]')
+    r = relay(tmp_path, mind)
+    assert await r.poll_once() is None
+    assert await r.poll_once() is None
+    write_request(tmp_path)
+    assert await r.poll_once() == "proposed"
+    (tmp_path / "proposal.json").unlink()
+    request.write_text("{not json at all")
+    assert await r.poll_once() is None          # back to strike one, not binned
+    assert request.exists()

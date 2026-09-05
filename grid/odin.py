@@ -13,6 +13,9 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Awaitable, Callable
+
+import httpx
 
 from .envelope import envelope, subject
 from .mind import ASK_TIMEOUT_S, REMEMBER_MIN_INTERVAL_S, Mind, MindError, Throttle
@@ -21,11 +24,14 @@ from .proposal import Rejection, parse_request, render_prompt, validate, write_p
 
 log = logging.getLogger("grid.odin")
 
+UNPARSEABLE_LIMIT = 3       # consecutive failed parses before the file is binned
+
 
 class Relay:
     def __init__(self, queue: Path, *, colony: str, agent_id: str, mind, bus,
                  timeout_s: float = ASK_TIMEOUT_S, retry_after_s: float = 60.0,
-                 clock=time.monotonic, throttle: Throttle | None = None):
+                 clock=time.monotonic, throttle: Throttle | None = None,
+                 state_fetch: Callable[[], Awaitable[dict]] | None = None):
         self.queue = Path(queue)
         self.colony = colony
         self.agent_id = agent_id
@@ -34,9 +40,11 @@ class Relay:
         self.timeout_s = timeout_s
         self.retry_after_s = retry_after_s
         self._clock = clock
+        self.state_fetch = state_fetch
         self.throttle = throttle or Throttle(REMEMBER_MIN_INTERVAL_S, clock=clock)
         self.stale_count = 0
         self._retry_not_before: dict[str, float] = {}
+        self._unparseable: dict[str, int] = {}
 
     async def _publish(self, kind: str, epoch: int, tick: int, **fields) -> None:
         try:
@@ -47,6 +55,17 @@ class Relay:
             raise
         except BusError as e:
             log.error("odin.%s publish failed: %s", kind, e)
+
+    async def _epoch_tick(self) -> tuple[int, int]:
+        """thegrid's Organism.telemetry() carries no epoch or tick; /api/state does."""
+        if self.state_fetch is None:
+            return 0, 0
+        try:
+            state = await self.state_fetch()
+            return int(state.get("epoch", 0) or 0), int(state.get("tick", 0) or 0)
+        except Exception as e:      # an envelope with 0/0 beats no envelope at all
+            log.warning("epoch/tick unavailable from the colony: %s", e)
+            return 0, 0
 
     async def poll_once(self) -> str | None:
         request_path = self.queue / "request.json"
@@ -61,15 +80,25 @@ class Relay:
             log.warning("stale proposal with no request: renamed to %s", stale.name)
         if not request_path.exists():
             return None
+        key = str(request_path)
         try:
             req = parse_request(request_path)
         except ValueError as e:
-            log.error("unreadable request: %s", e)
-            return None
+            seen = self._unparseable[key] = self._unparseable.get(key, 0) + 1
+            log.error("unreadable request (%d/%d): %s", seen, UNPARSEABLE_LIMIT, e)
+            if seen < UNPARSEABLE_LIMIT:
+                return None
+            # thegrid writes a request only when none exists, so leaving a file
+            # nobody can read here would block the Odin path forever.
+            request_path.unlink(missing_ok=True)
+            del self._unparseable[key]
+            epoch, tick = await self._epoch_tick()
+            await self._publish("rejected", epoch, tick, request_id=None,
+                                reason="unparseable request")
+            return "rejected"
+        self._unparseable.pop(key, None)        # consecutive, so a good parse resets
         if self._clock() < self._retry_not_before.get(req.request_id, 0.0):
             return None
-        epoch = int(req.parent.get("epoch", 0) or 0)
-        tick = int(req.parent.get("tick", 0) or 0)
 
         recall = await self.mind.recall(f"colony {self.colony} genome lineage {' '.join(req.genome[:6])}")
         prompt = render_prompt(req, recall)
@@ -83,6 +112,7 @@ class Relay:
             return "deferred"
 
         result = validate(reply, req)
+        epoch, tick = await self._epoch_tick()
         if isinstance(result, Rejection):
             log.info("rejected %s: %s", req.request_id, result.reason)
             request_path.unlink(missing_ok=True)   # let thegrid file a fresh request
@@ -107,6 +137,7 @@ class Relay:
 class RelayConfig:
     queue: Path
     colony: str
+    colony_url: str
     agent_id: str
     nats_url: str
     nats_user: str | None
@@ -124,6 +155,7 @@ class RelayConfig:
         return cls(
             queue=Path(env("ODIN_QUEUE", f"/srv/grid/{colony}/state/operator")),
             colony=colony,
+            colony_url=env("COLONY_URL", "http://127.0.0.1:8787").rstrip("/"),
             agent_id=env("MIND_AGENT_ID", f"grid-{colony}"),
             nats_url=env("NATS_URL", "nats://swarm.ninja-portal.com:4222"),
             nats_user=env("NATS_USER") or None,
@@ -147,19 +179,26 @@ async def run(cfg: RelayConfig) -> None:
             backoff = min(backoff * 2, 60.0)
     mind = Mind(cfg.agent_id, bus, kannaka_bin=cfg.kannaka_bin,
                 data_dir=Path(cfg.mind_data_dir) if cfg.mind_data_dir else None)
-    relay = Relay(cfg.queue, colony=cfg.colony, agent_id=cfg.agent_id, mind=mind, bus=bus)
-    log.info("watching %s for %s", cfg.queue, cfg.agent_id)
-    while True:
-        try:
-            outcome = await relay.poll_once()
-            if outcome:
-                log.info("%s", outcome)
-        except BusClosed as e:  # EX_TEMPFAIL: only a restart gets a live client back
-            log.error("nats gave up: %s; exiting for systemd to restart", e)
-            raise SystemExit(75) from e
-        except Exception as e:  # one bad poll must not kill the relay
-            log.exception("poll failed: %s", e)
-        await asyncio.sleep(cfg.poll_s)
+    async with httpx.AsyncClient(timeout=2) as client:
+        async def fetch_state() -> dict:
+            r = await client.get(f"{cfg.colony_url}/api/state")
+            r.raise_for_status()
+            return r.json()
+
+        relay = Relay(cfg.queue, colony=cfg.colony, agent_id=cfg.agent_id, mind=mind, bus=bus,
+                      state_fetch=fetch_state)
+        log.info("watching %s for %s", cfg.queue, cfg.agent_id)
+        while True:
+            try:
+                outcome = await relay.poll_once()
+                if outcome:
+                    log.info("%s", outcome)
+            except BusClosed as e:  # EX_TEMPFAIL: only a restart gets a live client back
+                log.error("nats gave up: %s; exiting for systemd to restart", e)
+                raise SystemExit(75) from e
+            except Exception as e:  # one bad poll must not kill the relay
+                log.exception("poll failed: %s", e)
+            await asyncio.sleep(cfg.poll_s)
 
 
 def main() -> None:
