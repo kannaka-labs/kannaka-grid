@@ -41,3 +41,13 @@ def test_event_must_reference_a_tick_and_be_capped():
         "Lineage 2 swept the map at tick 7410."
     assert check("event", "Lineage 2 swept the map.", isa=ISA) is None
     assert check("event", "tick " + "9" * MAX_CHARS, isa=ISA) is None
+
+
+def test_question_appends_facts_when_given():
+    base = question("skill", colony="c", epoch=1, tick=2000, since_tick=0)
+    with_facts = question("skill", colony="c", epoch=1, tick=2000, since_tick=0,
+                          facts="Observed now: dominant genome (2 opcodes): nop fork")
+    assert with_facts.startswith(base)
+    assert with_facts.endswith("Observed now: dominant genome (2 opcodes): nop fork")
+    assert question("topic", colony="c", epoch=1, tick=2000, since_tick=0, facts="") == \
+        question("topic", colony="c", epoch=1, tick=2000, since_tick=0)

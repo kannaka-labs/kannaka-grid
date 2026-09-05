@@ -33,9 +33,49 @@ def iter_sse_data(lines: Iterable[str]) -> Iterator[str]:
             yield line[len("data:"):].strip()
 
 
-def memory_text(event: Event) -> str:
+# thegrid's `record.py` encodes a genome as one character per opcode index
+# (`GENOME_ALPHABET[op % 64]`); pinned by a test against the submodule's source.
+GENOME_ALPHABET = "0123456789abcdefghijklmnopqrstuv" + "wxyzABCDEFGHIJKLMNOPQRSTUVWXYZ@#"
+FACTS_MAX_OPCODES = 32
+
+
+def decode_genome(encoded: str, isa: list[str]) -> list[str]:
+    """Glyph string -> opcode names, `?<char>` for anything outside the ISA."""
+    names = []
+    for ch in encoded:
+        index = GENOME_ALPHABET.find(ch)
+        names.append(isa[index] if 0 <= index < len(isa) else f"?{ch}")
+    return names
+
+
+def novel_opcodes(snap: Snapshot, isa: list[str]) -> list[str]:
+    """Opcode names in the dominant genome that the ancestor never carried, in order."""
+    ancestor = set(decode_genome(snap.ancestor, isa))
+    return [n for n in dict.fromkeys(decode_genome(snap.dominant, isa)) if n not in ancestor]
+
+
+def phase_facts(snap: Snapshot, isa: list[str]) -> str:
+    """One line of what the colony looks like right now, in opcode names.
+
+    Goes into every chronicle question (see chronicle.question) and into the
+    mind as the phase memory. Names, not glyphs: the `skill` check needs an
+    opcode the model can cite.
+    """
+    dominant = decode_genome(snap.dominant, isa)
+    novel = novel_opcodes(snap, isa)
+    return (f"Observed now at epoch {snap.epoch} tick {snap.tick}: population {snap.population}; "
+            f"top lineage share {snap.lineage_top:.2f}; storms so far {snap.storms}; "
+            f"heat {snap.heat:.1f}; dominant genome ({len(dominant)} opcodes): "
+            f"{' '.join(dominant[:FACTS_MAX_OPCODES])}; "
+            f"opcodes the ancestor lacks: {' '.join(novel) or 'none'}")
+
+
+def memory_text(event: Event, *, names: dict[str, list[str]] | None = None) -> str:
     fields = " ".join(f"{k}={v}" for k, v in sorted(event.fields.items()))
-    return f"Colony event {event.kind} at epoch {event.epoch} tick {event.tick}: {fields}".strip()
+    text = f"Colony event {event.kind} at epoch {event.epoch} tick {event.tick}: {fields}".strip()
+    if names:
+        text += " " + " ".join(f"{k}=[{' '.join(v)}]" for k, v in names.items())
+    return text
 
 
 def epoch_summary_text(event: Event, history: dict) -> str:
@@ -144,9 +184,15 @@ class Bridge:
             log.error("dropped %s: %s", subj, e)
             return
         if self.throttle.allow(event.kind):
+            # Genome-shaped events carry opcode NAMES into memory, not glyphs, so
+            # the chronicle's skill question has something to cite (issue #1).
+            names = None
+            if event.kind in ("genome.novel", "lineage.sweep") and self.last is not None and self.isa:
+                names = {"dominant": decode_genome(self.last.dominant, self.isa)[:FACTS_MAX_OPCODES],
+                         "novel_opcodes": novel_opcodes(self.last, self.isa)}
             # remember() shells out to `kannaka remember` with a 60 s timeout; run
             # it off the stream-reader coroutine or the whole bridge stalls on it.
-            ok = await asyncio.to_thread(self.mind.remember, memory_text(event),
+            ok = await asyncio.to_thread(self.mind.remember, memory_text(event, names=names),
                                          [self.colony, event.kind])
             if not ok:
                 log.warning("mind refused memory for %s", event.kind)
@@ -213,9 +259,18 @@ class Bridge:
         self._chronicled_phase = phase
         since = self._last_chronicle_tick
         self._last_chronicle_tick = snap.tick
+        # The observation rides in each question (the daemon cannot see a memory
+        # written now) AND is remembered once per phase for later asks and dreams.
+        facts = phase_facts(snap, self.isa) if self.isa else ""
+        if facts:
+            ok = await asyncio.to_thread(self.mind.remember, f"Colony phase {phase} summary. {facts}",
+                                         [self.colony, "phase"])
+            if not ok:
+                log.warning("mind refused the phase %d summary", phase)
         out: dict[str, str] = {}
         for kind in chron.KINDS:
-            q = chron.question(kind, colony=self.colony, epoch=snap.epoch, tick=snap.tick, since_tick=since)
+            q = chron.question(kind, colony=self.colony, epoch=snap.epoch, tick=snap.tick,
+                               since_tick=since, facts=facts)
             try:
                 raw = await self.mind.ask(q, recall_query=f"colony {self.colony} epoch {snap.epoch}")
             except BusClosed:

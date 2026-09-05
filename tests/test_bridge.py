@@ -351,3 +351,73 @@ async def test_reconnect_backoff_resets_after_a_stream_that_delivered_frames(mon
         await bridge_mod.run(cfg())
     # A stream that worked before it dropped is not a failing config: back to 1 s.
     assert delays == [1.0, 2.0, 1.0, 2.0, 4.0]
+
+
+# -- issue #1: the chronicle skill line needs opcode NAMES, not glyphs ---------------
+
+def test_genome_alphabet_matches_thegrid_record_py():
+    """thegrid encodes one opcode per char; our copy of its alphabet must not drift."""
+    import re
+    from pathlib import Path
+    from grid.bridge import GENOME_ALPHABET
+    src = Path(__file__).resolve().parents[1] / "thegrid" / "src" / "colony" / "record.py"
+    if not src.exists():
+        pytest.skip("thegrid submodule not checked out")
+    text = src.read_text()
+    base = re.search(r'^ALPHABET = "([^"]+)"', text, re.M).group(1)
+    ext = re.search(r'^GENOME_ALPHABET = ALPHABET \+ "([^"]+)"', text, re.M).group(1)
+    assert GENOME_ALPHABET == base + ext
+
+
+def test_decode_genome_maps_chars_to_isa_names():
+    from grid.bridge import decode_genome
+    isa = ["nop", "harvest", "fork"]
+    assert decode_genome("012", isa) == ["nop", "harvest", "fork"]
+    assert decode_genome("0z", isa) == ["nop", "?z"]          # index beyond the ISA
+    assert decode_genome("", isa) == []
+
+
+def test_phase_facts_names_dominant_and_novel_opcodes():
+    from grid.bridge import phase_facts
+    snap = Snapshot.from_state(state(tick=2000, dominant="0122", ancestor="01", population=77,
+                                     strains=[50, 27]))
+    facts = phase_facts(snap, ["nop", "harvest", "fork"])
+    assert facts.startswith("Observed now at epoch 1 tick 2000:")
+    assert "population 77" in facts and "storms so far 0" in facts
+    assert "dominant genome (4 opcodes): nop harvest fork fork" in facts
+    assert "opcodes the ancestor lacks: fork" in facts
+    assert "\n" not in facts
+
+
+def test_memory_text_carries_opcode_names_when_given():
+    text = memory_text(Event("genome.novel", 1, 61, {"novel_ops": 1, "genome_glyph": "012"}),
+                       names={"dominant": ["nop", "harvest", "fork"], "novel_opcodes": ["fork"]})
+    assert "novel_opcodes=[fork]" in text and "dominant=[nop harvest fork]" in text
+    assert memory_text(Event("storm", 1, 2, {})) == "Colony event storm at epoch 1 tick 2:"
+
+
+async def test_handle_state_remembers_names_for_a_novel_genome():
+    bus, mind = FakeBus(), FakeMind()
+    bridge = Bridge(cfg(), bus=bus, mind=mind)
+    await bridge.handle_state(state(tick=1, dominant="01", ancestor="01", strains=[50, 50]))
+    await bridge.handle_state(state(tick=2, dominant="012", ancestor="01", strains=[50, 50]))
+    novel = [t for t, tags in mind.remembered if "genome.novel" in tags]
+    assert len(novel) == 1
+    assert "novel_opcodes=[fork]" in novel[0] and "dominant=[nop harvest fork]" in novel[0]
+
+
+async def test_chronicle_questions_carry_facts_and_remember_the_phase_line():
+    bus = FakeBus()
+    mind = FakeMind(answers={"What is this epoch about": "A slow squeeze.",
+                             "Name the capability": "It learned to fork early using fork.",
+                             "single most important": "Sweep at tick 1900."})
+    bridge = Bridge(cfg(), bus=bus, mind=mind)
+    await bridge.handle_state(state(tick=CHRONICLE_EVERY_TICKS, dominant="012", ancestor="01"))
+    out = await bridge.maybe_chronicle()
+    assert set(out) == {"topic", "skill", "event"}
+    assert len(mind.asked) == 3
+    for q in mind.asked:
+        assert "Observed now at epoch 1 tick 2000" in q and "opcodes the ancestor lacks: fork" in q
+    phase_lines = [t for t, tags in mind.remembered if tags == ["colony-one", "phase"]]
+    assert len(phase_lines) == 1 and "dominant genome (3 opcodes): nop harvest fork" in phase_lines[0]
+    assert mind.remembered.index((phase_lines[0], ["colony-one", "phase"])) >= 0
