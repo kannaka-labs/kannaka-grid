@@ -51,20 +51,37 @@ def colony(tmp_path):
                              "--ticks-per-second", "50", "--mutator", "odin", "--name", "smoke",
                              "--state", str(state)], env=env, cwd=ROOT,
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-    base = f"http://127.0.0.1:{port}"
-    deadline = time.time() + 30
-    while time.time() < deadline:
+
+    def stop() -> None:
+        if proc.poll() is not None:
+            return
+        proc.terminate()
         try:
-            if httpx.get(f"{base}/api/state", timeout=1).status_code == 200:
-                break
-        except httpx.HTTPError:
-            time.sleep(0.5)
-    else:
-        proc.kill()
-        pytest.fail(f"colony did not come up: {proc.stderr.read()[-2000:]}")
-    yield base, state.parent / "operator"
-    proc.terminate()
-    proc.wait(10)
+            proc.wait(10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+    base = f"http://127.0.0.1:{port}"
+    try:
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                pytest.fail(f"colony exited early: {proc.stderr.read()[-2000:]}")
+            try:
+                if httpx.get(f"{base}/api/state", timeout=1).status_code == 200:
+                    break
+            except httpx.HTTPError:
+                time.sleep(0.5)
+        else:
+            pytest.fail(f"colony did not come up: {proc.stderr.read()[-2000:]}")
+    except BaseException:
+        stop()
+        raise
+    try:
+        yield base, state.parent / "operator"
+    finally:
+        stop()
 
 
 @skip
