@@ -1,0 +1,28 @@
+[Unit]
+Description=thegrid colony-one (kannaka-grid launcher, heat proxy if no k10temp)
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=nick
+Group=nick
+WorkingDirectory=/srv/grid/kannaka-grid
+Environment=PYTHONUNBUFFERED=1
+Environment=THEGRID_DIR=/srv/grid/thegrid
+ExecStart=/srv/grid/venv/bin/python -m grid.launcher --host 127.0.0.1 --port 8787 --ticks-per-second 10 --mutator odin --name colony-one --state /srv/grid/colony-one/state/colony.pkl
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/srv/grid/colony-one/state
+MemoryMax=192M
+MemoryHigh=160M
+MemorySwapMax=0
+CPUQuota=5%
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=kannaka-grid mind: dream, then restart the serve daemon so it loads new memories
+
+[Service]
+Type=oneshot
+User=nick
+Group=nick
+Environment=KANNAKA_DATA_DIR=/srv/grid/colony-one/memory
+ExecStart=/home/nick/.local/bin/kannaka dream
+ExecStartPost=/usr/bin/sudo -n /usr/bin/systemctl restart grid-mind.service
