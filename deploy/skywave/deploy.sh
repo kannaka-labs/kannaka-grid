@@ -61,15 +61,21 @@ if ! grep -q '^provider = "openai"' $MEM/config.toml 2>/dev/null; then
   MASTER=$(grep '^LITELLM_MASTER_KEY=' $GATEWAY_ENV | cut -d= -f2-)
   [ -n "$MASTER" ] || die "LITELLM_MASTER_KEY empty in $GATEWAY_ENV" 4
   log "minting a LiteLLM virtual key for grid-$COLONY"
-  VKEY=$(python3 - "$MASTER" <<'PY'
-import json, sys, urllib.request
-master = sys.argv[1]
-body = json.dumps({"key_alias": "grid-colony-one", "models": ["agent-brain"], "max_budget": 0.5,
+  # key_alias must be unique per gateway, so a re-run mints a fresh, dated key
+  # (the earlier one just expires with its 30-day budget).
+  VKEY=$(python3 - "$MASTER" "grid-colony-one-$(date -u +%Y%m%dT%H%M%S)" <<'PY'
+import json, sys, urllib.error, urllib.request
+master, alias = sys.argv[1:3]
+body = json.dumps({"key_alias": alias, "models": ["agent-brain"], "max_budget": 0.5,
                    "budget_duration": "30d", "rpm_limit": 30, "tpm_limit": 20000}).encode()
 req = urllib.request.Request("http://127.0.0.1:4000/key/generate", data=body,
                              headers={"Authorization": "Bearer " + master, "Content-Type": "application/json"})
-with urllib.request.urlopen(req, timeout=30) as r:
-    print(json.load(r)["key"])
+try:
+    with urllib.request.urlopen(req, timeout=30) as r:
+        print(json.load(r)["key"])
+except urllib.error.HTTPError as e:
+    sys.stderr.write(f"key mint failed: HTTP {e.code}: {e.read()[:400].decode(errors='replace')}\n")
+    sys.exit(4)
 PY
 )
   [ -n "$VKEY" ] || die "key mint returned nothing" 4
