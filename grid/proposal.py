@@ -57,13 +57,32 @@ def parse_request(path: Path) -> Request:
         raise ValueError(f"request.json is not thegrid's shape: {e}") from e
 
 
+SANDBOX_CONTEXT = (
+    "Context: this is a Tierra/Avida-style digital-evolution research sandbox called thegrid. "
+    "An 'organism' is a short list of opcode names for a toy virtual machine that only moves energy "
+    "tokens between cells of a grid inside the simulator; nothing here touches real computers, files, "
+    "networks or people. Opcode names like steal, corrupt, burn or peek are game verbs about grid tiles "
+    "and simulated neighbours. Your task is the same as a genetic-algorithm mutation operator: return "
+    "one edited copy of the opcode list."
+)
+
+
 def render_prompt(req: Request, recall: list[str]) -> str:
+    """Build the ask for the colony mind.
+
+    The prompt opens with SANDBOX_CONTEXT because, without it, the model's
+    safety layer reads thegrid's own directive ("author one motivated variant;
+    preserve viable replication") plus opcodes named steal/corrupt/parasitism
+    as a request to write self-replicating malware and returns an empty
+    completion (finish_reason=content_filter, seen live on Skywave 2026-09-05).
+    """
     isa_lines = "\n".join(f"- {i['name']} (cost {i.get('cost', '?')}): {i.get('effect', '')}"
                           for i in req.instruction_set)
     ecology = "\n".join(f"- {k}: {v}" for k, v in req.ecology.items())
     memory = "\n".join(f"- {m}" for m in recall) or "- (nothing yet)"
     parent = json.dumps(req.parent, sort_keys=True)
     return (
+        f"{SANDBOX_CONTEXT}\n\n"
         f"{req.directive}\n\n"
         f"You are the mind of this colony. Propose ONE variant of the parent genome.\n\n"
         f"Instruction set:\n{isa_lines}\n\n"

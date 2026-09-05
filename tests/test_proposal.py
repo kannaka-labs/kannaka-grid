@@ -57,6 +57,14 @@ def test_render_prompt_contains_directive_isa_parent_and_recall():
     assert "JSON array" in text
 
 
+def test_render_prompt_opens_with_the_sandbox_context_before_the_directive():
+    from grid.proposal import SANDBOX_CONTEXT
+    text = render_prompt(req(), recall=[])
+    assert text.startswith(SANDBOX_CONTEXT)
+    assert "digital-evolution research sandbox" in SANDBOX_CONTEXT
+    assert text.index(SANDBOX_CONTEXT) < text.index("Odin must author one motivated variant")
+
+
 def test_extract_names_finds_first_string_array():
     assert extract_names('Sure: ["harvest", "copy"] and more') == ["harvest", "copy"]
     assert extract_names("no array here") is None
