@@ -84,6 +84,15 @@ async def test_ask_sends_kannaka_contract_and_returns_text():
     assert timeout == ASK_TIMEOUT_S
 
 
+async def test_ask_uses_the_configured_timeout_unless_overridden():
+    bus = FakeBus(reply={"from": "m", "text": "ok"})
+    mind = Mind("m", bus, ask_timeout_s=400.0)
+    await mind.ask("q")
+    assert bus.calls[0][2] == 400.0
+    await mind.ask("q", timeout_s=5.0)
+    assert bus.calls[1][2] == 5.0
+
+
 async def test_ask_error_reply_raises():
     mind = Mind("m", FakeBus(reply={"from": "m", "error": "upstream model timeout"}))
     with pytest.raises(MindError, match="upstream model timeout"):

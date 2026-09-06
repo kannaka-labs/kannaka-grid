@@ -317,3 +317,13 @@ def test_config_from_env_carries_verdicts_dir_and_model_alias(monkeypatch):
     monkeypatch.setenv("MIND_MODEL_ALIAS", "kannaka-brain-v1")
     c = RelayConfig.from_env()
     assert c.verdicts_dir == "/tmp/v" and c.model_alias == "kannaka-brain-v1"
+
+
+def test_config_from_env_ask_timeout(monkeypatch):
+    from grid.mind import ASK_TIMEOUT_S
+    from grid.odin import RelayConfig
+    monkeypatch.setenv("COLONY_SLUG", "colony-one")
+    monkeypatch.delenv("MIND_ASK_TIMEOUT_S", raising=False)
+    assert RelayConfig.from_env().ask_timeout_s == ASK_TIMEOUT_S
+    monkeypatch.setenv("MIND_ASK_TIMEOUT_S", "400")
+    assert RelayConfig.from_env().ask_timeout_s == 400.0

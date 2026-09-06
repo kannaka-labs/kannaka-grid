@@ -166,6 +166,7 @@ class RelayConfig:
     poll_s: float
     verdicts_dir: str
     model_alias: str
+    ask_timeout_s: float = ASK_TIMEOUT_S
 
     @classmethod
     def from_env(cls) -> "RelayConfig":
@@ -186,6 +187,7 @@ class RelayConfig:
             poll_s=float(env("ODIN_POLL_S", "1")),
             verdicts_dir=env("VERDICTS_DIR", f"/srv/grid/{colony}/verdicts"),
             model_alias=env("MIND_MODEL_ALIAS", "agent-brain"),
+            ask_timeout_s=float(env("MIND_ASK_TIMEOUT_S", str(ASK_TIMEOUT_S))),
         )
 
 
@@ -201,7 +203,8 @@ async def run(cfg: RelayConfig) -> None:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60.0)
     mind = Mind(cfg.agent_id, bus, kannaka_bin=cfg.kannaka_bin,
-                data_dir=Path(cfg.mind_data_dir) if cfg.mind_data_dir else None)
+                data_dir=Path(cfg.mind_data_dir) if cfg.mind_data_dir else None,
+                ask_timeout_s=cfg.ask_timeout_s)
     async with httpx.AsyncClient(timeout=2) as client:
         async def fetch_state() -> dict:
             r = await client.get(f"{cfg.colony_url}/api/state")
@@ -210,7 +213,7 @@ async def run(cfg: RelayConfig) -> None:
 
         relay = Relay(cfg.queue, colony=cfg.colony, agent_id=cfg.agent_id, mind=mind, bus=bus,
                       state_fetch=fetch_state, proposal_log=ProposalLog(Path(cfg.verdicts_dir)),
-                      model_alias=cfg.model_alias)
+                      model_alias=cfg.model_alias, timeout_s=cfg.ask_timeout_s)
         log.info("watching %s for %s", cfg.queue, cfg.agent_id)
         while True:
             try:

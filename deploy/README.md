@@ -27,6 +27,24 @@ sudo systemctl enable --now grid-mind.service grid-mind-dream.timer
 Sudoers line for the dream restart: `nick ALL=(root) NOPASSWD: /usr/bin/systemctl restart grid-mind.service`.
 Receipt: `kannaka swarm peers` lists `grid-colony-one` with `ask` in capabilities.
 
+### 1a. Which model answers the mind
+The mind is an OpenAI-compatible client; the model behind it is a deployment choice.
+`deploy.sh` wires it to Skywave's LiteLLM alias `agent-brain` (a hosted model, ~$0.009 per
+ask at ~50 asks/h on colony-one, so a $2 key lasts ~2.5 h). To run on the constellation's own
+open-weight brain on debain2 instead (`kannaka-brain` = qwen2.5:14b, or the trained
+`kannaka-brain-v1` adapter; CPU-only, ~2 min per Odin prompt, no spend):
+```bash
+# once: mint a key on debain2's gateway for models kannaka-brain, kannaka-brain-v1 and land it
+# on Skywave as ~/.grid-debain2-key (0600) without it ever passing through a terminal
+grep -q '^MIND_ASK_TIMEOUT_S=' /srv/grid/grid.env || echo MIND_ASK_TIMEOUT_S=400 >> /srv/grid/grid.env
+bash ~/grid-deploy/set-mind-model.sh http://10.30.0.30:4000/v1 kannaka-brain ~/.grid-debain2-key
+```
+`set-mind-model.sh` rewrites only the `[llm]` lines, sets `MIND_MODEL_ALIAS` (which verdict rows
+record as the proposal's author), and restarts grid-mind/odin/bridge. Switch back with the same
+command and the Skywave gateway URL, alias `agent-brain`, and the key `rotate-mind-key.sh`
+minted. A drained hosted key shows in `journalctl -u grid-odin` as `429 budget_exceeded`;
+`rotate-mind-key.sh` mints a fresh one.
+
 ## 2. Colony
 All commands run from `/srv/grid/kannaka-grid`.
 ```bash

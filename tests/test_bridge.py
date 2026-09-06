@@ -320,6 +320,9 @@ def test_config_from_env_defaults(monkeypatch):
     assert c.flux_url is None and c.mind_agent_id is None
     assert c.state_every_s == 60 and c.history_every_s == 60
     assert c.verdicts_dir is None
+    assert c.ask_timeout_s == 180.0
+    monkeypatch.setenv("MIND_ASK_TIMEOUT_S", "400")
+    assert BridgeConfig.from_env().ask_timeout_s == 400.0
 
 
 async def test_reconnect_backoff_resets_after_a_stream_that_delivered_frames(monkeypatch):

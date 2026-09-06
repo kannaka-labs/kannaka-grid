@@ -42,7 +42,11 @@ class Throttle:
 
 class Mind:
     def __init__(self, agent_id: str, bus, *, kannaka_bin: str = "kannaka",
-                 data_dir: Path | None = None, runner=subprocess.run):
+                 data_dir: Path | None = None, runner=subprocess.run,
+                 ask_timeout_s: float = ASK_TIMEOUT_S):
+        # A local CPU model (kannaka-brain on debain2) takes ~2 min on an Odin
+        # prompt, so the deadline is a deployment knob (MIND_ASK_TIMEOUT_S).
+        self.ask_timeout_s = ask_timeout_s
         self.agent_id = agent_id
         self.bus = bus
         self.kannaka_bin = kannaka_bin
@@ -64,7 +68,9 @@ class Mind:
         return result.returncode == 0
 
     async def ask(self, text: str, *, recall_query: str | None = None,
-                  timeout_s: float = ASK_TIMEOUT_S) -> str:
+                  timeout_s: float | None = None) -> str:
+        if timeout_s is None:
+            timeout_s = self.ask_timeout_s
         payload = {"from": CALLER_ID, "text": text, "recall_query": recall_query,
                    "no_tools": True, "mode": "full_recall"}
         reply = await self.bus.request(f"KANNAKA.ask.{self.agent_id}", payload, timeout_s=timeout_s)

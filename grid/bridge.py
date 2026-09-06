@@ -21,7 +21,7 @@ from . import chronicle as chron
 from .distill import Distiller, Event, Snapshot
 from .envelope import envelope, now_ms, slug, subject
 from .flux import Flux
-from .mind import REMEMBER_MIN_INTERVAL_S, Mind, MindError, Throttle
+from .mind import ASK_TIMEOUT_S, REMEMBER_MIN_INTERVAL_S, Mind, MindError, Throttle
 from .natsio import Bus, BusClosed, BusError
 
 log = logging.getLogger("grid.bridge")
@@ -122,6 +122,7 @@ class BridgeConfig:
     state_every_s: float
     history_every_s: float
     verdicts_dir: str | None
+    ask_timeout_s: float = ASK_TIMEOUT_S
 
     @classmethod
     def from_env(cls) -> "BridgeConfig":
@@ -138,6 +139,7 @@ class BridgeConfig:
             state_every_s=float(env("STATE_EVERY_S", "60")),
             history_every_s=float(env("HISTORY_EVERY_S", "60")),
             verdicts_dir=env("VERDICTS_DIR") or None,
+            ask_timeout_s=float(env("MIND_ASK_TIMEOUT_S", str(ASK_TIMEOUT_S))),
         )
 
 
@@ -375,7 +377,8 @@ async def run(cfg: BridgeConfig) -> None:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60.0)
     mind = Mind(cfg.mind_agent_id or "grid-unbound", bus, kannaka_bin=cfg.kannaka_bin,
-                data_dir=Path(cfg.mind_data_dir) if cfg.mind_data_dir else None)
+                data_dir=Path(cfg.mind_data_dir) if cfg.mind_data_dir else None,
+                ask_timeout_s=cfg.ask_timeout_s)
     flux = Flux(cfg.flux_url) if cfg.flux_url else None
     if flux is None:
         log.info("FLUX_URL unset; Flux publishing skipped")
