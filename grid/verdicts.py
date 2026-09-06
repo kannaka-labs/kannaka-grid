@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -86,28 +87,89 @@ def verdict_row(entry: dict, stats: dict | None, *, settled_tick: int,
 
 
 class Ledger:
+    """The append-only hash chain of verdict rows.
+
+    The head and the settled ids are cached after the first read: a nightly run
+    settles thousands of proposals, and re-reading the whole file per append is
+    quadratic. `lock()` is what keeps the cache honest against a second writer.
+    """
+
     def __init__(self, path: Path):
         self.path = Path(path)
+        self._head: str | None = None
+        self._ids: set[str] | None = None
+        self._partial_tail_offset: int | None = None
 
     def rows(self) -> list[dict]:
+        out: list[dict] = []
+        self._partial_tail_offset = None
         try:
-            with open(self.path, encoding="utf-8") as f:
-                return [json.loads(l) for l in f if l.strip()]
+            with open(self.path, "rb") as f:
+                offset = 0
+                for raw in f:
+                    if raw.strip():
+                        try:
+                            out.append(json.loads(raw))
+                        except ValueError:      # includes a bad UTF-8 decode
+                            log.warning("verdict ledger: unreadable line at byte %d of %s "
+                                        "(partial write?); stopping there", offset, self.path)
+                            self._partial_tail_offset = offset
+                            break
+                    offset += len(raw)
         except OSError:
-            return []
+            out = []
+        self._head = out[-1]["chain"] if out else GENESIS
+        self._ids = {r["request_id"] for r in out}
+        return out
 
     def head(self) -> str:
-        rows = self.rows()
-        return rows[-1]["chain"] if rows else GENESIS
+        if self._head is None:
+            self.rows()
+        return self._head
+
+    def _truncate_partial_tail(self) -> None:
+        """Drop a half-written last line: rows are fsynced, so it was never a row."""
+        if self._head is None:
+            self.rows()
+        if self._partial_tail_offset is None:
+            return
+        log.warning("verdict ledger: truncating a partial tail at byte %d of %s",
+                    self._partial_tail_offset, self.path)
+        with open(self.path, "r+b") as f:
+            f.truncate(self._partial_tail_offset)
+            f.flush()
+            os.fsync(f.fileno())
+        self._partial_tail_offset = None
 
     def append(self, row: dict) -> dict:
-        full = dict(row, chain=chain_hash(self.head(), row))
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._truncate_partial_tail()
+        full = dict(row, chain=chain_hash(self.head(), row))
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(full, sort_keys=True, separators=(",", ":")) + "\n")
             f.flush()
             os.fsync(f.fileno())
+        self._head = full["chain"]
+        self._ids.add(full["request_id"])
         return full
+
+    @contextlib.contextmanager
+    def lock(self):
+        """Exclusive across processes on Linux (the nightly timer plus a manual run).
+
+        Windows has no flock and is a dev box only, so there it is a no-op.
+        """
+        if sys.platform != "linux":
+            yield
+            return
+        import fcntl
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(f"{self.path}.lock", "w", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
 
     def verify(self) -> bool:
         prev = GENESIS
@@ -118,7 +180,9 @@ class Ledger:
         return True
 
     def settled_ids(self) -> set[str]:
-        return {r["request_id"] for r in self.rows()}
+        if self._ids is None:
+            self.rows()
+        return set(self._ids)
 
 
 class StatsReader:
@@ -214,18 +278,21 @@ async def run_once(*, verdicts_dir: Path, history_db: Path, state: dict, bus=Non
     entries = ProposalLog(Path(verdicts_dir)).read_all()
     ledger = Ledger(Path(verdicts_dir) / "verdicts.jsonl")
     now_epoch, now_tick = int(state.get("epoch", 0)), int(state.get("tick", 0))
-    with StatsReader(Path(history_db)) as reader:
-        rows = settle_pending(entries, ledger, reader, now_epoch=now_epoch, now_tick=now_tick,
-                              settle_ticks=settle_ticks)
-    if bus is not None:
-        for row in rows:
-            fields = {k: v for k, v in row.items() if k not in ("epoch",)}
-            try:
-                await bus.publish(subject(colony, "verdict"),
-                                  envelope(agent_id=agent_id, colony=colony, epoch=row["epoch"],
-                                           tick=now_tick, **fields))
-            except Exception as e:      # the row is already in the ledger; the bus is best-effort
-                log.error("verdict publish failed for %s: %s", row["request_id"], e)
+    # One writer at a time: the nightly timer and a manual run must not interleave
+    # appends, and the cached head is only safe inside the lock.
+    with ledger.lock():
+        with StatsReader(Path(history_db)) as reader:
+            rows = settle_pending(entries, ledger, reader, now_epoch=now_epoch, now_tick=now_tick,
+                                  settle_ticks=settle_ticks)
+        if bus is not None:
+            for row in rows:
+                fields = {k: v for k, v in row.items() if k not in ("epoch",)}
+                try:
+                    await bus.publish(subject(colony, "verdict"),
+                                      envelope(agent_id=agent_id, colony=colony, epoch=row["epoch"],
+                                               tick=now_tick, **fields))
+                except Exception as e:  # the row is already in the ledger; the bus is best-effort
+                    log.error("verdict publish failed for %s: %s", row["request_id"], e)
     log.info("settled %d proposals (epoch %d tick %d)", len(rows), now_epoch, now_tick)
     return rows
 

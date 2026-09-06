@@ -82,6 +82,36 @@ def test_chain_is_deterministic_and_verifies(tmp_path):
     assert Ledger(tmp_path / "verdicts.jsonl").verify() is False
 
 
+def test_ledger_truncates_a_partial_tail_before_appending(tmp_path):
+    """A row is fsynced, so a half-line is a torn write, never a verdict."""
+    path = tmp_path / "verdicts.jsonl"
+    Ledger(path).append({"request_id": "a", "tier": "new"})
+    with open(path, "a", encoding="utf-8") as f:
+        f.write('{"request_id": "torn", "tier": "gro')       # the machine lost power here
+    led = Ledger(path)
+    led.append({"request_id": "b", "tier": "growing"})
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2 and [json.loads(l)["request_id"] for l in lines] == ["a", "b"]
+    assert Ledger(path).verify() is True
+
+
+def test_ledger_head_is_cached(tmp_path):
+    led = Ledger(tmp_path / "verdicts.jsonl")
+    reads = []
+    real = led.rows
+
+    def counted():
+        reads.append(1)
+        return real()
+
+    led.rows = counted
+    led.append({"request_id": "a", "tier": "new"})
+    led.append({"request_id": "b", "tier": "growing"})
+    assert len(reads) == 1                                   # the second append reused the head
+    assert led.settled_ids() == {"a", "b"} and len(reads) == 1
+    assert Ledger(tmp_path / "verdicts.jsonl").verify() is True
+
+
 def test_stats_reader_reads_a_copy(tmp_path):
     db = make_db(tmp_path / "history.sqlite3", [(1, "g1", 40, 0, 0, 3, 13, 120, 3020)])
     with StatsReader(db) as reader:
