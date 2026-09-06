@@ -105,6 +105,23 @@ def test_negatives_carry_the_prompt_and_the_rejected_reply(tmp_path):
     assert negatives["odin-c"]["text"] == '["harvest", "fork"]'
 
 
+def test_a_rejection_logged_before_replies_were_kept_is_not_a_negative(tmp_path):
+    """Without a reply the negative's text would be the literal string 'null'."""
+    vdir, out = tmp_path / "v", tmp_path / "out"
+    seed(vdir)
+    ProposalLog(vdir).record({"ts": 1040, "request_id": "e", "epoch": 1, "tick": 12, "colony": "c",
+                              "proposal": None, "proposal_genome_id": None, "outcome": "rejected",
+                              "model_alias": "m", "reason": "bad",   # pre-wave: no "reply" key
+                              "prompt_path": "prompts/e.txt", "parent_genome": ["harvest"]}, "prompt e")
+    Ledger(vdir / "verdicts.jsonl").append({"request_id": "e", "proposal_genome_id": None, "epoch": 1,
+        "settled_tick": 3100, "births": 0, "generations": 0, "lifetime_ticks": 0, "tier": "rejected",
+        "fitness": 0, "model_alias": "m", "outcome": "rejected", "history_sha256": HIST})
+    manifest = export(vdir, out, min_tier="reproduced")
+    ids = [json.loads(l)["id"] for l in (out / "negatives.jsonl").read_text().splitlines()]
+    assert "odin-e" not in ids and sorted(ids) == ["odin-c", "odin-d"]
+    assert manifest["skipped_no_reply"] == 1
+
+
 def test_a_negative_without_its_prompt_is_skipped(tmp_path):
     vdir, out = tmp_path / "v", tmp_path / "out"
     seed(vdir)

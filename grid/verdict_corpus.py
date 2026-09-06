@@ -66,7 +66,7 @@ def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced") -
     ledger = Ledger(vdir / "verdicts.jsonl")
     threshold = TIER_RANK[min_tier]
     records, negatives, by_tier = [], [], {}
-    skipped = skipped_missing_entry = skipped_below_threshold = 0
+    skipped = skipped_missing_entry = skipped_below_threshold = skipped_no_reply = 0
     excluded = {t: 0 for t in EXCLUDED_TIERS}
     snapshots: set[str] = set()
     stamps: list[int] = []
@@ -81,6 +81,11 @@ def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced") -
         negative = v["tier"] in NEGATIVE_TIERS
         if not negative and TIER_RANK.get(v["tier"], -1) < threshold:
             skipped_below_threshold += 1
+            continue
+        if v["tier"] == "rejected" and not e.get("reply"):
+            # Logged before the relay kept replies: a rejection has no proposal either,
+            # so the negative would be the literal string "null" against a real prompt.
+            skipped_no_reply += 1
             continue
         prompt_path = vdir / e.get("prompt_path", "")
         if not prompt_path.is_file():
@@ -114,6 +119,7 @@ def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced") -
                 "by_tier": by_tier, "skipped_missing_prompt": skipped,
                 "skipped_missing_entry": skipped_missing_entry,
                 "skipped_below_threshold": skipped_below_threshold,
+                "skipped_no_reply": skipped_no_reply,
                 "skipped_preexisting": excluded["preexisting"], "skipped_unknown": excluded["unknown"],
                 "chain_head": ledger.head(), "history_snapshots": sorted(snapshots),
                 "since_ts": min(stamps) if stamps else None, "until_ts": max(stamps) if stamps else None,
