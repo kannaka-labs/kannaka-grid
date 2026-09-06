@@ -311,7 +311,7 @@ if __name__ == "__main__":
 - Test: `tests/test_identity.py` (extend)
 
 **Interfaces:**
-- Produces: `export(out_dir: Path) -> dict` (writes `identity_examples.jsonl` + `manifest.json` = `{records, sha256}`, returns the manifest); the CLI gains `python -m grid.identity export --out <dir>`.
+- Produces: `export(out_dir: Path) -> dict` (writes `identity_examples.jsonl` + `identity_manifest.json` = `{records, sha256}`, returns the manifest); the CLI gains `python -m grid.identity export --out <dir>`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -323,7 +323,7 @@ def test_export_writes_examples_and_manifest(tmp_path):
     m = export(tmp_path)
     lines = (tmp_path / "identity_examples.jsonl").read_text(encoding="utf-8").splitlines()
     assert m["records"] == len(lines) >= 40
-    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    manifest = json.loads((tmp_path / "identity_manifest.json").read_text(encoding="utf-8"))
     assert manifest == m and manifest["sha256"] == hashlib.sha256((tmp_path / "identity_examples.jsonl").read_bytes()).hexdigest()
 ```
 
@@ -343,7 +343,7 @@ def export(out_dir: Path) -> dict:
         for r in recs:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     manifest = {"records": len(recs), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-    (out / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
+    (out / "identity_manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     return manifest
 ```
 
@@ -364,7 +364,7 @@ OUT=/srv/grid/colony-one/export
 /srv/grid/venv/bin/python -m grid.verdict_corpus --verdicts-dir /srv/grid/colony-one/verdicts --out "$OUT" --dream >/dev/null 2>&1
 /srv/grid/venv/bin/python -m grid.identity export --out "$OUT" >/dev/null 2>&1
 cp /srv/grid/colony-one/verdicts/verdicts.jsonl "$OUT/verdicts.jsonl"
-tar -C "$OUT" -cf - manifest.json records.jsonl negatives.jsonl verdicts.jsonl identity_examples.jsonl
+tar -C "$OUT" -cf - manifest.json records.jsonl negatives.jsonl verdicts.jsonl identity_examples.jsonl identity_manifest.json
 ```
 
 Note in `deploy/README.md` (a short block under the verdicts section): the pull now carries

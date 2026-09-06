@@ -60,5 +60,6 @@ def test_export_writes_examples_and_manifest(tmp_path):
     m = export(tmp_path)
     lines = (tmp_path / "identity_examples.jsonl").read_text(encoding="utf-8").splitlines()
     assert m["records"] == len(lines) >= 40
-    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    manifest = json.loads((tmp_path / "identity_manifest.json").read_text(encoding="utf-8"))
     assert manifest == m and manifest["sha256"] == hashlib.sha256((tmp_path / "identity_examples.jsonl").read_bytes()).hexdigest()
+    assert not (tmp_path / "manifest.json").exists()   # must never collide with the verdict manifest

@@ -8,4 +8,4 @@ OUT=/srv/grid/colony-one/export
 /srv/grid/venv/bin/python -m grid.verdict_corpus --verdicts-dir /srv/grid/colony-one/verdicts --out "$OUT" --dream >/dev/null 2>&1
 /srv/grid/venv/bin/python -m grid.identity export --out "$OUT" >/dev/null 2>&1
 cp /srv/grid/colony-one/verdicts/verdicts.jsonl "$OUT/verdicts.jsonl"
-tar -C "$OUT" -cf - manifest.json records.jsonl negatives.jsonl verdicts.jsonl identity_examples.jsonl
+tar -C "$OUT" -cf - manifest.json records.jsonl negatives.jsonl verdicts.jsonl identity_examples.jsonl identity_manifest.json

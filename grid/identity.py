@@ -52,7 +52,7 @@ def export(out_dir: Path) -> dict:
         for r in recs:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     manifest = {"records": len(recs), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-    (out / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
+    (out / "identity_manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     return manifest
 
 
