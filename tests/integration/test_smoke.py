@@ -12,6 +12,7 @@ import pytest
 from grid.bridge import iter_sse_data
 from grid.distill import Distiller, Snapshot
 from grid.odin import Relay
+from grid.proposal import GENOME_CAP
 
 pytestmark = pytest.mark.integration
 
@@ -170,12 +171,15 @@ async def test_verdicts_settle_against_the_real_fossil_db(colony, tmp_path):
 
 
 class EchoMind:
-    """Answers with the parent genome plus one nop — a valid variant of whatever was asked."""
+    """Answers with a one-opcode nop variant of whatever parent thegrid asked about."""
 
     agent_id = "grid-smoke"
 
     def __init__(self, queue: Path):
         self.queue = queue
+
+    def remember(self, text, tags, *, category="grid"):
+        return True             # the relay remembers rejections in a thread; must not AttributeError
 
     async def recall(self, query, top_k=5):
         return []
@@ -183,7 +187,19 @@ class EchoMind:
     async def ask(self, text, *, recall_query=None, timeout_s=180.0):
         request = json.loads((self.queue / "request.json").read_text())
         assert "nop" in [i["name"] for i in request["instruction_set"]], "thegrid's ISA lost nop"
-        return json.dumps(list(request["genome"]) + ["nop"])
+        genome = list(request["genome"])
+        # thegrid's max_genome and grid.proposal.GENOME_CAP are both 64, so appending
+        # to a parent that has drifted to the cap would be rejected, not proposed.
+        # Replace in place instead, at the last opcode that is not already a nop —
+        # replacing a trailing nop would reproduce the parent, which is also rejected.
+        if len(genome) >= GENOME_CAP:
+            for i in range(len(genome) - 1, -1, -1):
+                if genome[i] != "nop":
+                    genome[i] = "nop"
+                    break
+        else:
+            genome.append("nop")
+        return json.dumps(genome)
 
 
 @skip
@@ -216,6 +232,14 @@ async def test_a_real_proposal_is_credited_to_its_child(colony, tmp_path):
                   state_fetch=fetch_state, proposal_log=ProposalLog(vdir), model_alias="stub")
     assert await relay.poll_once() == "proposed"
     [entry] = ProposalLog(vdir).read_all()
+
+    # "parent + nop" is exactly an insertion thegrid's own ExperimentalMutator makes,
+    # so in a young homogeneous population the variant may already be alive. That
+    # settles 'preexisting' by design; it is not a pipeline failure.
+    if db.exists():
+        with StatsReader(db) as reader:
+            if reader.stats(entry["epoch"], entry["proposal_genome_id"]) is not None:
+                pytest.skip("variant already alive in this epoch")
 
     deadline = time.time() + 90
     while time.time() < deadline:
