@@ -1,0 +1,2 @@
+colony key models: ['kannaka-brain', 'kannaka-brain-7b-v1', 'kannaka-brain-current', 'kannaka-brain-v1', 'kannaka-brain-v2', 'kannaka-brain-v3']
+budget: 5.0 spend: 0.0

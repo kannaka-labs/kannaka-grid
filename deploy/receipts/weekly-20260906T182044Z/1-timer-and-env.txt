@@ -1,0 +1,8 @@
+grid-weekly-release.timer: active
+Sun 2026-09-13 06:00:00 CDT 6 days -         - grid-weekly-release.timer grid-weekly-release.service
+
+releases dir: drwx------ 2 nick nick 4096 Sep  6 13:10 /srv/grid/releases
+MIND_MODEL_ALIAS=kannaka-brain-v3
+MIND_LLM_MODEL=kannaka-brain-current
+DEBAIN2_HOST=debain2
+RELEASES_DIR=/srv/grid/releases

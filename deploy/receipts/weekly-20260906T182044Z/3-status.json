@@ -1,0 +1,39 @@
+{
+ "released": null,
+ "rows": 0,
+ "verify": true,
+ "candidate": {
+  "tag": "kannaka-brain-v3",
+  "run": "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260906-1008",
+  "rogue_ts": 1788709967.777,
+  "manifest": {
+   "base": "Qwen/Qwen2.5-14B-Instruct",
+   "train": 561,
+   "holdout": 57,
+   "lora": {
+    "r": 32,
+    "alpha": 64
+   },
+   "epochs": 2.0,
+   "max_steps": -1,
+   "lr": 0.0001,
+   "qlora": true,
+   "holdout_loss": {
+    "before": 4.648632610053347,
+    "after": 1.3872126769601254
+   },
+   "holdout_ppl": {
+    "before": 104.44207484887903,
+    "after": 4.003674950485302
+   },
+   "seconds": 781,
+   "adapter": "out/adapter",
+   "cuda": true,
+   "device": "NVIDIA A100 80GB PCIe",
+   "merged": "removed before quantize",
+   "gguf": "out/gguf/kannaka-brain-q4_K_M.gguf",
+   "served_as": "kannaka-brain-v3",
+   "promoted_at": 1788709966.5185843
+  }
+ }
+}
