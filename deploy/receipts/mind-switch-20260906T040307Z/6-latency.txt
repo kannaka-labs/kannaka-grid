@@ -1,0 +1,6 @@
+Direct probe from Skywave to debain2 gateway with the relay Odin prompt (1960 prompt tokens), 2026-09-06 03:2x UTC, debain2 idle:
+kannaka-brain      121.4 s  completion 61 tokens  reply = JSON list of 17 opcode names
+kannaka-brain-v1   140.4 s  completion 58 tokens  reply = JSON list of 16 opcode names
+Through kannaka swarm serve (persona + 8 recalled memories added): 233 s idle; 314 s and 400 s+ under load -> daemon dropped as NATS Stale Connection (see 2-).
+Direct route, debain2 at load ~50 (other tenants): 400 s ReadTimeout; gateway container restart by another operator: RemoteProtocolError.
+Direct route, debain2 idle, 900 s deadline: proposed in 106 s (23:00:12 -> 23:01:58 CDT).

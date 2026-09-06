@@ -1,0 +1,22 @@
+grid-mind NRestarts=1
+Sep 05 22:20:52 nick-debain1 kannaka[2417261]: [swarm serve] directed from kannaka-grid
+Sep 05 22:21:01 nick-debain1 kannaka[2417261]: [swarm serve] replied on _INBOX.wq7Cu2YLVU15kqi9A1iu2z.wq7Cu2YL
+Sep 05 22:27:22 nick-debain1 kannaka[2428027]: [swarm serve] directed from kannaka-grid
+Sep 05 22:31:15 nick-debain1 kannaka[2428027]: [swarm serve] replied on _INBOX.IrA56GSM4nYveBCIMD8hrO.IrA56GSM
+Sep 05 22:31:16 nick-debain1 kannaka[2428027]: [swarm serve] directed from kannaka-grid
+Sep 05 22:32:32 nick-debain1 kannaka[2428027]: [swarm serve] replied on _INBOX.scnUzDKESq50AE71Lw0z3A.scnUzDKE
+Sep 05 22:32:32 nick-debain1 kannaka[2428027]: [swarm serve] directed from kannaka-grid
+Sep 05 22:37:46 nick-debain1 kannaka[2428027]: [swarm serve] replied on _INBOX.jlek0kKE8dOPznrmBXZjZz.jlek0kKE
+Sep 05 22:37:59 nick-debain1 kannaka[2441279]: [swarm serve] directed from kannaka-grid
+Sep 05 22:43:14 nick-debain1 kannaka[2441279]: [swarm serve] replied on _INBOX.qEGisxVpYouZDPzlMauENU.qEGisxVp
+Sep 05 22:43:14 nick-debain1 kannaka[2441279]: [nats] server error: Stale Connection
+Sep 05 22:46:42 nick-debain1 kannaka[2447657]: [swarm serve] directed from kannaka-grid
+Sep 05 22:50:06 nick-debain1 kannaka[2455124]: [swarm serve] directed from kannaka-grid
+Sep 05 22:55:14 nick-debain1 kannaka[2455124]: [swarm serve] replied on _INBOX.7TTWl1FY6fJzEeIqW7QvU5.7TTWl1FY
+Sep 05 22:55:15 nick-debain1 kannaka[2455124]: [swarm serve] directed from kannaka-grid
+Sep 05 22:56:42 nick-debain1 kannaka[2462962]: [swarm serve] directed from kannaka-grid
+Sep 05 22:56:45 nick-debain1 kannaka[2462962]: [swarm serve] replied on _INBOX.GSXiqbLm2azUnOS8zF3C1i.GSXiqbLm
+Sep 05 22:56:46 nick-debain1 kannaka[2462962]: [swarm serve] directed from kannaka-grid
+Sep 05 22:56:50 nick-debain1 kannaka[2462962]: [swarm serve] replied on _INBOX.GSXiqbLm2azUnOS8zF3C1i.GSXiqbLm
+Sep 05 22:56:50 nick-debain1 kannaka[2462962]: [swarm serve] directed from kannaka-grid
+Sep 05 22:56:54 nick-debain1 kannaka[2462962]: [swarm serve] replied on _INBOX.GSXiqbLm2azUnOS8zF3C1i.GSXiqbLm

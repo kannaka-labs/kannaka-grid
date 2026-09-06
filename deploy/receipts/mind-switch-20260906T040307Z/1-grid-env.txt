@@ -1,0 +1,9 @@
+COLONY_SLUG=colony-one
+MIND_AGENT_ID=grid-colony-one
+MIND_DATA_DIR=/srv/grid/colony-one/memory
+MIND_MODEL_ALIAS=kannaka-brain
+MIND_ASK_TIMEOUT_S=900
+ODIN_RETRY_S=900
+MIND_LLM_URL=http://10.30.0.30:4000/v1
+MIND_LLM_MODEL=kannaka-brain
+MIND_LLM_KEY_FILE=(0600 file on host)

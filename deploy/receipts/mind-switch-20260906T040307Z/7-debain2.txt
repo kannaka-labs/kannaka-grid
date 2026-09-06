@@ -1,0 +1,5 @@
+debain2 (10.30.0.30), Intel Xeon E5-2697 v4 @ 2.30GHz, 20 cores, no GPU, 196 GB RAM
+gateway key for the colony mind: alias grid-colony-one-20260906T032040, models [kannaka-brain, kannaka-brain-v1], budget $5/30d, spend 0.0 (local models cost nothing)
+gateway model_list at 04:03Z: agent-brain, kannaka-brain, kannaka-brain-v1, kannaka-brain-32b-v1, kannaka-brain-v2, kannaka-brain-7b-v1
+ollama is bound to the docker bridge (172.18.0.1:11434) only; Skywave reaches debain2 through :4000
+kax-gateway container was restarted by another operator at ~03:59Z, cutting one relay request

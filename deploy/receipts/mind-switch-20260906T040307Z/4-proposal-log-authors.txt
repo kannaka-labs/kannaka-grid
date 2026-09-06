@@ -1,0 +1,2 @@
+by_model_alias {'agent-brain': 21, 'kannaka-brain': 1}
+kannaka-brain entry: request=76ba310662115943 outcome=proposed epoch=1 tick=51708 proposal_len=15 parent_len=14 prompt_sha256=fac07edc80ae1bb3

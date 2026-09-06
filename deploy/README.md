@@ -36,9 +36,18 @@ open-weight brain on debain2 instead (`kannaka-brain` = qwen2.5:14b, or the trai
 ```bash
 # once: mint a key on debain2's gateway for models kannaka-brain, kannaka-brain-v1 and land it
 # on Skywave as ~/.grid-debain2-key (0600) without it ever passing through a terminal
-grep -q '^MIND_ASK_TIMEOUT_S=' /srv/grid/grid.env || echo MIND_ASK_TIMEOUT_S=400 >> /srv/grid/grid.env
+grep -q '^MIND_ASK_TIMEOUT_S=' /srv/grid/grid.env || printf 'MIND_ASK_TIMEOUT_S=900
+ODIN_RETRY_S=900
+' >> /srv/grid/grid.env
 bash ~/grid-deploy/set-mind-model.sh http://10.30.0.30:4000/v1 kannaka-brain ~/.grid-debain2-key
+# keep the chronicle (3 asks per phase, rare) on the fast hosted alias so it does not
+# queue behind the relay on the same CPU model:
+bash ~/grid-deploy/set-mind-model.sh http://127.0.0.1:4000/v1 agent-brain /srv/grid/colony-one/mind-skywave.key --daemon-only
 ```
+Measured 2026-09-06: 121 s per Odin prompt straight to the gateway on an idle debain2, 400 s+
+when the box is shared (load 50 on 20 cores), hence the 900 s deadline. `ODIN_RETRY_S` must be
+>= the deadline: after a timeout the model is still computing the orphaned answer and an earlier
+retry queues behind it.
 `set-mind-model.sh` rewrites only the `[llm]` lines, sets `MIND_MODEL_ALIAS` (which verdict rows
 record as the proposal's author), points the relay's asks straight at the gateway
 (`MIND_LLM_URL/MODEL/KEY_FILE`; recall and remember stay on Kannaka's daemon), and restarts
