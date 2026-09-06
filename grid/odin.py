@@ -18,7 +18,7 @@ from typing import Awaitable, Callable
 import httpx
 
 from .envelope import envelope, now_ms, subject
-from .mind import ASK_TIMEOUT_S, REMEMBER_MIN_INTERVAL_S, Mind, MindError, Throttle
+from .mind import ASK_TIMEOUT_S, REMEMBER_MIN_INTERVAL_S, DirectLlm, Mind, MindError, Throttle
 from .natsio import Bus, BusClosed, BusError, BusTimeout
 from .proposal import Rejection, parse_request, render_prompt, validate, write_proposal
 from .proposal_log import ProposalLog, proposal_entry
@@ -170,6 +170,7 @@ class RelayConfig:
     # After a timeout the daemon is still computing the orphaned answer; retrying
     # sooner than the deadline queues the retry behind it and times out again.
     retry_after_s: float = 60.0
+    llm: DirectLlm | None = None    # MIND_LLM_URL / MIND_LLM_MODEL / MIND_LLM_KEY_FILE
 
     @classmethod
     def from_env(cls) -> "RelayConfig":
@@ -192,6 +193,7 @@ class RelayConfig:
             model_alias=env("MIND_MODEL_ALIAS", "agent-brain"),
             ask_timeout_s=float(env("MIND_ASK_TIMEOUT_S", str(ASK_TIMEOUT_S))),
             retry_after_s=float(env("ODIN_RETRY_S", "60")),
+            llm=DirectLlm.from_env(env),
         )
 
 
@@ -208,7 +210,7 @@ async def run(cfg: RelayConfig) -> None:
             backoff = min(backoff * 2, 60.0)
     mind = Mind(cfg.agent_id, bus, kannaka_bin=cfg.kannaka_bin,
                 data_dir=Path(cfg.mind_data_dir) if cfg.mind_data_dir else None,
-                ask_timeout_s=cfg.ask_timeout_s)
+                ask_timeout_s=cfg.ask_timeout_s, llm=cfg.llm)
     async with httpx.AsyncClient(timeout=2) as client:
         async def fetch_state() -> dict:
             r = await client.get(f"{cfg.colony_url}/api/state")

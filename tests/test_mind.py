@@ -1,10 +1,13 @@
 # tests/test_mind.py
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from grid.mind import ASK_TIMEOUT_S, REMEMBER_MIN_INTERVAL_S, Mind, MindError, Throttle
+import httpx
+
+from grid.mind import ASK_TIMEOUT_S, REMEMBER_MIN_INTERVAL_S, DirectLlm, Mind, MindError, Throttle
 
 
 class Clock:
@@ -91,6 +94,46 @@ async def test_ask_uses_the_configured_timeout_unless_overridden():
     assert bus.calls[0][2] == 400.0
     await mind.ask("q", timeout_s=5.0)
     assert bus.calls[1][2] == 5.0
+
+
+def _http(handler):
+    return lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+async def test_direct_llm_ask_posts_openai_chat_and_returns_text():
+    seen = {}
+
+    def handler(req):
+        seen["url"], seen["auth"], seen["body"] = str(req.url), req.headers.get("authorization"), json.loads(req.content)
+        return httpx.Response(200, json={"choices": [{"message": {"content": '  ["nop", "fork"]  '}}]})
+    bus = FakeBus(reply={"from": "m", "text": "daemon should not be asked"})
+    mind = Mind("m", bus, llm=DirectLlm("http://gw:4000/v1", "kannaka-brain", "k1"), http=_http(handler))
+    assert await mind.ask("prompt", recall_query="x") == '["nop", "fork"]'
+    assert seen["url"] == "http://gw:4000/v1/chat/completions" and seen["auth"] == "Bearer k1"
+    assert seen["body"]["model"] == "kannaka-brain"
+    assert seen["body"]["messages"] == [{"role": "user", "content": "prompt"}]
+    assert bus.calls == []
+
+
+async def test_direct_llm_http_and_empty_replies_raise_mind_error():
+    for resp in (httpx.Response(429, text="budget"), httpx.Response(200, json={"choices": [{"message": {"content": ""}}]}),
+                 httpx.Response(200, json={"nope": 1})):
+        mind = Mind("m", FakeBus(), llm=DirectLlm("http://gw/v1", "kb"), http=_http(lambda req, r=resp: r))
+        with pytest.raises(MindError):
+            await mind.ask("q")
+
+    def boom(req):
+        raise httpx.ReadTimeout("slow")
+    mind = Mind("m", FakeBus(), llm=DirectLlm("http://gw/v1", "kb"), http=_http(boom))
+    with pytest.raises(MindError, match="ReadTimeout"):
+        await mind.ask("q")
+
+
+def test_direct_llm_from_env_reads_key_file(tmp_path):
+    assert DirectLlm.from_env({}.get) is None
+    kf = tmp_path / "key"; kf.write_text("sk-abc\n", encoding="utf-8")
+    env = {"MIND_LLM_URL": "http://gw:4000/v1/", "MIND_LLM_MODEL": "kannaka-brain", "MIND_LLM_KEY_FILE": str(kf)}
+    assert DirectLlm.from_env(env.get) == DirectLlm("http://gw:4000/v1", "kannaka-brain", "sk-abc")
 
 
 async def test_ask_error_reply_raises():

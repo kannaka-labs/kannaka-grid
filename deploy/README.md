@@ -40,7 +40,11 @@ grep -q '^MIND_ASK_TIMEOUT_S=' /srv/grid/grid.env || echo MIND_ASK_TIMEOUT_S=400
 bash ~/grid-deploy/set-mind-model.sh http://10.30.0.30:4000/v1 kannaka-brain ~/.grid-debain2-key
 ```
 `set-mind-model.sh` rewrites only the `[llm]` lines, sets `MIND_MODEL_ALIAS` (which verdict rows
-record as the proposal's author), and restarts grid-mind/odin/bridge. Switch back with the same
+record as the proposal's author), points the relay's asks straight at the gateway
+(`MIND_LLM_URL/MODEL/KEY_FILE`; recall and remember stay on Kannaka's daemon), and restarts
+grid-mind/odin/bridge. The direct route exists because `kannaka swarm serve` is single-threaded:
+while it waits minutes on a CPU model it misses NATS pings, is dropped as a stale connection, and
+the reply is lost (kannaka-memory#904). `--via-daemon` routes asks through the daemon again. Switch back with the same
 command and the Skywave gateway URL, alias `agent-brain`, and the key `rotate-mind-key.sh`
 minted. A drained hosted key shows in `journalctl -u grid-odin` as `429 budget_exceeded`;
 `rotate-mind-key.sh` mints a fresh one.
