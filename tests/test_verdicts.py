@@ -95,6 +95,20 @@ def test_ledger_truncates_a_partial_tail_before_appending(tmp_path):
     assert Ledger(path).verify() is True
 
 
+def test_ledger_restores_a_lost_trailing_newline_before_appending(tmp_path):
+    """A torn write that lost only its newline still parses; the next row must not be glued to it."""
+    path = tmp_path / "verdicts.jsonl"
+    Ledger(path).append({"request_id": "a", "tier": "new"})
+    data = path.read_bytes()
+    assert data.endswith(b"\n")
+    path.write_bytes(data[:-1])
+    led = Ledger(path)
+    led.append({"request_id": "b", "tier": "growing"})
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert [json.loads(l)["request_id"] for l in lines] == ["a", "b"]
+    assert Ledger(path).verify() is True
+
+
 def test_ledger_refuses_to_append_past_a_mid_file_corrupt_row(tmp_path):
     """ext4 after a crash: a zero-filled block in place, the rows after it intact."""
     path = tmp_path / "verdicts.jsonl"
