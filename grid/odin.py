@@ -167,6 +167,9 @@ class RelayConfig:
     verdicts_dir: str
     model_alias: str
     ask_timeout_s: float = ASK_TIMEOUT_S
+    # After a timeout the daemon is still computing the orphaned answer; retrying
+    # sooner than the deadline queues the retry behind it and times out again.
+    retry_after_s: float = 60.0
 
     @classmethod
     def from_env(cls) -> "RelayConfig":
@@ -188,6 +191,7 @@ class RelayConfig:
             verdicts_dir=env("VERDICTS_DIR", f"/srv/grid/{colony}/verdicts"),
             model_alias=env("MIND_MODEL_ALIAS", "agent-brain"),
             ask_timeout_s=float(env("MIND_ASK_TIMEOUT_S", str(ASK_TIMEOUT_S))),
+            retry_after_s=float(env("ODIN_RETRY_S", "60")),
         )
 
 
@@ -213,7 +217,8 @@ async def run(cfg: RelayConfig) -> None:
 
         relay = Relay(cfg.queue, colony=cfg.colony, agent_id=cfg.agent_id, mind=mind, bus=bus,
                       state_fetch=fetch_state, proposal_log=ProposalLog(Path(cfg.verdicts_dir)),
-                      model_alias=cfg.model_alias, timeout_s=cfg.ask_timeout_s)
+                      model_alias=cfg.model_alias, timeout_s=cfg.ask_timeout_s,
+                      retry_after_s=cfg.retry_after_s)
         log.info("watching %s for %s", cfg.queue, cfg.agent_id)
         while True:
             try:
