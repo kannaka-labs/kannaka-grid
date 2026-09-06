@@ -233,6 +233,30 @@ rogue.weekly promotes.
    restart and appends a `rolled_back` row; the chain verifies.
 4. No secret, prompt, adapter, or GGUF appears in git or in a receipt.
 
+## 11. Reconciliation (2026-09-06, found while writing the plan)
+
+Kannaka's session has already built the transport for §2 in the other direction: a
+forced-command key `rogue-grid-pull@debain2` on Skywave runs `/srv/grid/pull-export.sh`,
+which runs `grid.verdict_corpus` and streams `records.jsonl`, `negatives.jsonl`,
+`manifest.json`, and `verdicts.jsonl` as a tar (exercised 2026-09-06 16:17Z). rogue-agent
+master does not consume it yet. So:
+
+- §2's push (`grid.weekly set`, the Saturday timer, `weekly-extra/current`) is **dropped**.
+  The colony's examples reach debain2 through the pull. kannaka-grid's contribution to the
+  set is the export itself: the `odin` and `chronicle` records it already writes, plus the
+  `dream` kind added to `grid.verdict_corpus` (same record shape: `id`, `kind`, `tier`,
+  `source`, `speaker`, `text`, `context`, `provenance`), with the manifest's `by_kind`
+  and `dream_note`.
+- §6's upstream change becomes: `rogue.weekly` pulls the tar, converts each record to a chat
+  example (`system` = the P2 line; `user` = `context`; `assistant` = `text`; `kind` and
+  `source` carried over; `negatives.jsonl` ignored), appends them after the Rogue examples,
+  and counts kinds. Proposed as a PR on `NickFlach/rogue-agent` built on their key; if they
+  are mid-way on the same wiring, the PR is the conversation.
+- §1 is now one Skywave timer (Sun 06:00 CT, the release gate) plus the unchanged Rogue timer.
+- Dedup across weeks (§2) moves to the export: `grid.verdict_corpus --since-ts` is added so
+  the puller can ask for the window after its last `until_ts`; without it the export is
+  cumulative, as today.
+
 ## 10. Open questions
 
 1. (rogue-agent owner) accept `ROGUE_WEEKLY_EXTRA_DIR` and `ROGUE_WEEKLY_USD=5`?
