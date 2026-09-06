@@ -169,13 +169,12 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now grid-verdicts.timer
 systemctl is-active --quiet grid-verdicts.timer || die "grid-verdicts.timer is not active: $(systemctl status grid-verdicts.timer --no-pager | tail -3)" 6
 # The checkout is updated earlier (§0), so grid.identity exists before pull-export.sh
-# runs it. Only install when the content differs, so a re-run is a no-op and an actual
-# change gets a one-line diff summary in the log instead of a silent overwrite.
-if [ -f "$HOME/grid-deploy/pull-export.sh" ]; then
-  if ! cmp -s "$HOME/grid-deploy/pull-export.sh" /srv/grid/pull-export.sh 2>/dev/null; then
-    log "pull-export.sh changed: $(diff /srv/grid/pull-export.sh "$HOME/grid-deploy/pull-export.sh" 2>/dev/null | head -1)"
-    install -m 755 -o nick -g nick "$HOME/grid-deploy/pull-export.sh" /srv/grid/pull-export.sh
-  fi
+# runs it, and the checkout's copy is the versioned source of truth for what gets
+# installed here. Only install when the content differs, so a re-run is a no-op and an
+# actual change gets a one-line diff summary in the log instead of a silent overwrite.
+if ! cmp -s "$CHECKOUT/deploy/skywave/pull-export.sh" /srv/grid/pull-export.sh 2>/dev/null; then
+  log "pull-export.sh changed: $(diff /srv/grid/pull-export.sh "$CHECKOUT/deploy/skywave/pull-export.sh" 2>/dev/null | head -1)"
+  install -m 755 -o nick -g nick "$CHECKOUT/deploy/skywave/pull-export.sh" /srv/grid/pull-export.sh
 fi
 log "§3 receipt: bridge and relay active, verdicts timer enabled"
 
