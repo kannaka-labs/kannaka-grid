@@ -102,7 +102,7 @@ A manual run, from `/srv/grid/kannaka-grid`, settles without publishing to the b
 ```
 Export the week's verdict corpus (positives, negatives, and a manifest with the chain head) for training:
 ```bash
-python -m grid.verdict_corpus --out ~/.kannaka-corpus/grid/$(date -u +%G-W%V) --dream
+/srv/grid/venv/bin/python -m grid.verdict_corpus --out ~/.kannaka-corpus/grid/$(date -u +%G-W%V) --dream
 ```
 `--dream` adds a `dream` kind pulled from the colony mind's store via `kannaka search`
 (empty with a `dream_note` explaining why until `kannaka dream` writes a report memory
