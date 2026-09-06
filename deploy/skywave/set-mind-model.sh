@@ -2,7 +2,7 @@
 # set-mind-model.sh - point the colony mind at a different OpenAI-compatible
 # gateway/model and restart everything that names the model.
 #
-#   bash ~/grid-deploy/set-mind-model.sh <base_url> <model> <key_file> [--via-daemon]
+#   bash ~/grid-deploy/set-mind-model.sh <base_url> <model> <key_file> [--via-daemon|--daemon-only]
 #   e.g. bash ~/grid-deploy/set-mind-model.sh http://10.30.0.30:4000/v1 kannaka-brain ~/.grid-debain2-key
 #
 # Rewrites only the [llm] base_url / model / api_key lines of the mind's
@@ -12,7 +12,11 @@
 # the serve daemon is single-threaded and a model that needs minutes per answer
 # makes it miss NATS pings and lose the reply. Pass --via-daemon to route the
 # relay's asks through `kannaka swarm serve` instead (fine for a hosted model).
-# Then restarts grid-mind, grid-odin and grid-bridge. Never prints a key.
+# --daemon-only rewrites just the daemon's config (the chronicle's model) and
+# leaves the relay's MIND_LLM_* route and MIND_MODEL_ALIAS alone, so the relay
+# can run on the local brain while the chronicle keeps a fast hosted model.
+# Then restarts grid-mind, grid-odin and grid-bridge (not grid-odin for
+# --daemon-only). Never prints a key.
 set -euo pipefail
 BASE_URL=${1:?base_url}; MODEL=${2:?model}; KEY_FILE=${3:?key_file}; VIA=${4:-}
 ROOT=/srv/grid
@@ -49,6 +53,16 @@ open(path, "w", encoding="utf-8").write("\n".join(out) + "\n")
 PY
 chmod 600 "$CFG"
 setenv() { grep -q "^$1=" "$ENVF" && sed -i "s#^$1=.*#$1=$2#" "$ENVF" || echo "$1=$2" >> "$ENVF"; }
+if [ "$VIA" = "--daemon-only" ]; then
+  sudo systemctl restart grid-mind.service grid-bridge.service
+  sleep 3
+  for u in grid-mind grid-bridge; do
+    systemctl is-active --quiet $u.service || die "$u did not come back: $(systemctl status $u --no-pager | tail -3)" 6
+  done
+  log "daemon (chronicle) now asks $MODEL at $BASE_URL; relay route untouched; grid-mind/bridge restarted"
+  grep -nE '^(provider|base_url|model) ' "$CFG" | sed 's/^/[set-mind-model] /'
+  exit 0
+fi
 setenv MIND_MODEL_ALIAS "$MODEL"
 if [ "$VIA" = "--via-daemon" ]; then
   sed -i '/^MIND_LLM_\(URL\|MODEL\|KEY_FILE\)=/d' "$ENVF"

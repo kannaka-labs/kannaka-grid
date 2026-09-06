@@ -6,6 +6,8 @@
 #
 #   GRID_MIND_BUDGET=2.0 bash ~/grid-deploy/rotate-mind-key.sh
 #
+# Also saves the key to /srv/grid/<colony>/mind-skywave.key (0600) so
+# set-mind-model.sh can point the daemon back at it later.
 # Never prints a key. Exit 4 = gateway refused the mint.
 set -euo pipefail
 ROOT=/srv/grid
@@ -58,6 +60,8 @@ if n != 1:
 open(path, "w", encoding="utf-8").write(new)
 PY
 chmod 600 "$MEM/config.toml"
+(umask 077; printf '%s
+' "$VKEY" > "$ROOT/$COLONY/mind-skywave.key")
 sudo systemctl restart grid-mind.service
 sleep 2
 systemctl is-active --quiet grid-mind.service || die "grid-mind did not come back: $(systemctl status grid-mind --no-pager | tail -3)" 6
