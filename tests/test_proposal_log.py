@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from grid.proposal import Request
-from grid.proposal_log import ProposalLog, proposal_entry
+from grid.proposal_log import REPLY_CAP, ProposalLog, proposal_entry
 
 ISA = [{"name": n, "cost": 0.1, "effect": n} for n in ("nop", "harvest", "copy", "fork")]
 
@@ -28,6 +28,18 @@ def test_rejected_entry_has_no_proposal():
     e = proposal_entry(req=req(), proposal=None, outcome="rejected", reason="unknown opcodes: ['x']",
                        epoch=0, tick=0, colony="c", mind="m", model_alias="a", prompt="p", ts_ms=1)
     assert e["proposal"] is None and e["proposal_genome_id"] is None and "unknown" in e["reason"]
+    assert e["reply"] is None
+
+
+def test_reply_is_kept_and_capped():
+    """A rejected reply is the training negative; a runaway one is not a transcript."""
+    e = proposal_entry(req=req(), proposal=None, outcome="rejected", reason="r", epoch=1, tick=1,
+                       colony="c", mind="m", model_alias="a", prompt="p", ts_ms=1,
+                       reply='["teleport"]')
+    assert e["reply"] == '["teleport"]'
+    long = proposal_entry(req=req(), proposal=None, outcome="rejected", reason="r", epoch=1, tick=1,
+                          colony="c", mind="m", model_alias="a", prompt="p", ts_ms=1, reply="x" * 5000)
+    assert long["reply"] == "x" * REPLY_CAP
 
 
 def test_log_appends_lines_and_prompt_files(tmp_path):

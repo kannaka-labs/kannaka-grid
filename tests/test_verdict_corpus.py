@@ -7,6 +7,7 @@ from grid.verdicts import Ledger
 
 REQUIRED = {"id", "kind", "tier", "source", "speaker", "text"}       # export_corpus.py's contract
 HIST = "f" * 64                             # the settle-time snapshot hash carried by every row
+REJECTED_REPLY = 'I think ["teleport"] would work well here.'
 
 
 def seed(vdir: Path) -> None:
@@ -18,6 +19,7 @@ def seed(vdir: Path) -> None:
                      "prompt_path": f"prompts/{rid}.txt", "parent_genome": ["harvest"]}, f"prompt {rid}")
     plog.record({"ts": 1030, "request_id": "d", "epoch": 1, "tick": 11, "colony": "c", "proposal": None,
                  "proposal_genome_id": None, "outcome": "rejected", "model_alias": "m", "reason": "bad",
+                 "reply": REJECTED_REPLY,
                  "prompt_path": "prompts/d.txt", "parent_genome": ["harvest"]}, "prompt d")
     led = Ledger(vdir / "verdicts.jsonl")
     led.append({"request_id": "a", "proposal_genome_id": "g1", "epoch": 1, "settled_tick": 3100, "births": 40,
@@ -88,6 +90,28 @@ def test_preexisting_verdicts_are_neither_positive_nor_negative(tmp_path):
     ids |= {json.loads(l)["id"] for l in (out / "negatives.jsonl").read_text().splitlines()}
     assert "odin-p" not in ids
     assert manifest["skipped_preexisting"] == 1 and manifest["skipped_unknown"] == 0
+
+
+def test_negatives_carry_the_prompt_and_the_rejected_reply(tmp_path):
+    """A negative is only usable as a preference pair if it has the ask and the answer."""
+    vdir, out = tmp_path / "v", tmp_path / "out"
+    seed(vdir)
+    export(vdir, out, min_tier="reproduced")
+    negatives = {n["id"]: n for n in
+                 (json.loads(l) for l in (out / "negatives.jsonl").read_text().splitlines())}
+    assert negatives["odin-d"]["context"] == "prompt d"          # rejected
+    assert negatives["odin-d"]["text"] == REJECTED_REPLY
+    assert negatives["odin-c"]["context"] == "prompt c"          # unborn: the genome she proposed
+    assert negatives["odin-c"]["text"] == '["harvest", "fork"]'
+
+
+def test_a_negative_without_its_prompt_is_skipped(tmp_path):
+    vdir, out = tmp_path / "v", tmp_path / "out"
+    seed(vdir)
+    (vdir / "prompts" / "d.txt").unlink()
+    manifest = export(vdir, out, min_tier="reproduced")
+    ids = [json.loads(l)["id"] for l in (out / "negatives.jsonl").read_text().splitlines()]
+    assert ids == ["odin-c"] and manifest["skipped_missing_prompt"] == 1
 
 
 def test_export_growing_threshold_and_missing_prompt(tmp_path):

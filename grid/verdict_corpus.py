@@ -26,9 +26,13 @@ EXCLUDED_TIERS = ("preexisting", "unknown")
 
 
 def record_for(entry: dict, verdict: dict, prompt: str) -> dict:
+    # A rejection never produced a genome, so what she actually wrote is the reply.
+    # Anything else — a positive, or an unborn proposal — is the genome she proposed.
+    text = entry.get("reply") if verdict.get("tier") == "rejected" else None
     return {
         "id": f"odin-{entry['request_id']}", "kind": "odin", "tier": 1, "source": "grid-verdicts",
-        "speaker": "kannaka", "text": json.dumps(entry.get("proposal")), "context": prompt,
+        "speaker": "kannaka", "text": json.dumps(entry.get("proposal")) if text is None else text,
+        "context": prompt,
         "verdict": {"tier": verdict.get("tier"), "fitness": verdict.get("fitness")},
         "provenance": {"colony": entry.get("colony"), "epoch": entry.get("epoch"), "tick": entry.get("tick"),
                        "chain": verdict.get("chain"),
@@ -74,19 +78,21 @@ def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced") -
         if v["tier"] in EXCLUDED_TIERS:
             excluded[v["tier"]] += 1
             continue
-        if v["tier"] in NEGATIVE_TIERS:
-            negatives.append(record_for(e, v, ""))
-            _seen(v, e, snapshots, stamps)
-            continue
-        if TIER_RANK.get(v["tier"], -1) < threshold:
+        negative = v["tier"] in NEGATIVE_TIERS
+        if not negative and TIER_RANK.get(v["tier"], -1) < threshold:
             skipped_below_threshold += 1
             continue
         prompt_path = vdir / e.get("prompt_path", "")
         if not prompt_path.is_file():
+            # A negative without its prompt is not a preference pair, only a complaint.
             skipped += 1
             continue
-        records.append(record_for(e, v, prompt_path.read_text(encoding="utf-8")))
-        by_tier[v["tier"]] = by_tier.get(v["tier"], 0) + 1
+        record = record_for(e, v, prompt_path.read_text(encoding="utf-8"))
+        if negative:
+            negatives.append(record)
+        else:
+            records.append(record)
+            by_tier[v["tier"]] = by_tier.get(v["tier"], 0) + 1
         _seen(v, e, snapshots, stamps)
     chron = vdir / "chronicle.jsonl"
     if chron.exists():

@@ -15,10 +15,12 @@ from .proposal import Request, genome_id_of
 
 log = logging.getLogger("grid.proposal_log")
 
+REPLY_CAP = 2000        # a rejected reply is a training negative, not a transcript
+
 
 def proposal_entry(*, req: Request, proposal: list[str] | None, outcome: str, reason: str | None,
                    epoch: int, tick: int, colony: str, mind: str, model_alias: str,
-                   prompt: str, ts_ms: int) -> dict:
+                   prompt: str, ts_ms: int, reply: str | None = None) -> dict:
     isa = req.isa
     return {
         "ts": ts_ms, "colony": colony, "epoch": epoch, "tick": tick,
@@ -27,6 +29,9 @@ def proposal_entry(*, req: Request, proposal: list[str] | None, outcome: str, re
         "proposal": list(proposal) if proposal is not None else None,
         "proposal_genome_id": genome_id_of(proposal, isa) if proposal is not None else None,
         "outcome": outcome, "reason": reason,
+        # What she actually said. A rejected reply has no genome, so the reply IS the
+        # negative example; without it the corpus can only say that something failed.
+        "reply": reply[:REPLY_CAP] if reply is not None else None,
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
         "prompt_path": f"prompts/{req.request_id}.txt",
     }

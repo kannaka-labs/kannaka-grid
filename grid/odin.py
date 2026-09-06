@@ -61,12 +61,13 @@ class Relay:
             log.error("odin.%s publish failed: %s", kind, e)
 
     def _log(self, req, prompt: str, proposal: list[str] | None, outcome: str, reason: str | None,
-             epoch: int, tick: int) -> None:
+             epoch: int, tick: int, reply: str | None = None) -> None:
         if self.proposal_log is None:
             return
         entry = proposal_entry(req=req, proposal=proposal, outcome=outcome, reason=reason,
                                epoch=epoch, tick=tick, colony=self.colony, mind=self.agent_id,
-                               model_alias=self.model_alias, prompt=prompt, ts_ms=now_ms())
+                               model_alias=self.model_alias, prompt=prompt, ts_ms=now_ms(),
+                               reply=reply)
         self.proposal_log.record(entry, prompt)
 
     async def _epoch_tick(self) -> tuple[int, int]:
@@ -129,8 +130,10 @@ class Relay:
         if isinstance(result, Rejection):
             log.info("rejected %s: %s", req.request_id, result.reason)
             request_path.unlink(missing_ok=True)   # let thegrid file a fresh request
+            # Log before publishing: a dead bus raises BusClosed out of poll_once, and
+            # the training record must survive that. The reply is the negative example.
+            self._log(req, prompt, None, "rejected", result.reason, epoch, tick, reply=reply)
             await self._publish("rejected", epoch, tick, request_id=req.request_id, reason=result.reason)
-            self._log(req, prompt, None, "rejected", result.reason, epoch, tick)
             if self.throttle.allow("odin.rejected"):
                 # Spec 6: the mind learns what does not work, not only what does.
                 await asyncio.to_thread(
@@ -142,9 +145,10 @@ class Relay:
         if not write_proposal(self.queue, req, result):
             log.info("request %s vanished before the proposal landed", req.request_id)
             return None
+        # The proposal itself is the training text, so no reply is kept here.
+        self._log(req, prompt, result, "proposed", None, epoch, tick)
         await self._publish("proposed", epoch, tick, request_id=req.request_id,
                             genome_len=len(result), mind=self.agent_id)
-        self._log(req, prompt, result, "proposed", None, epoch, tick)
         return "proposed"
 
 

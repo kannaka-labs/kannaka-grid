@@ -165,3 +165,28 @@ history.sqlite3 (copy) ──▶ verdicts.py ──▶ verdicts.jsonl (hash-chai
 3. Keep the full prompt text per proposal (~4 KB × ~1200/day ≈ 5 MB/day) or only
    its hash plus the parent genome, regenerating the prompt at export? Recommendation:
    keep the text; disk is cheap and the render function may change.
+
+## Reconciliation (final review)
+
+What the implementation settled that the sections above do not say. These are
+corrections, not new scope; the sections stand as written except where noted.
+
+- §1, the entry JSON gains `"reply": null | "<raw reply, capped at 2000 chars>"`.
+  A rejected proposal has no genome, so the reply is the only record of what she
+  actually wrote; proposals carry `null`, because the proposal is the text.
+- §2, `genome_stats` is keyed by `(epoch, genome_id)`, so a proposal that
+  recreates a genome already alive would inherit every carrier's births. A row
+  whose `first_tick` predates the proposal's own tick settles `preexisting` with
+  `fitness` 0. A proposal logged with the relay's `0/0` epoch fallback settles
+  `unknown`: it leaves the pending set but is neither a win nor a loss. A
+  proposal consumed after the epoch rolled over is looked up in `epoch + 1` too,
+  within `NEXT_EPOCH_GRACE_TICKS` (1000); every row records `epoch_found`.
+- §3, negatives carry `context` (the prompt) and, for rejections, `text` = the
+  raw reply — a negative without its prompt is skipped, not exported. The
+  manifest reports `history_snapshots`, `since_ts`/`until_ts` and
+  `"cumulative": true` (an export is the whole ledger to date, not a window),
+  plus `skipped_preexisting`, `skipped_unknown` and `skipped_below_threshold`.
+- §Security, `history_sha256` is the hash of the **settle-time snapshot** the
+  verdict was actually scored against, stored inside the hash-chained verdict
+  row. Hashing the live DB at export time named a state the verdicts were never
+  read from.

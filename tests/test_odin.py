@@ -272,6 +272,32 @@ async def test_rejected_is_logged_without_a_proposal(tmp_path):
     assert await r.poll_once() == "rejected"
     [e] = plog.read_all()
     assert e["outcome"] == "rejected" and e["proposal"] is None and "teleport" in e["reason"]
+    assert e["reply"] == '["teleport"]'          # the raw reply IS the training negative
+
+
+async def test_a_rejection_is_logged_even_when_the_bus_is_dead(tmp_path):
+    """_log runs before _publish: BusClosed must not cost us the training record."""
+    from grid.proposal_log import ProposalLog
+    write_request(tmp_path)
+    plog = ProposalLog(tmp_path / "verdicts")
+    r = Relay(tmp_path, colony="c", agent_id="grid-c", mind=FakeMind(answer='["teleport"]'),
+              bus=ClosedBus(), clock=Clock(), proposal_log=plog)
+    with pytest.raises(BusClosed):
+        await r.poll_once()
+    [e] = plog.read_all()
+    assert e["outcome"] == "rejected" and e["reply"] == '["teleport"]'
+
+
+async def test_a_proposal_is_logged_even_when_the_bus_is_dead(tmp_path):
+    from grid.proposal_log import ProposalLog
+    write_request(tmp_path)
+    plog = ProposalLog(tmp_path / "verdicts")
+    r = Relay(tmp_path, colony="c", agent_id="grid-c", mind=FakeMind(answer='["harvest","fork"]'),
+              bus=ClosedBus(), clock=Clock(), proposal_log=plog)
+    with pytest.raises(BusClosed):
+        await r.poll_once()
+    [e] = plog.read_all()
+    assert e["outcome"] == "proposed" and e["proposal"] == ["harvest", "fork"] and e["reply"] is None
 
 
 async def test_relay_without_a_log_still_proposes(tmp_path):
