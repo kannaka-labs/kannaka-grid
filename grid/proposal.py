@@ -7,6 +7,7 @@ anything that is not a genome.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -30,6 +31,11 @@ class Request:
     @property
     def names(self) -> frozenset[str]:
         return frozenset(str(i["name"]) for i in self.instruction_set)
+
+    @property
+    def isa(self) -> list[str]:
+        """Instruction names in ISA order — the index of a name is thegrid's opcode."""
+        return [str(i["name"]) for i in self.instruction_set]
 
 
 @dataclass(frozen=True)
@@ -55,6 +61,19 @@ def parse_request(path: Path) -> Request:
         )
     except (KeyError, TypeError) as e:
         raise ValueError(f"request.json is not thegrid's shape: {e}") from e
+
+
+def genome_id_of(names: list[str], isa: list[str]) -> str:
+    """thegrid's genome id (history.genome_id) computed from opcode names.
+
+    thegrid hashes the raw opcode bytes; a name's index in the ISA list is its
+    opcode, so the relay can name a child before it is born.
+    """
+    try:
+        ops = bytes(isa.index(n) for n in names)
+    except ValueError as e:
+        raise ValueError(f"opcode name not in the ISA: {e}") from None
+    return hashlib.sha256(ops).hexdigest()[:16]
 
 
 SANDBOX_CONTEXT = (

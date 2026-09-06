@@ -113,3 +113,41 @@ def test_write_proposal_refuses_when_request_gone_or_replaced(tmp_path):
     write_request(tmp_path, request_id="other")
     assert write_proposal(tmp_path, r, ["harvest", "fork"]) is False
     assert not (tmp_path / "proposal.json").exists()
+
+
+def test_request_isa_is_the_instruction_names_in_order():
+    assert req().isa == ["nop", "harvest", "scan", "move", "alloc", "copy", "ifnotdone", "jmpb", "fork"]
+
+
+def test_genome_id_of_matches_thegrid_algorithm():
+    import hashlib
+    from grid.proposal import genome_id_of
+    isa = ["nop", "harvest", "scan", "move", "alloc", "copy", "ifnotdone", "jmpb", "fork"]
+    names = ["harvest", "alloc", "copy", "ifnotdone", "jmpb", "fork"]
+    expected = hashlib.sha256(bytes([1, 4, 5, 6, 7, 8])).hexdigest()[:16]
+    assert genome_id_of(names, isa) == expected
+    assert len(genome_id_of(names, isa)) == 16
+
+
+def test_genome_id_of_agrees_with_thegrid_when_importable():
+    import sys
+    from pathlib import Path
+    from grid.proposal import genome_id_of
+    thegrid = Path(__file__).resolve().parents[1] / "thegrid"
+    if not (thegrid / "src" / "colony" / "history.py").exists():
+        pytest.skip("thegrid submodule not checked out")
+    sys.path.insert(0, str(thegrid))
+    try:
+        from src.colony.history import genome_id  # type: ignore
+    except Exception as e:  # noqa: BLE001 - thegrid may need Linux-only modules
+        pytest.skip(f"thegrid not importable here: {e}")
+    finally:
+        sys.path.remove(str(thegrid))
+    isa = ["nop", "harvest", "scan", "move", "alloc", "copy"]
+    assert genome_id_of(["harvest", "copy", "nop"], isa) == genome_id([1, 5, 0])
+
+
+def test_genome_id_of_rejects_unknown_name():
+    from grid.proposal import genome_id_of
+    with pytest.raises(ValueError):
+        genome_id_of(["harvest", "teleport"], ["nop", "harvest"])
