@@ -63,7 +63,7 @@ class Clock:
 def cfg() -> BridgeConfig:
     return BridgeConfig(colony_url="http://127.0.0.1:8787", nats_url="nats://x", nats_user=None,
                         nats_password=None, flux_url=None, mind_agent_id=None, mind_data_dir=None,
-                        kannaka_bin="kannaka", state_every_s=60, history_every_s=60)
+                        kannaka_bin="kannaka", state_every_s=60, history_every_s=60, verdicts_dir=None)
 
 
 def test_iter_sse_data_yields_data_frames_only():
@@ -312,13 +312,14 @@ async def test_schedule_chronicle_spawns_at_most_one_task():
 
 def test_config_from_env_defaults(monkeypatch):
     for k in ("COLONY_URL", "NATS_URL", "NATS_USER", "NATS_PASSWORD", "FLUX_URL", "MIND_AGENT_ID",
-              "MIND_DATA_DIR", "KANNAKA_BIN", "STATE_EVERY_S", "HISTORY_EVERY_S"):
+              "MIND_DATA_DIR", "KANNAKA_BIN", "STATE_EVERY_S", "HISTORY_EVERY_S", "VERDICTS_DIR"):
         monkeypatch.delenv(k, raising=False)
     c = BridgeConfig.from_env()
     assert c.colony_url == "http://127.0.0.1:8787"
     assert c.nats_url == "nats://swarm.ninja-portal.com:4222"
     assert c.flux_url is None and c.mind_agent_id is None
     assert c.state_every_s == 60 and c.history_every_s == 60
+    assert c.verdicts_dir is None
 
 
 async def test_reconnect_backoff_resets_after_a_stream_that_delivered_frames(monkeypatch):
@@ -421,3 +422,31 @@ async def test_chronicle_questions_carry_facts_and_remember_the_phase_line():
     phase_lines = [t for t, tags in mind.remembered if tags == ["colony-one", "phase"]]
     assert len(phase_lines) == 1 and "dominant genome (3 opcodes): nop harvest fork" in phase_lines[0]
     assert mind.remembered.index((phase_lines[0], ["colony-one", "phase"])) >= 0
+
+
+async def test_published_chronicle_lines_are_logged(tmp_path):
+    import json as _json
+    bus = FakeBus()
+    mind = FakeMind(answers={"What is this epoch about": "A slow squeeze.",
+                             "Name the capability": "fork early via fork.",
+                             "single most important": "Sweep at tick 1900."})
+    bridge = Bridge(cfg(), bus=bus, mind=mind, chronicle_log=tmp_path / "chronicle.jsonl")
+    await bridge.handle_state(state(tick=CHRONICLE_EVERY_TICKS))
+    out = await bridge.maybe_chronicle()
+    assert set(out) == {"topic", "skill", "event"}
+    rows = [_json.loads(l) for l in (tmp_path / "chronicle.jsonl").read_text().splitlines()]
+    assert [r["kind"] for r in rows] == ["topic", "skill", "event"]
+    assert rows[1]["text"] == "fork early via fork." and "Name the capability" in rows[1]["question"]
+    assert rows[0]["epoch"] == 1 and rows[0]["tick"] == CHRONICLE_EVERY_TICKS and rows[0]["colony"] == "colony-one"
+
+
+async def test_chronicle_log_failure_does_not_block_publishing(tmp_path):
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    bus = FakeBus()
+    mind = FakeMind(answers={"What is this epoch about": "Fine."})
+    bridge = Bridge(cfg(), bus=bus, mind=mind, chronicle_log=blocker / "chronicle.jsonl")
+    await bridge.handle_state(state(tick=CHRONICLE_EVERY_TICKS))
+    out = await bridge.maybe_chronicle()
+    assert out["topic"] == "Fine."
+    assert [s for s, _ in bus.published if s.endswith(".chronicle.topic")]

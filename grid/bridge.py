@@ -19,7 +19,7 @@ import httpx
 
 from . import chronicle as chron
 from .distill import Distiller, Event, Snapshot
-from .envelope import envelope, slug, subject
+from .envelope import envelope, now_ms, slug, subject
 from .flux import Flux
 from .mind import REMEMBER_MIN_INTERVAL_S, Mind, MindError, Throttle
 from .natsio import Bus, BusClosed, BusError
@@ -121,6 +121,7 @@ class BridgeConfig:
     kannaka_bin: str
     state_every_s: float
     history_every_s: float
+    verdicts_dir: str | None
 
     @classmethod
     def from_env(cls) -> "BridgeConfig":
@@ -136,18 +137,21 @@ class BridgeConfig:
             kannaka_bin=env("KANNAKA_BIN", "kannaka"),
             state_every_s=float(env("STATE_EVERY_S", "60")),
             history_every_s=float(env("HISTORY_EVERY_S", "60")),
+            verdicts_dir=env("VERDICTS_DIR") or None,
         )
 
 
 class Bridge:
     def __init__(self, cfg: BridgeConfig, *, bus, mind, flux=None, distiller: Distiller | None = None,
                  throttle: Throttle | None = None, clock=time.monotonic,
-                 history_fetch: Callable[[], Awaitable[dict]] | None = None):
+                 history_fetch: Callable[[], Awaitable[dict]] | None = None,
+                 chronicle_log: Path | None = None):
         self.cfg = cfg
         self.bus = bus
         self.mind = mind
         self.flux = flux
         self.history_fetch = history_fetch
+        self.chronicle_log = chronicle_log
         self.distiller = distiller or Distiller()
         self.throttle = throttle or Throttle(REMEMBER_MIN_INTERVAL_S, clock=clock)
         self.colony: str | None = None
@@ -286,11 +290,24 @@ class Bridge:
             try:
                 await self.bus.publish(subject(self.colony, "chronicle", kind),
                                        self._env(snap.epoch, snap.tick, text=answer, since_tick=since))
+                self._log_chronicle(kind, q, answer, snap, since)
             except BusClosed:
                 raise
             except BusError as e:
                 log.error("chronicle %s publish failed: %s", kind, e)
         return out
+
+    def _log_chronicle(self, kind: str, question: str, text: str, snap: Snapshot, since: int) -> None:
+        if self.chronicle_log is None:
+            return
+        row = {"ts": now_ms(), "colony": self.colony, "epoch": snap.epoch, "tick": snap.tick,
+               "kind": kind, "question": question, "text": text, "since_tick": since}
+        try:
+            self.chronicle_log.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.chronicle_log, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n")
+        except Exception as e:      # the line is already published; only the log is lost
+            log.warning("chronicle log write failed: %s", e)
 
     def schedule_chronicle(self) -> None:
         """Run the chronicle off the stream path; at most one in flight."""
@@ -362,7 +379,8 @@ async def run(cfg: BridgeConfig) -> None:
     flux = Flux(cfg.flux_url) if cfg.flux_url else None
     if flux is None:
         log.info("FLUX_URL unset; Flux publishing skipped")
-    bridge = Bridge(cfg, bus=bus, mind=mind, flux=flux)
+    chronicle_log = Path(cfg.verdicts_dir) / "chronicle.jsonl" if cfg.verdicts_dir else None
+    bridge = Bridge(cfg, bus=bus, mind=mind, flux=flux, chronicle_log=chronicle_log)
     backoff = 1.0
     while True:
         frames = bridge.frames_handled
