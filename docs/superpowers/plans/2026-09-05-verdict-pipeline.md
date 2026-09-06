@@ -140,7 +140,7 @@ git commit -m "feat: genome_id_of — thegrid's genome hash from opcode names"
 - Test: `tests/test_proposal_log.py`
 
 **Interfaces:**
-- Produces: `proposal_entry(*, req: Request, proposal: list[str] | None, outcome: str, reason: str | None, epoch: int, tick: int, colony: str, mind: str, model_alias: str, prompt: str, ts_ms: int) -> dict` (pure; computes both genome ids; `prompt_sha256`; `prompt_path = f"prompts/{request_id}.txt"`); `class ProposalLog(dir: Path)` with `record(entry: dict, prompt: str) -> bool` (writes the prompt file then appends the entry line with fsync; returns False and logs on any failure, never raises) and `read_all() -> list[dict]`.
+- Produces: `proposal_entry(*, req: Request, proposal: list[str] | None, outcome: str, reason: str | None, epoch: int, tick: int, colony: str, mind: str, model_alias: str, prompt: str, ts_ms: int, reply: str | None = None) -> dict` (pure; computes both genome ids; `prompt_sha256`; `prompt_path = f"prompts/{request_id}.txt"`; stores `reply` truncated to `REPLY_CAP` = 2000 chars — the raw model reply is the training negative for a rejection); `class ProposalLog(dir: Path)` with `record(entry: dict, prompt: str) -> bool` (writes the prompt file then appends the entry line with fsync; returns False and logs on any failure, never raises) and `read_all() -> list[dict]`.
 - Consumes: `Request`, `genome_id_of` (Task 1); `now_ms` (envelope).
 
 - [ ] **Step 1: Write the failing tests**
@@ -151,7 +151,7 @@ import json
 from pathlib import Path
 
 from grid.proposal import Request
-from grid.proposal_log import ProposalLog, proposal_entry
+from grid.proposal_log import REPLY_CAP, ProposalLog, proposal_entry
 
 ISA = [{"name": n, "cost": 0.1, "effect": n} for n in ("nop", "harvest", "copy", "fork")]
 
@@ -177,6 +177,18 @@ def test_rejected_entry_has_no_proposal():
     e = proposal_entry(req=req(), proposal=None, outcome="rejected", reason="unknown opcodes: ['x']",
                        epoch=0, tick=0, colony="c", mind="m", model_alias="a", prompt="p", ts_ms=1)
     assert e["proposal"] is None and e["proposal_genome_id"] is None and "unknown" in e["reason"]
+    assert e["reply"] is None
+
+
+def test_reply_is_kept_and_capped():
+    """A rejected reply is the training negative; a runaway one is not a transcript."""
+    e = proposal_entry(req=req(), proposal=None, outcome="rejected", reason="r", epoch=1, tick=1,
+                       colony="c", mind="m", model_alias="a", prompt="p", ts_ms=1,
+                       reply='["teleport"]')
+    assert e["reply"] == '["teleport"]'
+    long = proposal_entry(req=req(), proposal=None, outcome="rejected", reason="r", epoch=1, tick=1,
+                          colony="c", mind="m", model_alias="a", prompt="p", ts_ms=1, reply="x" * 5000)
+    assert long["reply"] == "x" * REPLY_CAP
 
 
 def test_log_appends_lines_and_prompt_files(tmp_path):
@@ -200,6 +212,16 @@ def test_log_never_raises_when_the_directory_is_unwritable(tmp_path):
                        colony="c", mind="m", model_alias="a", prompt="p", ts_ms=1)
     assert log.record(e, "p") is False
     assert log.read_all() == []
+
+
+def test_read_all_stops_at_a_partial_trailing_line(tmp_path):
+    log = ProposalLog(tmp_path)
+    e = proposal_entry(req=req("a"), proposal=["fork"], outcome="proposed", reason=None, epoch=1, tick=1,
+                       colony="c", mind="m", model_alias="a", prompt="p", ts_ms=1)
+    assert log.record(e, "p") is True
+    with open(tmp_path / "proposals.jsonl", "a", encoding="utf-8") as f:
+        f.write('{"request_id": "b", "truncated')          # crash mid-write
+    assert [x["request_id"] for x in log.read_all()] == ["a"]
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -228,10 +250,12 @@ from .proposal import Request, genome_id_of
 
 log = logging.getLogger("grid.proposal_log")
 
+REPLY_CAP = 2000        # a rejected reply is a training negative, not a transcript
+
 
 def proposal_entry(*, req: Request, proposal: list[str] | None, outcome: str, reason: str | None,
                    epoch: int, tick: int, colony: str, mind: str, model_alias: str,
-                   prompt: str, ts_ms: int) -> dict:
+                   prompt: str, ts_ms: int, reply: str | None = None) -> dict:
     isa = req.isa
     return {
         "ts": ts_ms, "colony": colony, "epoch": epoch, "tick": tick,
@@ -240,6 +264,9 @@ def proposal_entry(*, req: Request, proposal: list[str] | None, outcome: str, re
         "proposal": list(proposal) if proposal is not None else None,
         "proposal_genome_id": genome_id_of(proposal, isa) if proposal is not None else None,
         "outcome": outcome, "reason": reason,
+        # What she actually said. A rejected reply has no genome, so the reply IS the
+        # negative example; without it the corpus can only say that something failed.
+        "reply": reply[:REPLY_CAP] if reply is not None else None,
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
         "prompt_path": f"prompts/{req.request_id}.txt",
     }
@@ -253,7 +280,10 @@ class ProposalLog:
     def record(self, entry: dict, prompt: str) -> bool:
         try:
             (self.dir / "prompts").mkdir(parents=True, exist_ok=True)
-            (self.dir / entry["prompt_path"]).write_text(prompt, encoding="utf-8")
+            with open(self.dir / entry["prompt_path"], "w", encoding="utf-8") as p:
+                p.write(prompt)
+                p.flush()
+                os.fsync(p.fileno())
             with open(self.path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, separators=(",", ":"), sort_keys=True) + "\n")
                 f.flush()
@@ -264,16 +294,25 @@ class ProposalLog:
             return False
 
     def read_all(self) -> list[dict]:
+        out: list[dict] = []
         try:
             with open(self.path, encoding="utf-8") as f:
-                return [json.loads(line) for line in f if line.strip()]
+                for n, line in enumerate(f, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        out.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        log.warning("proposal log: stopping at unreadable line %d (partial write?)", n)
+                        break
         except OSError:
             return []
+        return out
 ```
 
 - [ ] **Step 4: Run to verify they pass**
 
-Run: `python -m pytest tests/test_proposal_log.py -q` → `4 passed`.
+Run: `python -m pytest tests/test_proposal_log.py -q` → `6 passed`.
 
 - [ ] **Step 5: Mutation, then commit**
 
@@ -294,7 +333,7 @@ git commit -m "feat: proposal log — every Odin proposal with its prompt, never
 
 **Interfaces:**
 - Consumes: `ProposalLog`, `proposal_entry` (Task 2); `now_ms` (envelope).
-- Produces: `Relay.__init__(..., proposal_log: ProposalLog | None = None, model_alias: str = "")`; `RelayConfig.verdicts_dir: str` (env `VERDICTS_DIR`, default `/srv/grid/<colony>/verdicts`), `RelayConfig.model_alias: str` (env `MIND_MODEL_ALIAS`, default `"agent-brain"`); `run()` wires a `ProposalLog(cfg.verdicts_dir)`.
+- Produces: `Relay.__init__(..., proposal_log: ProposalLog | None = None, model_alias: str = "")`; `Relay._log(..., reply: str | None = None)`; `RelayConfig.verdicts_dir: str` (env `VERDICTS_DIR`, default `/srv/grid/<colony>/verdicts`), `RelayConfig.model_alias: str` (env `MIND_MODEL_ALIAS`, default `"agent-brain"`); `run()` wires a `ProposalLog(cfg.verdicts_dir)`.
 
 - [ ] **Step 1: Write the failing tests** (append to `tests/test_odin.py`)
 
@@ -322,6 +361,32 @@ async def test_rejected_is_logged_without_a_proposal(tmp_path):
     assert await r.poll_once() == "rejected"
     [e] = plog.read_all()
     assert e["outcome"] == "rejected" and e["proposal"] is None and "teleport" in e["reason"]
+    assert e["reply"] == '["teleport"]'          # the raw reply IS the training negative
+
+
+async def test_a_rejection_is_logged_even_when_the_bus_is_dead(tmp_path):
+    """_log runs before _publish: BusClosed must not cost us the training record."""
+    from grid.proposal_log import ProposalLog
+    write_request(tmp_path)
+    plog = ProposalLog(tmp_path / "verdicts")
+    r = Relay(tmp_path, colony="c", agent_id="grid-c", mind=FakeMind(answer='["teleport"]'),
+              bus=ClosedBus(), clock=Clock(), proposal_log=plog)
+    with pytest.raises(BusClosed):
+        await r.poll_once()
+    [e] = plog.read_all()
+    assert e["outcome"] == "rejected" and e["reply"] == '["teleport"]'
+
+
+async def test_a_proposal_is_logged_even_when_the_bus_is_dead(tmp_path):
+    from grid.proposal_log import ProposalLog
+    write_request(tmp_path)
+    plog = ProposalLog(tmp_path / "verdicts")
+    r = Relay(tmp_path, colony="c", agent_id="grid-c", mind=FakeMind(answer='["harvest","fork"]'),
+              bus=ClosedBus(), clock=Clock(), proposal_log=plog)
+    with pytest.raises(BusClosed):
+        await r.poll_once()
+    [e] = plog.read_all()
+    assert e["outcome"] == "proposed" and e["proposal"] == ["harvest", "fork"] and e["reply"] is None
 
 
 async def test_relay_without_a_log_still_proposes(tmp_path):
@@ -356,16 +421,17 @@ In `grid/odin.py`:
 
 ```python
     def _log(self, req, prompt: str, proposal: list[str] | None, outcome: str, reason: str | None,
-             epoch: int, tick: int) -> None:
+             epoch: int, tick: int, reply: str | None = None) -> None:
         if self.proposal_log is None:
             return
         entry = proposal_entry(req=req, proposal=proposal, outcome=outcome, reason=reason,
                                epoch=epoch, tick=tick, colony=self.colony, mind=self.agent_id,
-                               model_alias=self.model_alias, prompt=prompt, ts_ms=now_ms())
+                               model_alias=self.model_alias, prompt=prompt, ts_ms=now_ms(),
+                               reply=reply)
         self.proposal_log.record(entry, prompt)
 ```
 
-- In `poll_once`: after `await self._publish("rejected", ...)` in the rejection branch add `self._log(req, prompt, None, "rejected", result.reason, epoch, tick)`; after the `proposed` publish add `self._log(req, prompt, result, "proposed", None, epoch, tick)`.
+- In `poll_once`: **before** `await self._publish("rejected", ...)` in the rejection branch add `self._log(req, prompt, None, "rejected", result.reason, epoch, tick, reply=reply)`; before the `proposed` publish add `self._log(req, prompt, result, "proposed", None, epoch, tick)`. Log first: a dead bus raises `BusClosed` out of `poll_once`, and the training record must survive that.
 - `RelayConfig`: fields `verdicts_dir: str`, `model_alias: str`; in `from_env`: `verdicts_dir=env("VERDICTS_DIR", f"/srv/grid/{colony}/verdicts")`, `model_alias=env("MIND_MODEL_ALIAS", "agent-brain")`.
 - `run()`: `relay = Relay(..., state_fetch=fetch_state, proposal_log=ProposalLog(Path(cfg.verdicts_dir)), model_alias=cfg.model_alias)`.
 - `deploy/grid.env.example`: add after `ODIN_POLL_S=1`:
@@ -377,7 +443,7 @@ MIND_MODEL_ALIAS=agent-brain
 
 - [ ] **Step 4: Run to verify they pass**
 
-Run: `python -m pytest tests/test_odin.py -q` → all pass (13 existing + 4).
+Run: `python -m pytest tests/test_odin.py -q` → all pass (13 existing + 6).
 
 - [ ] **Step 5: Mutation, then commit**
 
@@ -479,14 +545,14 @@ git commit -m "feat: bridge logs every published chronicle line for the verdict 
 
 **Interfaces:**
 - Produces:
-  - `SETTLE_TICKS = 3000`; `TIERS = ("established", "enduring", "growing", "reproduced", "new")`.
+  - `SETTLE_TICKS = 3000`; `TIERS = ("established", "enduring", "growing", "reproduced", "new")`; `NEXT_EPOCH_GRACE_TICKS = 1000`.
   - `tier_of(births: int, generations: int) -> str`.
   - `is_settled(entry_epoch: int, entry_tick: int, *, now_epoch: int, now_tick: int, settle_ticks: int = SETTLE_TICKS) -> bool` — True if `now_epoch > entry_epoch` or `now_tick - entry_tick >= settle_ticks`.
   - `canonical(row: dict) -> str`; `chain_hash(prev: str, row: dict) -> str` (row without `chain`).
-  - `verdict_row(entry: dict, stats: dict | None, *, settled_tick: int) -> dict` with keys `request_id, proposal_genome_id, epoch, settled_tick, births, generations, lifetime_ticks, tier, fitness, model_alias, outcome`; rejected entries → tier `rejected`, births 0; no stats → `unborn`.
-  - `class Ledger(path: Path)` with `rows() -> list[dict]`, `head() -> str` (genesis `"0"*64`), `append(row: dict) -> dict` (adds `chain`, fsyncs), `verify() -> bool`, `settled_ids() -> set[str]`.
-  - `class StatsReader(db_path: Path)` context manager: copies the DB to a temp file, opens read-only; `stats(epoch: int, genome_id: str) -> dict | None` returning `{births, first_generation, max_generation, first_tick, last_tick}`.
-  - `settle_pending(entries: list[dict], ledger: Ledger, reader: StatsReader, *, now_epoch: int, now_tick: int, settle_ticks: int = SETTLE_TICKS) -> list[dict]` — appends and returns the new rows.
+  - `verdict_row(entry: dict, stats: dict | None, *, settled_tick: int, epoch_found: int | None = None, history_sha256: str = "") -> dict` with keys `request_id, proposal_genome_id, epoch, epoch_found, settled_tick, births, generations, lifetime_ticks, tier, fitness, model_alias, outcome, history_sha256`; rejected entries → tier `rejected`, births 0; entries logged at the relay's `0/0` fallback → `unknown`; no stats → `unborn`; stats whose `first_tick` predates the entry's own tick (same epoch) → `preexisting` with `fitness` 0.
+  - `class Ledger(path: Path)` with `rows() -> list[dict]` (stops at the first unreadable line and remembers its byte offset), `head() -> str` (genesis `"0"*64`, cached), `append(row: dict) -> dict` (truncates a partial tail, adds `chain`, fsyncs, updates the cache), `lock()` (flock on Linux, no-op elsewhere), `verify() -> bool`, `settled_ids() -> set[str]`.
+  - `class StatsReader(db_path: Path, tmp_dir: Path | None = None)` context manager: snapshots the DB through the backup API into `tmp_dir`, opens read-only; `stats(epoch: int, genome_id: str) -> dict | None` returning `{births, first_generation, max_generation, first_tick, last_tick}`; `snapshot_sha256() -> str` (hash of that snapshot, computed once).
+  - `settle_pending(entries: list[dict], ledger: Ledger, reader: StatsReader, *, now_epoch: int, now_tick: int, settle_ticks: int = SETTLE_TICKS) -> list[dict]` — appends and returns the new rows, each stamped with the snapshot hash; falls back to `epoch + 1` (within `NEXT_EPOCH_GRACE_TICKS`) once the colony has moved on.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -499,8 +565,8 @@ from pathlib import Path
 
 import pytest
 
-from grid.verdicts import (SETTLE_TICKS, Ledger, StatsReader, chain_hash, is_settled, settle_pending,
-                           tier_of, verdict_row)
+from grid.verdicts import (SETTLE_TICKS, Ledger, StatsReader, canonical, chain_hash, is_settled,
+                           settle_pending, tier_of, verdict_row)
 
 
 def make_db(path: Path, rows: list[tuple]) -> Path:
@@ -538,13 +604,28 @@ def test_settle_rule():
 
 
 def test_verdict_row_shapes():
-    r = verdict_row(entry(), {"births": 40, "first_generation": 3, "max_generation": 10, "first_tick": 120, "last_tick": 3020},
+    r = verdict_row(entry(), {"births": 40, "first_generation": 3, "max_generation": 13, "first_tick": 120, "last_tick": 3020},
                     settled_tick=3200)
-    assert r["tier"] == "growing" and r["fitness"] == 40 and r["generations"] == 7 and r["lifetime_ticks"] == 2900
+    assert r["tier"] == "growing" and r["fitness"] == 40 and r["generations"] == 10 and r["lifetime_ticks"] == 2900
     assert r["request_id"] == "r1" and r["proposal_genome_id"] == "g1" and r["settled_tick"] == 3200
     assert verdict_row(entry(), None, settled_tick=3200)["tier"] == "unborn"
     rej = verdict_row(entry(outcome="rejected"), None, settled_tick=3200)
     assert rej["tier"] == "rejected" and rej["births"] == 0 and rej["fitness"] == 0
+
+
+def test_preexisting_genome_is_not_credited():
+    """genome_stats is keyed by (epoch, genome_id): a genome already alive carries every carrier's births."""
+    r = verdict_row(entry(tick=100), {"births": 90, "first_generation": 2, "max_generation": 40,
+                                      "first_tick": 50, "last_tick": 3000}, settled_tick=3200)
+    assert r["tier"] == "preexisting" and r["fitness"] == 0
+    assert r["births"] == 90 and r["generations"] == 38 and r["lifetime_ticks"] == 2950
+
+
+def test_child_born_on_or_after_the_proposal_is_credited():
+    """thegrid never lowers first_tick, so first_tick == our tick is our own child."""
+    r = verdict_row(entry(tick=100), {"births": 40, "first_generation": 3, "max_generation": 13,
+                                      "first_tick": 100, "last_tick": 3020}, settled_tick=3200)
+    assert r["tier"] == "growing" and r["fitness"] == 40
 
 
 def test_chain_is_deterministic_and_verifies(tmp_path):
@@ -561,10 +642,40 @@ def test_chain_is_deterministic_and_verifies(tmp_path):
     assert Ledger(tmp_path / "verdicts.jsonl").verify() is False
 
 
+def test_ledger_truncates_a_partial_tail_before_appending(tmp_path):
+    """A row is fsynced, so a half-line is a torn write, never a verdict."""
+    path = tmp_path / "verdicts.jsonl"
+    Ledger(path).append({"request_id": "a", "tier": "new"})
+    with open(path, "a", encoding="utf-8") as f:
+        f.write('{"request_id": "torn", "tier": "gro')       # the machine lost power here
+    led = Ledger(path)
+    led.append({"request_id": "b", "tier": "growing"})
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2 and [json.loads(l)["request_id"] for l in lines] == ["a", "b"]
+    assert Ledger(path).verify() is True
+
+
+def test_ledger_head_is_cached(tmp_path):
+    led = Ledger(tmp_path / "verdicts.jsonl")
+    reads = []
+    real = led.rows
+
+    def counted():
+        reads.append(1)
+        return real()
+
+    led.rows = counted
+    led.append({"request_id": "a", "tier": "new"})
+    led.append({"request_id": "b", "tier": "growing"})
+    assert len(reads) == 1                                   # the second append reused the head
+    assert led.settled_ids() == {"a", "b"} and len(reads) == 1
+    assert Ledger(tmp_path / "verdicts.jsonl").verify() is True
+
+
 def test_stats_reader_reads_a_copy(tmp_path):
-    db = make_db(tmp_path / "history.sqlite3", [(1, "g1", 40, 0, 0, 3, 10, 120, 3020)])
+    db = make_db(tmp_path / "history.sqlite3", [(1, "g1", 40, 0, 0, 3, 13, 120, 3020)])
     with StatsReader(db) as reader:
-        assert reader.stats(1, "g1") == {"births": 40, "first_generation": 3, "max_generation": 10,
+        assert reader.stats(1, "g1") == {"births": 40, "first_generation": 3, "max_generation": 13,
                                          "first_tick": 120, "last_tick": 3020}
         assert reader.stats(1, "missing") is None
         assert reader.stats(2, "g1") is None
@@ -592,19 +703,100 @@ def test_stats_reader_sees_rows_still_in_the_wal(tmp_path):
     db.close()
 
 
+def test_stats_reader_snapshot_hash_sees_wal_rows(tmp_path):
+    """The hash names the snapshot the verdicts were scored against, WAL rows included."""
+    path = tmp_path / "history.sqlite3"
+    db = sqlite3.connect(path)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("CREATE TABLE t (x INTEGER)")
+    db.commit()
+    with StatsReader(path) as reader:
+        before = reader.snapshot_sha256()
+        assert reader.snapshot_sha256() is before                  # computed once, cached
+    db.execute("PRAGMA wal_autocheckpoint=0")
+    db.execute("INSERT INTO t VALUES (1)")
+    db.commit()                                                    # the row lives only in the WAL
+    with StatsReader(path) as reader:
+        after = reader.snapshot_sha256()
+    db.close()
+    assert len(before) == 64 and before != after
+
+
+def test_verdict_row_carries_the_settle_time_snapshot_hash():
+    r = verdict_row(entry(), None, settled_tick=3200, history_sha256="beef" * 16)
+    assert r["history_sha256"] == "beef" * 16
+    assert "history_sha256" in canonical(r)                        # inside the chain, not beside it
+
+
+def test_stats_reader_writes_its_copy_into_the_given_dir(tmp_path):
+    db = make_db(tmp_path / "history.sqlite3", [])
+    with StatsReader(db, tmp_dir=tmp_path / "verdicts") as reader:
+        assert Path(reader.copy_path).parent == tmp_path / "verdicts"
+    assert not Path(reader.copy_path).exists()
+
+
+def test_stats_reader_leaves_no_temp_file_when_the_db_is_missing(tmp_path):
+    reader = StatsReader(tmp_path / "absent.sqlite3")
+    with pytest.raises(sqlite3.OperationalError):
+        with reader:
+            pass
+    assert reader.copy_path is not None and not Path(reader.copy_path).exists()
+
+
 def test_settle_pending_appends_only_due_and_unsettled(tmp_path):
-    db = make_db(tmp_path / "history.sqlite3", [(1, "g1", 40, 0, 0, 3, 10, 120, 3020)])
+    db = make_db(tmp_path / "history.sqlite3", [(1, "g1", 40, 0, 0, 3, 13, 120, 3020)])
     led = Ledger(tmp_path / "verdicts.jsonl")
     entries = [entry("r1", tick=100, gid="g1"), entry("r2", tick=200, gid="g2"),
                entry("r3", tick=4000, gid="g3"), entry("r4", tick=100, outcome="rejected")]
     with StatsReader(db) as reader:
         rows = settle_pending(entries, led, reader, now_epoch=1, now_tick=3300)
+        snapshot = reader.snapshot_sha256()
     assert [r["request_id"] for r in rows] == ["r1", "r2", "r4"]         # r3 not due yet
     assert [r["tier"] for r in rows] == ["growing", "unborn", "rejected"]
+    assert {r["history_sha256"] for r in rows} == {snapshot}             # the state each was scored against
     with StatsReader(db) as reader:
         again = settle_pending(entries, led, reader, now_epoch=1, now_tick=3300)
     assert again == []                                                     # idempotent
     assert led.verify() is True and len(led.rows()) == 3
+
+
+def test_unknown_epoch_settles_as_unknown_not_unborn(tmp_path):
+    """0/0 is the relay's fallback when /api/state was down, not epoch 0 tick 0."""
+    db = make_db(tmp_path / "history.sqlite3", [(0, "g1", 40, 0, 0, 3, 13, 0, 3020)])
+    led = Ledger(tmp_path / "verdicts.jsonl")
+    with StatsReader(db) as reader:
+        rows = settle_pending([entry("r0", epoch=0, tick=0, gid="g1")], led, reader,
+                              now_epoch=1, now_tick=50)
+    assert [r["tier"] for r in rows] == ["unknown"]        # the (0, g1) row is not evidence
+    assert rows[0]["births"] == 0 and rows[0]["fitness"] == 0 and rows[0]["epoch_found"] is None
+    assert led.settled_ids() == {"r0"}                     # settled: it leaves the pending set
+
+
+def test_proposal_consumed_in_the_next_epoch_is_found(tmp_path):
+    db = make_db(tmp_path / "history.sqlite3", [(2, "g1", 40, 0, 0, 3, 13, 40, 900)])
+    led = Ledger(tmp_path / "verdicts.jsonl")
+    with StatsReader(db) as reader:
+        rows = settle_pending([entry("r1", epoch=1, tick=900, gid="g1")], led, reader,
+                              now_epoch=2, now_tick=100)
+    assert rows[0]["tier"] == "growing" and rows[0]["fitness"] == 40 and rows[0]["epoch_found"] == 2
+
+
+def test_next_epoch_row_past_the_grace_window_is_not_credited(tmp_path):
+    db = make_db(tmp_path / "history.sqlite3", [(2, "g1", 40, 0, 0, 3, 13, 5000, 9000)])
+    led = Ledger(tmp_path / "verdicts.jsonl")
+    with StatsReader(db) as reader:
+        rows = settle_pending([entry("r1", epoch=1, tick=900, gid="g1")], led, reader,
+                              now_epoch=2, now_tick=100)
+    assert rows[0]["tier"] == "unborn" and rows[0]["epoch_found"] is None
+
+
+def test_old_epoch_row_is_found_when_now_epoch_is_later(tmp_path):
+    db = make_db(tmp_path / "history.sqlite3", [(1, "g1", 40, 0, 0, 3, 13, 950, 3020)])
+    led = Ledger(tmp_path / "verdicts.jsonl")
+    with StatsReader(db) as reader:
+        rows = settle_pending([entry("r1", epoch=1, tick=900, gid="g1")], led, reader,
+                              now_epoch=2, now_tick=100)
+    assert rows[0]["tier"] == "growing" and rows[0]["epoch_found"] == 1
 ```
 
 - [ ] **Step 2: Run to verify they fail** → `ModuleNotFoundError: No module named 'grid.verdicts'`.
@@ -623,6 +815,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -637,6 +830,10 @@ log = logging.getLogger("grid.verdicts")
 SETTLE_TICKS = 3000
 TIERS = ("established", "enduring", "growing", "reproduced", "new")
 GENESIS = "0" * 64
+# A proposal written near the end of an epoch is often consumed by the first births
+# of the next one. Only the very start of that epoch can be our child; later rows
+# are somebody else's strain that happens to share the id.
+NEXT_EPOCH_GRACE_TICKS = 1000
 
 
 def tier_of(births: int, generations: int) -> str:
@@ -664,45 +861,123 @@ def chain_hash(prev: str, row: dict) -> str:
     return hashlib.sha256((prev + canonical(row)).encode()).hexdigest()
 
 
-def verdict_row(entry: dict, stats: dict | None, *, settled_tick: int) -> dict:
+def verdict_row(entry: dict, stats: dict | None, *, settled_tick: int,
+                epoch_found: int | None = None, history_sha256: str = "") -> dict:
+    entry_epoch, entry_tick = int(entry.get("epoch", 0)), int(entry.get("tick", 0))
+    births = gens = life = 0
     if entry.get("outcome") != "proposed":
-        tier, births, gens, life = "rejected", 0, 0, 0
+        tier, epoch_found = "rejected", None
+    elif entry_epoch == 0 and entry_tick == 0:
+        # The relay's _epoch_tick fallback: /api/state was unreachable, so the
+        # (epoch, genome_id) key is a guess. A missing row is then no evidence the
+        # child was never born, and a present one is no evidence it was ours.
+        tier, epoch_found = "unknown", None
     elif stats is None:
-        tier, births, gens, life = "unborn", 0, 0, 0
+        tier = "unborn"
     else:
         births = int(stats.get("births") or 0)
         gens = int(stats.get("max_generation") or 0) - int(stats.get("first_generation") or 0)
         life = int(stats.get("last_tick") or 0) - int(stats.get("first_tick") or 0)
-        tier = tier_of(births, gens)
+        # genome_stats is keyed by (epoch, genome_id), so a proposal that recreates a
+        # genome already alive would inherit every carrier's births. thegrid's
+        # _observe_genome never lowers first_tick and the relay reads its tick before
+        # writing the proposal, so a child of THIS proposal has first_tick >= our tick.
+        # Epoch ticks restart at 0, so the guard only means anything within our epoch.
+        stale = (epoch_found is None or epoch_found == entry_epoch) and \
+            int(stats.get("first_tick", 0)) < entry_tick
+        tier = "preexisting" if stale else tier_of(births, gens)
     return {"request_id": entry["request_id"], "proposal_genome_id": entry.get("proposal_genome_id"),
-            "epoch": int(entry.get("epoch", 0)), "settled_tick": settled_tick,
+            "epoch": entry_epoch, "epoch_found": epoch_found, "settled_tick": settled_tick,
             "births": births, "generations": gens, "lifetime_ticks": life, "tier": tier,
-            "fitness": births, "model_alias": entry.get("model_alias", ""), "outcome": entry.get("outcome")}
+            "fitness": 0 if tier == "preexisting" else births,
+            "model_alias": entry.get("model_alias", ""), "outcome": entry.get("outcome"),
+            "history_sha256": history_sha256}
 
 
 class Ledger:
+    """The append-only hash chain of verdict rows.
+
+    The head and the settled ids are cached after the first read: a nightly run
+    settles thousands of proposals, and re-reading the whole file per append is
+    quadratic. `lock()` is what keeps the cache honest against a second writer.
+    """
+
     def __init__(self, path: Path):
         self.path = Path(path)
+        self._head: str | None = None
+        self._ids: set[str] | None = None
+        self._partial_tail_offset: int | None = None
 
     def rows(self) -> list[dict]:
+        out: list[dict] = []
+        self._partial_tail_offset = None
         try:
-            with open(self.path, encoding="utf-8") as f:
-                return [json.loads(l) for l in f if l.strip()]
+            with open(self.path, "rb") as f:
+                offset = 0
+                for raw in f:
+                    if raw.strip():
+                        try:
+                            out.append(json.loads(raw))
+                        except ValueError:      # includes a bad UTF-8 decode
+                            log.warning("verdict ledger: unreadable line at byte %d of %s "
+                                        "(partial write?); stopping there", offset, self.path)
+                            self._partial_tail_offset = offset
+                            break
+                    offset += len(raw)
         except OSError:
-            return []
+            out = []
+        self._head = out[-1]["chain"] if out else GENESIS
+        self._ids = {r["request_id"] for r in out}
+        return out
 
     def head(self) -> str:
-        rows = self.rows()
-        return rows[-1]["chain"] if rows else GENESIS
+        if self._head is None:
+            self.rows()
+        return self._head
+
+    def _truncate_partial_tail(self) -> None:
+        """Drop a half-written last line: rows are fsynced, so it was never a row."""
+        if self._head is None:
+            self.rows()
+        if self._partial_tail_offset is None:
+            return
+        log.warning("verdict ledger: truncating a partial tail at byte %d of %s",
+                    self._partial_tail_offset, self.path)
+        with open(self.path, "r+b") as f:
+            f.truncate(self._partial_tail_offset)
+            f.flush()
+            os.fsync(f.fileno())
+        self._partial_tail_offset = None
 
     def append(self, row: dict) -> dict:
-        full = dict(row, chain=chain_hash(self.head(), row))
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._truncate_partial_tail()
+        full = dict(row, chain=chain_hash(self.head(), row))
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(full, sort_keys=True, separators=(",", ":")) + "\n")
             f.flush()
             os.fsync(f.fileno())
+        self._head = full["chain"]
+        self._ids.add(full["request_id"])
         return full
+
+    @contextlib.contextmanager
+    def lock(self):
+        """Exclusive across processes on Linux (the nightly timer plus a manual run).
+
+        Windows has no flock and is a dev box only, so there it is a no-op.
+        """
+        if sys.platform != "linux":
+            yield
+            return
+        import fcntl
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(f"{self.path}.lock", "w", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
 
     def verify(self) -> bool:
         prev = GENESIS
@@ -713,7 +988,9 @@ class Ledger:
         return True
 
     def settled_ids(self) -> set[str]:
-        return {r["request_id"] for r in self.rows()}
+        if self._ids is None:
+            self.rows()
+        return set(self._ids)
 
 
 class StatsReader:
@@ -725,25 +1002,35 @@ class StatsReader:
     which reads consistently through the WAL.
     """
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, tmp_dir: Path | None = None):
         self.db_path = Path(db_path)
+        self.tmp_dir = Path(tmp_dir) if tmp_dir is not None else None
         self.copy_path: str | None = None
         self._db: sqlite3.Connection | None = None
+        self._sha256: str | None = None
 
     def __enter__(self) -> "StatsReader":
-        fd, self.copy_path = tempfile.mkstemp(suffix=".sqlite3")
+        if self.tmp_dir is not None:        # /tmp may be a small tmpfs; the fossil DB is not
+            self.tmp_dir.mkdir(parents=True, exist_ok=True)
+        fd, self.copy_path = tempfile.mkstemp(
+            suffix=".sqlite3", dir=str(self.tmp_dir) if self.tmp_dir is not None else None)
         os.close(fd)
-        src = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
         try:
-            dst = sqlite3.connect(self.copy_path)
+            src = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
             try:
-                src.backup(dst)
+                dst = sqlite3.connect(self.copy_path)
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
             finally:
-                dst.close()
-        finally:
-            src.close()
-        self._db = sqlite3.connect(f"file:{self.copy_path}?mode=ro", uri=True)
-        self._db.row_factory = sqlite3.Row
+                src.close()
+            self._db = sqlite3.connect(f"file:{self.copy_path}?mode=ro", uri=True)
+            self._db.row_factory = sqlite3.Row
+        except Exception:
+            if os.path.exists(self.copy_path):
+                os.unlink(self.copy_path)
+            raise
         return self
 
     def __exit__(self, *exc) -> None:
@@ -752,6 +1039,20 @@ class StatsReader:
         if self.copy_path and os.path.exists(self.copy_path):
             os.unlink(self.copy_path)
 
+    def snapshot_sha256(self) -> str:
+        """Hash of the snapshot this reader scored against — the state to re-derive from.
+
+        Hashing the live file would name a DB the verdicts were never read from;
+        the colony writes to it continuously.
+        """
+        if self._sha256 is None:
+            h = hashlib.sha256()
+            with open(self.copy_path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            self._sha256 = h.hexdigest()
+        return self._sha256
+
     def stats(self, epoch: int, genome_id: str) -> dict | None:
         row = self._db.execute(
             "SELECT births, first_generation, max_generation, first_tick, last_tick "
@@ -759,9 +1060,31 @@ class StatsReader:
         return dict(row) if row else None
 
 
+def _lookup(reader: StatsReader, entry: dict, *, now_epoch: int) -> tuple[dict | None, int | None]:
+    """The genome's stats and the epoch they came from, or (None, None).
+
+    thegrid consumes proposal.json at the next qualifying birth, which for a
+    proposal written late in an epoch can fall after the epoch rolled over. Only
+    the first NEXT_EPOCH_GRACE_TICKS of that epoch could be our child.
+    """
+    gid = entry.get("proposal_genome_id")
+    if not gid:
+        return None, None
+    entry_epoch = int(entry.get("epoch", 0))
+    stats = reader.stats(entry_epoch, gid)
+    if stats is not None:
+        return stats, entry_epoch
+    if now_epoch > entry_epoch:
+        nxt = reader.stats(entry_epoch + 1, gid)
+        if nxt is not None and int(nxt.get("first_tick", 0)) <= NEXT_EPOCH_GRACE_TICKS:
+            return nxt, entry_epoch + 1
+    return None, None
+
+
 def settle_pending(entries: list[dict], ledger: Ledger, reader: StatsReader, *, now_epoch: int,
                    now_tick: int, settle_ticks: int = SETTLE_TICKS) -> list[dict]:
     done = ledger.settled_ids()
+    hist = reader.snapshot_sha256()
     out = []
     for e in entries:
         if e["request_id"] in done:
@@ -769,13 +1092,14 @@ def settle_pending(entries: list[dict], ledger: Ledger, reader: StatsReader, *, 
         if not is_settled(int(e.get("epoch", 0)), int(e.get("tick", 0)), now_epoch=now_epoch,
                           now_tick=now_tick, settle_ticks=settle_ticks):
             continue
-        stats = reader.stats(int(e.get("epoch", 0)), e["proposal_genome_id"]) if e.get("proposal_genome_id") else None
-        out.append(ledger.append(verdict_row(e, stats, settled_tick=now_tick)))
+        stats, found = _lookup(reader, e, now_epoch=now_epoch)
+        out.append(ledger.append(verdict_row(e, stats, settled_tick=now_tick, epoch_found=found,
+                                             history_sha256=hist)))
         done.add(e["request_id"])
     return out
 ```
 
-- [ ] **Step 4: Run** `python -m pytest tests/test_verdicts.py -q` → `7 passed`.
+- [ ] **Step 4: Run** `python -m pytest tests/test_verdicts.py -q` → `19 passed`.
 
 - [ ] **Step 5: Mutations, then commit**
 
@@ -798,7 +1122,7 @@ git commit -m "feat: verdicts — thegrid tiers, settle rule, hash-chained ledge
 
 **Interfaces:**
 - Consumes: `ProposalLog.read_all` (Task 2), `Bus`, `envelope`, `subject`.
-- Produces: `async run_once(*, verdicts_dir: Path, history_db: Path, state: dict, bus=None, colony: str, agent_id: str, settle_ticks: int = SETTLE_TICKS) -> list[dict]` (reads proposals, settles, publishes each new row on `GRID.<colony>.verdict`, publish failures logged); `main(argv)` with `--verdicts-dir`, `--history-db`, `--colony-url`, `--colony`, `--settle-ticks`, `--no-publish`; env fallbacks `VERDICTS_DIR`, `HISTORY_DB` (default `/srv/grid/<colony>/state/history.sqlite3`), `COLONY_URL`, `COLONY_SLUG`, `MIND_AGENT_ID`, `SETTLE_TICKS`, NATS vars.
+- Produces: `async run_once(*, verdicts_dir: Path, history_db: Path, state: dict, bus=None, colony: str, agent_id: str, settle_ticks: int = SETTLE_TICKS) -> list[dict]` (reads proposals, settles under `Ledger.lock()`, publishes each new row on `GRID.<colony>.verdict` with `kind="verdict"`, publish failures logged); `main(argv)` with `--verdicts-dir`, `--history-db`, `--colony-url`, `--colony`, `--settle-ticks`, `--no-publish`; env fallbacks `VERDICTS_DIR`, `HISTORY_DB` (default `/srv/grid/<colony>/state/history.sqlite3`), `COLONY_URL`, `COLONY_SLUG`, `MIND_AGENT_ID`, `SETTLE_TICKS`, NATS vars.
 
 - [ ] **Step 1: Write the failing tests** (append to `tests/test_verdicts.py`)
 
@@ -814,7 +1138,7 @@ class FakeBus:
 async def test_run_once_settles_publishes_and_is_idempotent(tmp_path):
     from grid.proposal_log import ProposalLog
     from grid.verdicts import run_once
-    db = make_db(tmp_path / "history.sqlite3", [(1, "g1", 40, 0, 0, 3, 10, 120, 3020)])
+    db = make_db(tmp_path / "history.sqlite3", [(1, "g1", 40, 0, 0, 3, 13, 120, 3020)])
     vdir = tmp_path / "verdicts"
     plog = ProposalLog(vdir)
     plog.record({"request_id": "r1", "epoch": 1, "tick": 100, "proposal_genome_id": "g1", "outcome": "proposed",
@@ -826,6 +1150,7 @@ async def test_run_once_settles_publishes_and_is_idempotent(tmp_path):
     subj, payload = bus.published[0]
     assert subj == "GRID.c.verdict" and payload["request_id"] == "r1" and payload["fitness"] == 40
     assert payload["schema_version"] == "1.0" and payload["epoch"] == 1 and payload["tick"] == 3300
+    assert payload["kind"] == "verdict"          # consumers route on kind, not only on subject
     assert await run_once(verdicts_dir=vdir, history_db=db, state={"epoch": 1, "tick": 3400}, bus=bus,
                           colony="c", agent_id="grid-c") == []
     assert len(bus.published) == 1
@@ -857,18 +1182,21 @@ async def run_once(*, verdicts_dir: Path, history_db: Path, state: dict, bus=Non
     entries = ProposalLog(Path(verdicts_dir)).read_all()
     ledger = Ledger(Path(verdicts_dir) / "verdicts.jsonl")
     now_epoch, now_tick = int(state.get("epoch", 0)), int(state.get("tick", 0))
-    with StatsReader(Path(history_db)) as reader:
-        rows = settle_pending(entries, ledger, reader, now_epoch=now_epoch, now_tick=now_tick,
-                              settle_ticks=settle_ticks)
-    if bus is not None:
-        for row in rows:
-            fields = {k: v for k, v in row.items() if k not in ("epoch",)}
-            try:
-                await bus.publish(subject(colony, "verdict"),
-                                  envelope(agent_id=agent_id, colony=colony, epoch=row["epoch"],
-                                           tick=now_tick, **fields))
-            except Exception as e:      # the row is already in the ledger; the bus is best-effort
-                log.error("verdict publish failed for %s: %s", row["request_id"], e)
+    # One writer at a time: the nightly timer and a manual run must not interleave
+    # appends, and the cached head is only safe inside the lock.
+    with ledger.lock():
+        with StatsReader(Path(history_db), tmp_dir=Path(verdicts_dir)) as reader:
+            rows = settle_pending(entries, ledger, reader, now_epoch=now_epoch, now_tick=now_tick,
+                                  settle_ticks=settle_ticks)
+        if bus is not None:
+            for row in rows:
+                fields = {k: v for k, v in row.items() if k not in ("epoch",)}
+                try:
+                    await bus.publish(subject(colony, "verdict"),
+                                      envelope(agent_id=agent_id, colony=colony, epoch=row["epoch"],
+                                               tick=now_tick, kind="verdict", **fields))
+                except Exception as e:  # the row is already in the ledger; the bus is best-effort
+                    log.error("verdict publish failed for %s: %s", row["request_id"], e)
     log.info("settled %d proposals (epoch %d tick %d)", len(rows), now_epoch, now_tick)
     return rows
 
@@ -922,7 +1250,7 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
-- [ ] **Step 4: Run** `python -m pytest tests/test_verdicts.py -q` → `9 passed`.
+- [ ] **Step 4: Run** `python -m pytest tests/test_verdicts.py -q` → `21 passed`.
 
 - [ ] **Step 5: Mutation, then commit**
 
@@ -943,7 +1271,7 @@ git commit -m "feat: verdicts run_once + CLI — settle, chain, publish GRID.<co
 
 **Interfaces:**
 - Consumes: `Ledger`, `ProposalLog`, `TIERS` (Tasks 2, 5); chronicle log rows (Task 4).
-- Produces: `TIER_RANK = {"established": 4, "enduring": 3, "growing": 2, "reproduced": 1, "new": 0}`; `record_for(entry: dict, verdict: dict, prompt: str, *, history_sha256: str) -> dict`; `chronicle_record(row: dict) -> dict`; `export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced", history_db: Path | None = None) -> dict` (writes `records.jsonl`, `negatives.jsonl`, `manifest.json`; returns the manifest); `main(argv)` with `--verdicts-dir`, `--out`, `--min-tier`, `--history-db`.
+- Produces: `TIER_RANK = {"established": 4, "enduring": 3, "growing": 2, "reproduced": 1, "new": 0}`; `NEGATIVE_TIERS`, `EXCLUDED_TIERS = ("preexisting", "unknown")`; `record_for(entry: dict, verdict: dict, prompt: str) -> dict` (the hash comes off `verdict["history_sha256"]`; a rejection's text is its raw `reply`); `chronicle_record(row: dict) -> dict`; `export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced") -> dict` (writes `records.jsonl`, `negatives.jsonl`, `manifest.json`; returns the manifest); `main(argv)` with `--verdicts-dir`, `--out`, `--min-tier`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -957,26 +1285,34 @@ from grid.verdict_corpus import chronicle_record, export, record_for
 from grid.verdicts import Ledger
 
 REQUIRED = {"id", "kind", "tier", "source", "speaker", "text"}       # export_corpus.py's contract
+HIST = "f" * 64                             # the settle-time snapshot hash carried by every row
+REJECTED_REPLY = 'I think ["teleport"] would work well here.'
 
 
 def seed(vdir: Path) -> None:
     plog = ProposalLog(vdir)
-    for rid, gid in (("a", "g1"), ("b", "g2"), ("c", "g3")):
-        plog.record({"request_id": rid, "epoch": 1, "tick": 10, "colony": "c", "proposal": ["harvest", "fork"],
+    for n, (rid, gid) in enumerate((("a", "g1"), ("b", "g2"), ("c", "g3"))):
+        plog.record({"ts": 1000 + n, "request_id": rid, "epoch": 1, "tick": 10, "colony": "c",
+                     "proposal": ["harvest", "fork"],
                      "proposal_genome_id": gid, "outcome": "proposed", "model_alias": "m", "reason": None,
                      "prompt_path": f"prompts/{rid}.txt", "parent_genome": ["harvest"]}, f"prompt {rid}")
-    plog.record({"request_id": "d", "epoch": 1, "tick": 11, "colony": "c", "proposal": None,
+    plog.record({"ts": 1030, "request_id": "d", "epoch": 1, "tick": 11, "colony": "c", "proposal": None,
                  "proposal_genome_id": None, "outcome": "rejected", "model_alias": "m", "reason": "bad",
+                 "reply": REJECTED_REPLY,
                  "prompt_path": "prompts/d.txt", "parent_genome": ["harvest"]}, "prompt d")
     led = Ledger(vdir / "verdicts.jsonl")
     led.append({"request_id": "a", "proposal_genome_id": "g1", "epoch": 1, "settled_tick": 3100, "births": 40,
-                "generations": 12, "lifetime_ticks": 2000, "tier": "growing", "fitness": 40, "model_alias": "m", "outcome": "proposed"})
+                "generations": 12, "lifetime_ticks": 2000, "tier": "growing", "fitness": 40, "model_alias": "m",
+                "outcome": "proposed", "history_sha256": HIST})
     led.append({"request_id": "b", "proposal_genome_id": "g2", "epoch": 1, "settled_tick": 3100, "births": 1,
-                "generations": 0, "lifetime_ticks": 5, "tier": "new", "fitness": 1, "model_alias": "m", "outcome": "proposed"})
+                "generations": 0, "lifetime_ticks": 5, "tier": "new", "fitness": 1, "model_alias": "m",
+                "outcome": "proposed", "history_sha256": HIST})
     led.append({"request_id": "c", "proposal_genome_id": "g3", "epoch": 1, "settled_tick": 3100, "births": 0,
-                "generations": 0, "lifetime_ticks": 0, "tier": "unborn", "fitness": 0, "model_alias": "m", "outcome": "proposed"})
+                "generations": 0, "lifetime_ticks": 0, "tier": "unborn", "fitness": 0, "model_alias": "m",
+                "outcome": "proposed", "history_sha256": HIST})
     led.append({"request_id": "d", "proposal_genome_id": None, "epoch": 1, "settled_tick": 3100, "births": 0,
-                "generations": 0, "lifetime_ticks": 0, "tier": "rejected", "fitness": 0, "model_alias": "m", "outcome": "rejected"})
+                "generations": 0, "lifetime_ticks": 0, "tier": "rejected", "fitness": 0, "model_alias": "m",
+                "outcome": "rejected", "history_sha256": HIST})
     (vdir / "chronicle.jsonl").write_text(json.dumps({"ts": 1, "colony": "c", "epoch": 1, "tick": 2000, "kind": "skill",
                                                        "question": "Name the capability", "text": "fork early via fork.",
                                                        "since_tick": 0}) + "\n")
@@ -984,8 +1320,8 @@ def seed(vdir: Path) -> None:
 
 def test_record_for_shape():
     e = {"request_id": "a", "epoch": 1, "tick": 10, "colony": "c", "proposal": ["harvest", "fork"], "model_alias": "m"}
-    v = {"tier": "growing", "fitness": 40, "chain": "abc"}
-    r = record_for(e, v, "the prompt", history_sha256="deadbeef")
+    v = {"tier": "growing", "fitness": 40, "chain": "abc", "history_sha256": "deadbeef"}
+    r = record_for(e, v, "the prompt")
     assert REQUIRED <= set(r)
     assert r["id"] == "odin-a" and r["kind"] == "odin" and r["tier"] == 1 and r["speaker"] == "kannaka"
     assert r["source"] == "grid-verdicts" and r["text"] == '["harvest", "fork"]' and r["context"] == "the prompt"
@@ -1012,7 +1348,49 @@ def test_export_filters_by_tier_and_splits_negatives(tmp_path):
     assert records[0]["context"] == "prompt a"
     assert manifest["records"] == 2 and manifest["negatives"] == 2 and manifest["min_tier"] == "reproduced"
     assert manifest["by_tier"] == {"growing": 1} and manifest["chain_head"] == Ledger(vdir / "verdicts.jsonl").head()
+    assert manifest["skipped_below_threshold"] == 1                            # 'b' is only 'new'
+    assert manifest["history_snapshots"] == [HIST] and manifest["cumulative"] is True
+    assert manifest["since_ts"] == 1000 and manifest["until_ts"] == 1030
     assert json.loads((out / "manifest.json").read_text()) == manifest
+
+
+def test_preexisting_verdicts_are_neither_positive_nor_negative(tmp_path):
+    vdir, out = tmp_path / "v", tmp_path / "out"
+    seed(vdir)
+    ProposalLog(vdir).record({"request_id": "p", "epoch": 1, "tick": 12, "colony": "c",
+                              "proposal": ["harvest", "fork"], "proposal_genome_id": "g4",
+                              "outcome": "proposed", "model_alias": "m", "reason": None,
+                              "prompt_path": "prompts/p.txt", "parent_genome": ["harvest"]}, "prompt p")
+    Ledger(vdir / "verdicts.jsonl").append({"request_id": "p", "proposal_genome_id": "g4", "epoch": 1,
+        "settled_tick": 3100, "births": 90, "generations": 38, "lifetime_ticks": 2950,
+        "tier": "preexisting", "fitness": 0, "model_alias": "m", "outcome": "proposed"})
+    manifest = export(vdir, out, min_tier="reproduced")
+    ids = {json.loads(l)["id"] for l in (out / "records.jsonl").read_text().splitlines()}
+    ids |= {json.loads(l)["id"] for l in (out / "negatives.jsonl").read_text().splitlines()}
+    assert "odin-p" not in ids
+    assert manifest["skipped_preexisting"] == 1 and manifest["skipped_unknown"] == 0
+
+
+def test_negatives_carry_the_prompt_and_the_rejected_reply(tmp_path):
+    """A negative is only usable as a preference pair if it has the ask and the answer."""
+    vdir, out = tmp_path / "v", tmp_path / "out"
+    seed(vdir)
+    export(vdir, out, min_tier="reproduced")
+    negatives = {n["id"]: n for n in
+                 (json.loads(l) for l in (out / "negatives.jsonl").read_text().splitlines())}
+    assert negatives["odin-d"]["context"] == "prompt d"          # rejected
+    assert negatives["odin-d"]["text"] == REJECTED_REPLY
+    assert negatives["odin-c"]["context"] == "prompt c"          # unborn: the genome she proposed
+    assert negatives["odin-c"]["text"] == '["harvest", "fork"]'
+
+
+def test_a_negative_without_its_prompt_is_skipped(tmp_path):
+    vdir, out = tmp_path / "v", tmp_path / "out"
+    seed(vdir)
+    (vdir / "prompts" / "d.txt").unlink()
+    manifest = export(vdir, out, min_tier="reproduced")
+    ids = [json.loads(l)["id"] for l in (out / "negatives.jsonl").read_text().splitlines()]
+    assert ids == ["odin-c"] and manifest["skipped_missing_prompt"] == 1
 
 
 def test_export_growing_threshold_and_missing_prompt(tmp_path):
@@ -1023,6 +1401,26 @@ def test_export_growing_threshold_and_missing_prompt(tmp_path):
     records = [json.loads(l) for l in (out / "records.jsonl").read_text().splitlines()]
     assert [r["id"] for r in records] == ["chronicle-c-1-2000-skill"]      # 'a' skipped: prompt missing
     assert manifest["skipped_missing_prompt"] == 1
+
+
+def test_a_repeated_chronicle_line_is_exported_once(tmp_path):
+    vdir, out = tmp_path / "v", tmp_path / "out"
+    seed(vdir)
+    line = (vdir / "chronicle.jsonl").read_text(encoding="utf-8")
+    (vdir / "chronicle.jsonl").write_text(line + line, encoding="utf-8")
+    manifest = export(vdir, out, min_tier="reproduced")
+    ids = [json.loads(l)["id"] for l in (out / "records.jsonl").read_text().splitlines()]
+    assert ids == ["odin-a", "chronicle-c-1-2000-skill"] and manifest["records"] == 2
+
+
+def test_manifest_counts_verdicts_without_a_proposal_entry(tmp_path):
+    vdir, out = tmp_path / "v", tmp_path / "out"
+    seed(vdir)
+    Ledger(vdir / "verdicts.jsonl").append({"request_id": "ghost", "proposal_genome_id": "gz", "epoch": 1,
+        "settled_tick": 3100, "births": 9, "generations": 20, "lifetime_ticks": 100, "tier": "growing",
+        "fitness": 9, "model_alias": "m", "outcome": "proposed"})
+    manifest = export(vdir, out, min_tier="reproduced")
+    assert manifest["skipped_missing_entry"] == 1 and manifest["records"] == 2
 ```
 
 - [ ] **Step 2: Run** → `ModuleNotFoundError: No module named 'grid.verdict_corpus'`.
@@ -1040,7 +1438,6 @@ negatives.jsonl for a later preference-pair version.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
 import os
@@ -1054,15 +1451,23 @@ log = logging.getLogger("grid.verdict_corpus")
 
 TIER_RANK = {"established": 4, "enduring": 3, "growing": 2, "reproduced": 1, "new": 0}
 NEGATIVE_TIERS = ("unborn", "rejected")
+# Neither a win nor a loss: 'preexisting' credited a genome that was already alive,
+# 'unknown' never learned the epoch it was proposed in. Training on either teaches noise.
+EXCLUDED_TIERS = ("preexisting", "unknown")
 
 
-def record_for(entry: dict, verdict: dict, prompt: str, *, history_sha256: str) -> dict:
+def record_for(entry: dict, verdict: dict, prompt: str) -> dict:
+    # A rejection never produced a genome, so what she actually wrote is the reply.
+    # Anything else — a positive, or an unborn proposal — is the genome she proposed.
+    text = entry.get("reply") if verdict.get("tier") == "rejected" else None
     return {
         "id": f"odin-{entry['request_id']}", "kind": "odin", "tier": 1, "source": "grid-verdicts",
-        "speaker": "kannaka", "text": json.dumps(entry.get("proposal")), "context": prompt,
+        "speaker": "kannaka", "text": json.dumps(entry.get("proposal")) if text is None else text,
+        "context": prompt,
         "verdict": {"tier": verdict.get("tier"), "fitness": verdict.get("fitness")},
         "provenance": {"colony": entry.get("colony"), "epoch": entry.get("epoch"), "tick": entry.get("tick"),
-                       "chain": verdict.get("chain"), "history_sha256": history_sha256,
+                       "chain": verdict.get("chain"),
+                       "history_sha256": verdict.get("history_sha256", ""),
                        "model_alias": entry.get("model_alias")},
     }
 
@@ -1077,52 +1482,73 @@ def chronicle_record(row: dict) -> dict:
     }
 
 
-def _sha256_file(path: Path | None) -> str:
-    if path is None or not Path(path).exists():
-        return ""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def _seen(verdict: dict, entry: dict, snapshots: set[str], stamps: list[int]) -> None:
+    """Remember which colony state a record came from, and when it was proposed."""
+    if verdict.get("history_sha256"):
+        snapshots.add(verdict["history_sha256"])
+    if isinstance(entry.get("ts"), int):
+        stamps.append(entry["ts"])
 
 
-def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced",
-           history_db: Path | None = None) -> dict:
+def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced") -> dict:
     vdir, out = Path(verdicts_dir), Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     entries = {e["request_id"]: e for e in ProposalLog(vdir).read_all()}
     ledger = Ledger(vdir / "verdicts.jsonl")
-    hist_sha = _sha256_file(history_db)
     threshold = TIER_RANK[min_tier]
-    records, negatives, by_tier, skipped = [], [], {}, 0
+    records, negatives, by_tier = [], [], {}
+    skipped = skipped_missing_entry = skipped_below_threshold = 0
+    excluded = {t: 0 for t in EXCLUDED_TIERS}
+    snapshots: set[str] = set()
+    stamps: list[int] = []
     for v in ledger.rows():
         e = entries.get(v["request_id"])
         if e is None:
+            skipped_missing_entry += 1
             continue
-        if v["tier"] in NEGATIVE_TIERS:
-            negatives.append(record_for(e, v, "", history_sha256=hist_sha))
+        if v["tier"] in EXCLUDED_TIERS:
+            excluded[v["tier"]] += 1
             continue
-        if TIER_RANK.get(v["tier"], -1) < threshold:
+        negative = v["tier"] in NEGATIVE_TIERS
+        if not negative and TIER_RANK.get(v["tier"], -1) < threshold:
+            skipped_below_threshold += 1
             continue
         prompt_path = vdir / e.get("prompt_path", "")
         if not prompt_path.is_file():
+            # A negative without its prompt is not a preference pair, only a complaint.
             skipped += 1
             continue
-        records.append(record_for(e, v, prompt_path.read_text(encoding="utf-8"), history_sha256=hist_sha))
-        by_tier[v["tier"]] = by_tier.get(v["tier"], 0) + 1
+        record = record_for(e, v, prompt_path.read_text(encoding="utf-8"))
+        if negative:
+            negatives.append(record)
+        else:
+            records.append(record)
+            by_tier[v["tier"]] = by_tier.get(v["tier"], 0) + 1
+        _seen(v, e, snapshots, stamps)
     chron = vdir / "chronicle.jsonl"
     if chron.exists():
+        # The id is (colony, epoch, tick, kind); a re-published line would otherwise
+        # be trained on twice. The first one is the one that was actually published.
+        seen_chronicle: set[str] = set()
         for line in chron.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                records.append(chronicle_record(json.loads(line)))
+            if not line.strip():
+                continue
+            record = chronicle_record(json.loads(line))
+            if record["id"] not in seen_chronicle:
+                seen_chronicle.add(record["id"])
+                records.append(record)
     for name, rows in (("records.jsonl", records), ("negatives.jsonl", negatives)):
         with open(out / name, "w", encoding="utf-8") as f:
             for r in rows:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
     manifest = {"records": len(records), "negatives": len(negatives), "min_tier": min_tier,
-                "by_tier": by_tier, "skipped_missing_prompt": skipped, "chain_head": ledger.head(),
-                "history_sha256": hist_sha, "verdicts_dir": str(vdir)}
+                "by_tier": by_tier, "skipped_missing_prompt": skipped,
+                "skipped_missing_entry": skipped_missing_entry,
+                "skipped_below_threshold": skipped_below_threshold,
+                "skipped_preexisting": excluded["preexisting"], "skipped_unknown": excluded["unknown"],
+                "chain_head": ledger.head(), "history_snapshots": sorted(snapshots),
+                "since_ts": min(stamps) if stamps else None, "until_ts": max(stamps) if stamps else None,
+                "cumulative": True, "verdicts_dir": str(vdir)}
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     return manifest
 
@@ -1135,9 +1561,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--verdicts-dir", default=env("VERDICTS_DIR", f"/srv/grid/{colony}/verdicts"))
     ap.add_argument("--out", required=True)
     ap.add_argument("--min-tier", default="reproduced", choices=sorted(TIER_RANK))
-    ap.add_argument("--history-db", default=env("HISTORY_DB", f"/srv/grid/{colony}/state/history.sqlite3"))
     a = ap.parse_args(argv)
-    print(json.dumps(export(Path(a.verdicts_dir), Path(a.out), min_tier=a.min_tier, history_db=Path(a.history_db))))
+    print(json.dumps(export(Path(a.verdicts_dir), Path(a.out), min_tier=a.min_tier)))
     return 0
 
 
@@ -1145,7 +1570,7 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
-- [ ] **Step 4: Run** `python -m pytest tests/test_verdict_corpus.py -q` → `4 passed`.
+- [ ] **Step 4: Run** `python -m pytest tests/test_verdict_corpus.py -q` → `9 passed`.
 
 - [ ] **Step 5: Mutation, then commit**
 
@@ -1260,11 +1685,80 @@ async def test_verdicts_settle_against_the_real_fossil_db(colony, tmp_path):
                           agent_id="grid-smoke", settle_ticks=100)
     assert [r["tier"] for r in rows] == ["unborn"]
     assert Ledger(vdir / "verdicts.jsonl").verify()
+
+
+class EchoMind:
+    """Answers with the parent genome plus one nop — a valid variant of whatever was asked."""
+
+    agent_id = "grid-smoke"
+
+    def __init__(self, queue: Path):
+        self.queue = queue
+
+    async def recall(self, query, top_k=5):
+        return []
+
+    async def ask(self, text, *, recall_query=None, timeout_s=180.0):
+        request = json.loads((self.queue / "request.json").read_text())
+        assert "nop" in [i["name"] for i in request["instruction_set"]], "thegrid's ISA lost nop"
+        return json.dumps(list(request["genome"]) + ["nop"])
+
+
+@skip
+async def test_a_real_proposal_is_credited_to_its_child(colony, tmp_path):
+    """The whole pipeline on a genome thegrid really births: propose, consume, credit.
+
+    The 'unborn' smoke above proves the negative path. Only this one proves the
+    join actually lands — that our genome_id names the child thegrid recorded.
+    """
+    from grid.proposal_log import ProposalLog
+    from grid.verdicts import Ledger, StatsReader, run_once
+    base, queue = colony
+    db = queue.parent / "history.sqlite3"
+    request_path = queue / "request.json"
+
+    def state() -> dict:
+        return httpx.get(f"{base}/api/state", timeout=2).json()
+
+    async def fetch_state() -> dict:
+        return state()
+
+    deadline = time.time() + 90
+    while time.time() < deadline and not request_path.exists():
+        time.sleep(0.5)
+    if not request_path.exists():
+        pytest.skip("thegrid filed no Odin request in 90s (its mutator asks on ~5% of births)")
+
+    vdir = tmp_path / "verdicts"
+    relay = Relay(queue, colony="smoke", agent_id="grid-smoke", mind=EchoMind(queue), bus=NullBus(),
+                  state_fetch=fetch_state, proposal_log=ProposalLog(vdir), model_alias="stub")
+    assert await relay.poll_once() == "proposed"
+    [entry] = ProposalLog(vdir).read_all()
+
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        if not (queue / "proposal.json").exists() and db.exists():
+            with StatsReader(db) as reader:
+                if reader.stats(entry["epoch"], entry["proposal_genome_id"]) is not None:
+                    break
+        time.sleep(1)
+    else:
+        pytest.skip("thegrid did not consume and birth the proposed genome within 90s")
+
+    rows = await run_once(verdicts_dir=vdir, history_db=db, state=state(), bus=None, colony="smoke",
+                          agent_id="grid-smoke", settle_ticks=1)
+    assert [r["request_id"] for r in rows] == [entry["request_id"]]
+    assert rows[0]["tier"] not in ("unborn", "preexisting")
+    assert rows[0]["fitness"] >= 1 and rows[0]["epoch_found"] is not None
+    assert Ledger(vdir / "verdicts.jsonl").verify()
+    with StatsReader(db) as reader:
+        stats = reader.stats(entry["epoch"], entry["proposal_genome_id"])
+    assert stats["first_tick"] >= entry["tick"]      # the child is ours, not a strain already alive
 ```
 
 The filename is confirmed: `live.py:76` opens `LineageHistory(state_path.with_name("history.sqlite3"))`, and Skywave shows `history.sqlite3` with `-wal`/`-shm` siblings (WAL mode, hence the backup-API reader in Task 5).
 
-- [ ] **Step 2: Run** `python -m pytest tests/integration -q` → `3 skipped` on Windows.
+- [ ] **Step 2: Run** `python -m pytest tests/integration -q` → `4 skipped` on Windows.
 
 - [ ] **Step 3: Commit**
 
