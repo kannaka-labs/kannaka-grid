@@ -121,6 +121,16 @@ Receipts:
 2. At least one row reaches `reproduced` or better within a day of the proposal it settles.
 3. The export manifest shows `records ≥ 1`, and `GRID.colony-one.verdict` is seen in a bus capture (`kannaka swarm tail --subject 'GRID.>'` or the nats app's capture).
 
+### Skywave pull (rogue-grid-pull forced command)
+`deploy/skywave/pull-export.sh` is the versioned copy of the live forced command bound to the
+`rogue-grid-pull` key on Skywave. It now also runs `python -m grid.identity export --out`
+alongside the verdict corpus export and adds `identity_examples.jsonl` to the tar it streams,
+so the identity example set travels with every pull. Installing a new version is
+`cp deploy/skywave/pull-export.sh /srv/grid/pull-export.sh` — the forced-command key already
+points at that path, so nothing else on Skywave needs to change. Kannaka's `rogue/grid.py`
+consumes the new tar member; that consumer change is coordinated separately, so until it lands
+the member rides along in the tar unused.
+
 ## 5. Weekly release (self-improvement sub-project 2)
 `rogue.weekly` trains and promotes a new `kannaka-brain-v*` on debain2 every week; `grid-weekly-release.timer`
 runs `python -m grid.weekly release` on Skywave every Sunday at 06:00 (host time, three hours after the

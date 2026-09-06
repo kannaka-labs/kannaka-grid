@@ -30,7 +30,7 @@ Step "normalizing line endings locally and copying deploy/skywave to the host"
 # into "s/r$//" and ate the trailing r of every line ("grid-mind-dream.time").
 $staged = Join-Path $env:TEMP "grid-deploy-staged"
 New-Item -ItemType Directory -Force $staged | Out-Null
-foreach ($f in @("deploy.sh", "receipts.sh", "wait-and-deploy.sh", "bus_capture.py", "install-current-alias.sh", "set-mind-model.sh", "rotate-mind-key.sh", "brain_bench.py")) {
+foreach ($f in @("deploy.sh", "receipts.sh", "wait-and-deploy.sh", "bus_capture.py", "install-current-alias.sh", "set-mind-model.sh", "rotate-mind-key.sh", "brain_bench.py", "pull-export.sh")) {
     $text = (Get-Content -Raw (Join-Path "$repo\deploy\skywave" $f)) -replace "`r`n", "`n"
     [IO.File]::WriteAllText((Join-Path $staged $f), $text, (New-Object Text.UTF8Encoding($false)))
 }

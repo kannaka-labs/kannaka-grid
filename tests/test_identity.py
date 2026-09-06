@@ -52,3 +52,13 @@ async def test_measure_reports_per_question_leaks():
     clean_q = IDENTITY_QUESTIONS[0]
     assert m["by_question"][clean_q]["base_named"] == 0 and m["by_question"][clean_q]["leaks"] == []
     assert m["score"]["base_named"] == 2 * 1 and m["score"]["pass"] is False
+
+
+def test_export_writes_examples_and_manifest(tmp_path):
+    from grid.identity import export
+    import hashlib
+    m = export(tmp_path)
+    lines = (tmp_path / "identity_examples.jsonl").read_text(encoding="utf-8").splitlines()
+    assert m["records"] == len(lines) >= 40
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest == m and manifest["sha256"] == hashlib.sha256((tmp_path / "identity_examples.jsonl").read_bytes()).hexdigest()

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import sys
@@ -40,6 +41,21 @@ def records() -> list[dict]:
     return out
 
 
+def export(out_dir: Path) -> dict:
+    """Write the committed identity example set out as a corpus record file plus a
+    manifest, so the Skywave pull can carry it as one tar member (records() validates
+    on load, so a base-naming leak can never ship through here)."""
+    out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+    recs = records()                                   # validates: no committed leak ships
+    path = out / "identity_examples.jsonl"
+    with open(path, "w", encoding="utf-8") as f:
+        for r in recs:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    manifest = {"records": len(recs), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
+    return manifest
+
+
 async def measure(ask: Ask, *, runs: int = 10) -> dict:
     """Run the full identity probe and report which questions leak, with the model's
     own offending words, so the example set can target real failures."""
@@ -67,14 +83,20 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     import os
     ap = argparse.ArgumentParser(prog="grid.identity")
-    ap.add_argument("verb", choices=("measure",))
+    ap.add_argument("verb", choices=("measure", "export"))
     ap.add_argument("--model", default=os.environ.get("MIND_LLM_MODEL", "kannaka-brain-current"))
     ap.add_argument("--gateway-url", default=os.environ.get("MIND_LLM_URL", "http://10.30.0.30:4000/v1"))
     ap.add_argument("--key-file", default=os.environ.get("MIND_LLM_KEY_FILE", "/srv/grid/colony-one/mind-llm.key"))
     ap.add_argument("--runs", type=int, default=10)
     ap.add_argument("--timeout-s", type=float, default=float(os.environ.get("PROBE_TIMEOUT_S", "900")))
-    ap.add_argument("--out", default=None, help="write the full report (with the model's offending answers) here")
+    ap.add_argument("--out", default=None, help="write the full report (with the model's offending answers) here; for export, the directory to write into (required)")
     a = ap.parse_args(argv)
+    if a.verb == "export":
+        if not a.out:
+            ap.error("export requires --out")
+        manifest = export(Path(a.out))
+        print(json.dumps(manifest, indent=1))
+        return 0
     key = Path(a.key_file).read_text(encoding="utf-8").strip()
     m = asyncio.run(measure_model(a.gateway_url, key, a.model, runs=a.runs, timeout_s=a.timeout_s))
     leaking = {q: v for q, v in m["by_question"].items() if v["base_named"]}
