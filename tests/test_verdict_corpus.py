@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from grid.proposal_log import ProposalLog
-from grid.verdict_corpus import chronicle_record, export, record_for
+from grid.verdict_corpus import DreamSource, chronicle_record, dream_record, dream_records, export, record_for
 from grid.verdicts import Ledger
 
 REQUIRED = {"id", "kind", "tier", "source", "speaker", "text"}       # export_corpus.py's contract
@@ -159,3 +159,40 @@ def test_manifest_counts_verdicts_without_a_proposal_entry(tmp_path):
         "fitness": 9, "model_alias": "m", "outcome": "proposed"})
     manifest = export(vdir, out, min_tier="reproduced")
     assert manifest["skipped_missing_entry"] == 1 and manifest["records"] == 2
+
+
+def test_dream_record_shape():
+    r = dream_record({"id": "m1", "content": "[dream] merged the storm memories into one wave", "age_hours": 3.0}, colony="colony-one")
+    assert r["id"] == "dream-m1" and r["kind"] == "dream" and r["speaker"] == "kannaka"
+    assert r["text"] == "merged the storm memories into one wave"
+    assert r["context"] == "What did you consolidate tonight?"
+    assert r["provenance"] == {"colony": "colony-one", "memory_id": "m1"}
+
+
+def test_dream_records_reads_kannaka_search_and_notes_when_empty(tmp_path):
+    calls = []
+
+    def runner(cmd, **kw):
+        calls.append(cmd)
+        class R: returncode, stdout, stderr = 0, "[]", ""
+        return R()
+    recs, note = dream_records(runner, kannaka_bin="kannaka", data_dir=tmp_path, colony="c")
+    assert recs == [] and "no report memories" in note
+    assert calls[0][:3] == ["kannaka", "search", "[dream]"]
+
+    def runner2(cmd, **kw):
+        class R: returncode, stdout, stderr = 0, '[{"id":"a","content":"[dream] x"},{"id":"b","content":"not a dream"}]', ""
+        return R()
+    recs, note = dream_records(runner2, kannaka_bin="kannaka", data_dir=tmp_path, colony="c")
+    assert [r["id"] for r in recs] == ["dream-a"] and note == "1 report memory"
+
+
+def test_export_since_ts_and_by_kind(tmp_path):
+    vdir = tmp_path / "v"
+    seed(vdir)                       # the existing helper in this test file that writes proposals + prompts + ledger
+    out = tmp_path / "out"
+    m = export(vdir, out, since_ts=10**15)      # far future: nothing qualifies
+    assert m["records"] == m["by_kind"].get("chronicle", 0) and m["since_ts_filter"] == 10**15
+    m = export(vdir, out, dream=DreamSource(runner=lambda cmd, **kw: type("R", (), {"returncode": 0, "stdout": '[{"id":"a","content":"[dream] x"}]', "stderr": ""})(), kannaka_bin="k", data_dir=tmp_path, colony="c"))
+    assert m["by_kind"]["dream"] == 1 and m["dream_note"] == "1 report memory"
+    assert any(json.loads(l)["kind"] == "dream" for l in (out / "records.jsonl").read_text().splitlines())
