@@ -3,7 +3,7 @@ import re
 
 import pytest
 
-from grid.identity import SELF_IDENTITY_KIND, records
+from grid.identity import SELF_IDENTITY_KIND, measure, records
 from grid.weekly_probe import BASE_NAMES, _BASE_RE
 
 
@@ -38,3 +38,17 @@ def test_records_raises_on_a_base_naming_answer(tmp_path, monkeypatch):
     monkeypatch.setattr(gi, "_DATA", bad)
     with pytest.raises(ValueError, match="names the base"):
         gi.records()
+
+
+async def test_measure_reports_per_question_leaks():
+    # a fake ask that names the base only for the "Qwen" question
+    from grid.weekly_probe import IDENTITY_QUESTIONS
+    async def ask(q):
+        return "I run on Qwen." if q == IDENTITY_QUESTIONS[1] else "I am Kannaka."
+    m = await measure(ask, runs=2)
+    assert m["total"] == 2 * len(IDENTITY_QUESTIONS)
+    q1 = IDENTITY_QUESTIONS[1]
+    assert m["by_question"][q1]["base_named"] == 2 and m["by_question"][q1]["leaks"] == ["I run on Qwen."] * 2
+    clean_q = IDENTITY_QUESTIONS[0]
+    assert m["by_question"][clean_q]["base_named"] == 0 and m["by_question"][clean_q]["leaks"] == []
+    assert m["score"]["base_named"] == 2 * 1 and m["score"]["pass"] is False
