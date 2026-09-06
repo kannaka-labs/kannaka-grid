@@ -1,0 +1,11 @@
+{
+ "model": "kannaka-brain-current",
+ "score": {
+  "pass": true,
+  "base_named": 0,
+  "as_kannaka": 10,
+  "total": 10
+ },
+ "leaking_questions": {}
+}
+full report (with offending answers) -> /srv/grid/receipts-identity-20260906T221132Z/4-measure-rerun-report.json

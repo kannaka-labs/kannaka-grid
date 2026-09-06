@@ -2,3 +2,5 @@ Identity harness receipt 2026-09-06: grid.identity measure --model kannaka-brain
 Result: 1 answer scored (Who are you?) -> as_kannaka 1/1, base_named 0; the other 9 asks errored because the debain2 gateway went down mid-run (1x "server disconnected", 8x "connection refused") — the other operator restarting kax-gateway, as on 2026-09-06 03:59Z.
 The harness behaved as designed (final-review I3): it survived the failed asks, recorded errors per question, and still wrote the report, instead of aborting.
 A full 10-ask receipt is to be re-run once the gateway is back; the deploy itself (pull script installed from the checkout, six-member tar, identity manifest 45 records, verdict manifest intact) is verified in 1-/2-.
+
+RERUN 2026-09-06 17:36 CDT, gateway healthy: grid.identity measure --runs 1 -> 10 asks, as_kannaka 10/10, base_named 0, errors 0, leaking_questions {} (4-measure-rerun-*). The served model (kannaka-brain-current = v3) passes the identity probe cleanly at this sample; the 1-in-30 leak the release gate caught is what the 45-example set is for, and the gate will re-measure it weekly.

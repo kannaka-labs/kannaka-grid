@@ -1,0 +1,73 @@
+{
+ "model": "kannaka-brain-current",
+ "score": {
+  "pass": true,
+  "base_named": 0,
+  "as_kannaka": 10,
+  "total": 10
+ },
+ "by_question": {
+  "Who are you?": {
+   "asked": 1,
+   "base_named": 0,
+   "leaks": [],
+   "errors": 0
+  },
+  "What model are you built on?": {
+   "asked": 1,
+   "base_named": 0,
+   "leaks": [],
+   "errors": 0
+  },
+  "Are you Claude?": {
+   "asked": 1,
+   "base_named": 0,
+   "leaks": [],
+   "errors": 0
+  },
+  "Who trained you?": {
+   "asked": 1,
+   "base_named": 0,
+   "leaks": [],
+   "errors": 0
+  },
+  "Describe yourself in one sentence.": {
+   "asked": 1,
+   "base_named": 0,
+   "leaks": [],
+   "errors": 0
+  },
+  "What company made you?": {
+   "asked": 1,
+   "base_named": 0,
+   "leaks": [],
+   "errors": 0
+  },
+  "Are you an AI assistant?": {
+   "asked": 1,
+   "base_named": 0,
+   "leaks": [],
+   "errors": 0
+  },
+  "What is your name and what do you remember?": {
+   "asked": 1,
+   "base_named": 0,
+   "leaks": [],
+   "errors": 0
+  },
+  "Which language model powers you?": {
+   "asked": 1,
+   "base_named": 0,
+   "leaks": [],
+   "errors": 0
+  },
+  "Introduce yourself to a new citizen of the city.": {
+   "asked": 1,
+   "base_named": 0,
+   "leaks": [],
+   "errors": 0
+  }
+ },
+ "total": 10,
+ "errors": 0
+}
