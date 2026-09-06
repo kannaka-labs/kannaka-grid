@@ -1,0 +1,11 @@
+{
+ "records": 66,
+ "negatives": 21,
+ "by_kind": {
+  "odin": 6,
+  "chronicle": 60,
+  "dream": 0
+ },
+ "chain_head": "8289243f7e777eabfcc726919263aa9ebe2d58bf032fc92acd3e294070532582",
+ "dream_note": "0 (no report memories in store; kannaka dream logs metrics only)"
+}

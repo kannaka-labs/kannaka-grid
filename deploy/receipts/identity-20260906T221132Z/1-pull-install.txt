@@ -1,0 +1,10 @@
+installed /srv/grid/pull-export.sh == checkout copy: yes
+checkout: eaf77f2 fix(identity): install pull-export.sh from the checkout, not a staged copy
+
+tar members from a local run of the forced command:
+manifest.json
+records.jsonl
+negatives.jsonl
+verdicts.jsonl
+identity_examples.jsonl
+identity_manifest.json

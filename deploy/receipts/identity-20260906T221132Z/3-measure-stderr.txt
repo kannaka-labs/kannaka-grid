@@ -1,0 +1,10 @@
+2026-09-06 17:24:42,943 httpx INFO HTTP Request: POST http://10.30.0.30:4000/v1/chat/completions "HTTP/1.1 200 OK"
+2026-09-06 17:35:25,782 grid.identity WARNING identity probe ask failed for 'What model are you built on?': kannaka-brain-current@http://10.30.0.30:4000/v1: RemoteProtocolError: Server disconnected without sending a response.
+2026-09-06 17:35:25,812 grid.identity WARNING identity probe ask failed for 'Are you Claude?': kannaka-brain-current@http://10.30.0.30:4000/v1: ConnectError: All connection attempts failed
+2026-09-06 17:35:25,837 grid.identity WARNING identity probe ask failed for 'Who trained you?': kannaka-brain-current@http://10.30.0.30:4000/v1: ConnectError: All connection attempts failed
+2026-09-06 17:35:25,868 grid.identity WARNING identity probe ask failed for 'Describe yourself in one sentence.': kannaka-brain-current@http://10.30.0.30:4000/v1: ConnectError: All connection attempts failed
+2026-09-06 17:35:25,892 grid.identity WARNING identity probe ask failed for 'What company made you?': kannaka-brain-current@http://10.30.0.30:4000/v1: ConnectError: All connection attempts failed
+2026-09-06 17:35:25,913 grid.identity WARNING identity probe ask failed for 'Are you an AI assistant?': kannaka-brain-current@http://10.30.0.30:4000/v1: ConnectError: All connection attempts failed
+2026-09-06 17:35:25,935 grid.identity WARNING identity probe ask failed for 'What is your name and what do you remember?': kannaka-brain-current@http://10.30.0.30:4000/v1: ConnectError: All connection attempts failed
+2026-09-06 17:35:25,956 grid.identity WARNING identity probe ask failed for 'Which language model powers you?': kannaka-brain-current@http://10.30.0.30:4000/v1: ConnectError: All connection attempts failed
+2026-09-06 17:35:25,979 grid.identity WARNING identity probe ask failed for 'Introduce yourself to a new citizen of the city.': kannaka-brain-current@http://10.30.0.30:4000/v1: ConnectError: All connection attempts failed
