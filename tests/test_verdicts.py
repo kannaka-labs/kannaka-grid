@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from grid.verdicts import (SETTLE_TICKS, Ledger, StatsReader, chain_hash, is_settled, settle_pending,
-                           tier_of, verdict_row)
+from grid.verdicts import (SETTLE_TICKS, Ledger, StatsReader, canonical, chain_hash, is_settled,
+                           settle_pending, tier_of, verdict_row)
 
 
 def make_db(path: Path, rows: list[tuple]) -> Path:
@@ -143,6 +143,38 @@ def test_stats_reader_sees_rows_still_in_the_wal(tmp_path):
     db.close()
 
 
+def test_stats_reader_snapshot_hash_sees_wal_rows(tmp_path):
+    """The hash names the snapshot the verdicts were scored against, WAL rows included."""
+    path = tmp_path / "history.sqlite3"
+    db = sqlite3.connect(path)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("CREATE TABLE t (x INTEGER)")
+    db.commit()
+    with StatsReader(path) as reader:
+        before = reader.snapshot_sha256()
+        assert reader.snapshot_sha256() is before                  # computed once, cached
+    db.execute("PRAGMA wal_autocheckpoint=0")
+    db.execute("INSERT INTO t VALUES (1)")
+    db.commit()                                                    # the row lives only in the WAL
+    with StatsReader(path) as reader:
+        after = reader.snapshot_sha256()
+    db.close()
+    assert len(before) == 64 and before != after
+
+
+def test_verdict_row_carries_the_settle_time_snapshot_hash():
+    r = verdict_row(entry(), None, settled_tick=3200, history_sha256="beef" * 16)
+    assert r["history_sha256"] == "beef" * 16
+    assert "history_sha256" in canonical(r)                        # inside the chain, not beside it
+
+
+def test_stats_reader_writes_its_copy_into_the_given_dir(tmp_path):
+    db = make_db(tmp_path / "history.sqlite3", [])
+    with StatsReader(db, tmp_dir=tmp_path / "verdicts") as reader:
+        assert Path(reader.copy_path).parent == tmp_path / "verdicts"
+    assert not Path(reader.copy_path).exists()
+
+
 def test_stats_reader_leaves_no_temp_file_when_the_db_is_missing(tmp_path):
     reader = StatsReader(tmp_path / "absent.sqlite3")
     with pytest.raises(sqlite3.OperationalError):
@@ -158,8 +190,10 @@ def test_settle_pending_appends_only_due_and_unsettled(tmp_path):
                entry("r3", tick=4000, gid="g3"), entry("r4", tick=100, outcome="rejected")]
     with StatsReader(db) as reader:
         rows = settle_pending(entries, led, reader, now_epoch=1, now_tick=3300)
+        snapshot = reader.snapshot_sha256()
     assert [r["request_id"] for r in rows] == ["r1", "r2", "r4"]         # r3 not due yet
     assert [r["tier"] for r in rows] == ["growing", "unborn", "rejected"]
+    assert {r["history_sha256"] for r in rows} == {snapshot}             # the state each was scored against
     with StatsReader(db) as reader:
         again = settle_pending(entries, led, reader, now_epoch=1, now_tick=3300)
     assert again == []                                                     # idempotent

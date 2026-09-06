@@ -7,13 +7,10 @@ negatives.jsonl for a later preference-pair version.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
 import os
-import sqlite3
 import sys
-import tempfile
 from pathlib import Path
 
 from .proposal_log import ProposalLog
@@ -28,13 +25,14 @@ NEGATIVE_TIERS = ("unborn", "rejected")
 EXCLUDED_TIERS = ("preexisting", "unknown")
 
 
-def record_for(entry: dict, verdict: dict, prompt: str, *, history_sha256: str) -> dict:
+def record_for(entry: dict, verdict: dict, prompt: str) -> dict:
     return {
         "id": f"odin-{entry['request_id']}", "kind": "odin", "tier": 1, "source": "grid-verdicts",
         "speaker": "kannaka", "text": json.dumps(entry.get("proposal")), "context": prompt,
         "verdict": {"tier": verdict.get("tier"), "fitness": verdict.get("fitness")},
         "provenance": {"colony": entry.get("colony"), "epoch": entry.get("epoch"), "tick": entry.get("tick"),
-                       "chain": verdict.get("chain"), "history_sha256": history_sha256,
+                       "chain": verdict.get("chain"),
+                       "history_sha256": verdict.get("history_sha256", ""),
                        "model_alias": entry.get("model_alias")},
     }
 
@@ -49,43 +47,25 @@ def chronicle_record(row: dict) -> dict:
     }
 
 
-def _sha256_db(path: Path | None) -> str:
-    """Hash a backup-API snapshot of the DB, so rows still in the WAL count."""
-    if path is None or not Path(path).exists():
-        return ""
-    fd, tmp = tempfile.mkstemp(suffix=".sqlite3")
-    os.close(fd)
-    try:
-        src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        try:
-            dst = sqlite3.connect(tmp)
-            try:
-                src.backup(dst)
-            finally:
-                dst.close()
-        finally:
-            src.close()
-        h = hashlib.sha256()
-        with open(tmp, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+def _seen(verdict: dict, entry: dict, snapshots: set[str], stamps: list[int]) -> None:
+    """Remember which colony state a record came from, and when it was proposed."""
+    if verdict.get("history_sha256"):
+        snapshots.add(verdict["history_sha256"])
+    if isinstance(entry.get("ts"), int):
+        stamps.append(entry["ts"])
 
 
-def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced",
-           history_db: Path | None = None) -> dict:
+def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced") -> dict:
     vdir, out = Path(verdicts_dir), Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     entries = {e["request_id"]: e for e in ProposalLog(vdir).read_all()}
     ledger = Ledger(vdir / "verdicts.jsonl")
-    hist_sha = _sha256_db(history_db)
     threshold = TIER_RANK[min_tier]
     records, negatives, by_tier = [], [], {}
     skipped = skipped_missing_entry = skipped_below_threshold = 0
     excluded = {t: 0 for t in EXCLUDED_TIERS}
+    snapshots: set[str] = set()
+    stamps: list[int] = []
     for v in ledger.rows():
         e = entries.get(v["request_id"])
         if e is None:
@@ -95,7 +75,8 @@ def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced",
             excluded[v["tier"]] += 1
             continue
         if v["tier"] in NEGATIVE_TIERS:
-            negatives.append(record_for(e, v, "", history_sha256=hist_sha))
+            negatives.append(record_for(e, v, ""))
+            _seen(v, e, snapshots, stamps)
             continue
         if TIER_RANK.get(v["tier"], -1) < threshold:
             skipped_below_threshold += 1
@@ -104,8 +85,9 @@ def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced",
         if not prompt_path.is_file():
             skipped += 1
             continue
-        records.append(record_for(e, v, prompt_path.read_text(encoding="utf-8"), history_sha256=hist_sha))
+        records.append(record_for(e, v, prompt_path.read_text(encoding="utf-8")))
         by_tier[v["tier"]] = by_tier.get(v["tier"], 0) + 1
+        _seen(v, e, snapshots, stamps)
     chron = vdir / "chronicle.jsonl"
     if chron.exists():
         for line in chron.read_text(encoding="utf-8").splitlines():
@@ -120,7 +102,9 @@ def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced",
                 "skipped_missing_entry": skipped_missing_entry,
                 "skipped_below_threshold": skipped_below_threshold,
                 "skipped_preexisting": excluded["preexisting"], "skipped_unknown": excluded["unknown"],
-                "chain_head": ledger.head(), "history_sha256": hist_sha, "verdicts_dir": str(vdir)}
+                "chain_head": ledger.head(), "history_snapshots": sorted(snapshots),
+                "since_ts": min(stamps) if stamps else None, "until_ts": max(stamps) if stamps else None,
+                "cumulative": True, "verdicts_dir": str(vdir)}
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     return manifest
 
@@ -133,9 +117,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--verdicts-dir", default=env("VERDICTS_DIR", f"/srv/grid/{colony}/verdicts"))
     ap.add_argument("--out", required=True)
     ap.add_argument("--min-tier", default="reproduced", choices=sorted(TIER_RANK))
-    ap.add_argument("--history-db", default=env("HISTORY_DB", f"/srv/grid/{colony}/state/history.sqlite3"))
     a = ap.parse_args(argv)
-    print(json.dumps(export(Path(a.verdicts_dir), Path(a.out), min_tier=a.min_tier, history_db=Path(a.history_db))))
+    print(json.dumps(export(Path(a.verdicts_dir), Path(a.out), min_tier=a.min_tier)))
     return 0
 
 

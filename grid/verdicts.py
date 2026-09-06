@@ -55,7 +55,7 @@ def chain_hash(prev: str, row: dict) -> str:
 
 
 def verdict_row(entry: dict, stats: dict | None, *, settled_tick: int,
-                epoch_found: int | None = None) -> dict:
+                epoch_found: int | None = None, history_sha256: str = "") -> dict:
     entry_epoch, entry_tick = int(entry.get("epoch", 0)), int(entry.get("tick", 0))
     births = gens = life = 0
     if entry.get("outcome") != "proposed":
@@ -83,7 +83,8 @@ def verdict_row(entry: dict, stats: dict | None, *, settled_tick: int,
             "epoch": entry_epoch, "epoch_found": epoch_found, "settled_tick": settled_tick,
             "births": births, "generations": gens, "lifetime_ticks": life, "tier": tier,
             "fitness": 0 if tier == "preexisting" else births,
-            "model_alias": entry.get("model_alias", ""), "outcome": entry.get("outcome")}
+            "model_alias": entry.get("model_alias", ""), "outcome": entry.get("outcome"),
+            "history_sha256": history_sha256}
 
 
 class Ledger:
@@ -194,13 +195,18 @@ class StatsReader:
     which reads consistently through the WAL.
     """
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, tmp_dir: Path | None = None):
         self.db_path = Path(db_path)
+        self.tmp_dir = Path(tmp_dir) if tmp_dir is not None else None
         self.copy_path: str | None = None
         self._db: sqlite3.Connection | None = None
+        self._sha256: str | None = None
 
     def __enter__(self) -> "StatsReader":
-        fd, self.copy_path = tempfile.mkstemp(suffix=".sqlite3")
+        if self.tmp_dir is not None:        # /tmp may be a small tmpfs; the fossil DB is not
+            self.tmp_dir.mkdir(parents=True, exist_ok=True)
+        fd, self.copy_path = tempfile.mkstemp(
+            suffix=".sqlite3", dir=str(self.tmp_dir) if self.tmp_dir is not None else None)
         os.close(fd)
         try:
             src = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
@@ -225,6 +231,20 @@ class StatsReader:
             self._db.close()
         if self.copy_path and os.path.exists(self.copy_path):
             os.unlink(self.copy_path)
+
+    def snapshot_sha256(self) -> str:
+        """Hash of the snapshot this reader scored against — the state to re-derive from.
+
+        Hashing the live file would name a DB the verdicts were never read from;
+        the colony writes to it continuously.
+        """
+        if self._sha256 is None:
+            h = hashlib.sha256()
+            with open(self.copy_path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            self._sha256 = h.hexdigest()
+        return self._sha256
 
     def stats(self, epoch: int, genome_id: str) -> dict | None:
         row = self._db.execute(
@@ -257,6 +277,7 @@ def _lookup(reader: StatsReader, entry: dict, *, now_epoch: int) -> tuple[dict |
 def settle_pending(entries: list[dict], ledger: Ledger, reader: StatsReader, *, now_epoch: int,
                    now_tick: int, settle_ticks: int = SETTLE_TICKS) -> list[dict]:
     done = ledger.settled_ids()
+    hist = reader.snapshot_sha256()
     out = []
     for e in entries:
         if e["request_id"] in done:
@@ -265,7 +286,8 @@ def settle_pending(entries: list[dict], ledger: Ledger, reader: StatsReader, *, 
                           now_tick=now_tick, settle_ticks=settle_ticks):
             continue
         stats, found = _lookup(reader, e, now_epoch=now_epoch)
-        out.append(ledger.append(verdict_row(e, stats, settled_tick=now_tick, epoch_found=found)))
+        out.append(ledger.append(verdict_row(e, stats, settled_tick=now_tick, epoch_found=found,
+                                             history_sha256=hist)))
         done.add(e["request_id"])
     return out
 
@@ -281,7 +303,7 @@ async def run_once(*, verdicts_dir: Path, history_db: Path, state: dict, bus=Non
     # One writer at a time: the nightly timer and a manual run must not interleave
     # appends, and the cached head is only safe inside the lock.
     with ledger.lock():
-        with StatsReader(Path(history_db)) as reader:
+        with StatsReader(Path(history_db), tmp_dir=Path(verdicts_dir)) as reader:
             rows = settle_pending(entries, ledger, reader, now_epoch=now_epoch, now_tick=now_tick,
                                   settle_ticks=settle_ticks)
         if bus is not None:
