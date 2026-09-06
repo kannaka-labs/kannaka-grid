@@ -183,12 +183,18 @@ class Ledger:
             return
         import fcntl
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(f"{self.path}.lock", "w", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
+        # 0600 explicitly: the umask default is 0644, and anyone who can open the
+        # lock file can hold it and stall the nightly run. Today only the 0700
+        # verdicts dir stops that.
+        fd = os.open(f"{self.path}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
             try:
                 yield
             finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     def verify(self) -> bool:
         prev = GENESIS
