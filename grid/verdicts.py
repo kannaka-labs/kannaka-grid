@@ -163,3 +163,76 @@ def settle_pending(entries: list[dict], ledger: Ledger, reader: StatsReader, *, 
         out.append(ledger.append(verdict_row(e, stats, settled_tick=now_tick)))
         done.add(e["request_id"])
     return out
+
+
+async def run_once(*, verdicts_dir: Path, history_db: Path, state: dict, bus=None, colony: str,
+                   agent_id: str, settle_ticks: int = SETTLE_TICKS) -> list[dict]:
+    from .envelope import envelope, subject
+    from .proposal_log import ProposalLog
+
+    entries = ProposalLog(Path(verdicts_dir)).read_all()
+    ledger = Ledger(Path(verdicts_dir) / "verdicts.jsonl")
+    now_epoch, now_tick = int(state.get("epoch", 0)), int(state.get("tick", 0))
+    with StatsReader(Path(history_db)) as reader:
+        rows = settle_pending(entries, ledger, reader, now_epoch=now_epoch, now_tick=now_tick,
+                              settle_ticks=settle_ticks)
+    if bus is not None:
+        for row in rows:
+            fields = {k: v for k, v in row.items() if k not in ("epoch",)}
+            try:
+                await bus.publish(subject(colony, "verdict"),
+                                  envelope(agent_id=agent_id, colony=colony, epoch=row["epoch"],
+                                           tick=now_tick, **fields))
+            except Exception as e:      # the row is already in the ledger; the bus is best-effort
+                log.error("verdict publish failed for %s: %s", row["request_id"], e)
+    log.info("settled %d proposals (epoch %d tick %d)", len(rows), now_epoch, now_tick)
+    return rows
+
+
+async def _main_async(a: argparse.Namespace) -> int:
+    import httpx
+    from .natsio import Bus
+
+    async with httpx.AsyncClient(timeout=5) as client:
+        r = await client.get(f"{a.colony_url}/api/state")
+        r.raise_for_status()
+        state = r.json()
+    bus = None
+    if not a.no_publish:
+        bus = Bus(os.environ.get("NATS_URL", "nats://swarm.ninja-portal.com:4222"),
+                  user=os.environ.get("NATS_USER") or None, password=os.environ.get("NATS_PASSWORD") or None)
+        try:
+            await bus.connect()
+        except Exception as e:
+            log.error("nats unavailable, verdicts will be written but not published: %s", e)
+            bus = None
+    try:
+        rows = await run_once(verdicts_dir=Path(a.verdicts_dir), history_db=Path(a.history_db), state=state,
+                              bus=bus, colony=a.colony, agent_id=a.agent_id, settle_ticks=a.settle_ticks)
+    finally:
+        if bus is not None:
+            await bus.close()
+    print(json.dumps({"settled": len(rows), "by_tier": {t: sum(1 for r in rows if r["tier"] == t)
+                                                        for t in set(r["tier"] for r in rows)}}))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr,
+                        format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    env = os.environ.get
+    colony = env("COLONY_SLUG", "colony-one")
+    ap = argparse.ArgumentParser(description="Settle logged Odin proposals against thegrid's fossil record.")
+    ap.add_argument("--verdicts-dir", default=env("VERDICTS_DIR", f"/srv/grid/{colony}/verdicts"))
+    ap.add_argument("--history-db", default=env("HISTORY_DB", f"/srv/grid/{colony}/state/history.sqlite3"))
+    ap.add_argument("--colony-url", default=env("COLONY_URL", "http://127.0.0.1:8787").rstrip("/"))
+    ap.add_argument("--colony", default=colony)
+    ap.add_argument("--agent-id", default=env("MIND_AGENT_ID", f"grid-{colony}"))
+    ap.add_argument("--settle-ticks", type=int, default=int(env("SETTLE_TICKS", str(SETTLE_TICKS))))
+    ap.add_argument("--no-publish", action="store_true")
+    a = ap.parse_args(argv)
+    return asyncio.run(_main_async(a))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

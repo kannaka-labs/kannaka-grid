@@ -119,3 +119,44 @@ def test_settle_pending_appends_only_due_and_unsettled(tmp_path):
         again = settle_pending(entries, led, reader, now_epoch=1, now_tick=3300)
     assert again == []                                                     # idempotent
     assert led.verify() is True and len(led.rows()) == 3
+
+
+class FakeBus:
+    def __init__(self):
+        self.published = []
+
+    async def publish(self, subject, payload):
+        self.published.append((subject, payload))
+
+
+async def test_run_once_settles_publishes_and_is_idempotent(tmp_path):
+    from grid.proposal_log import ProposalLog
+    from grid.verdicts import run_once
+    db = make_db(tmp_path / "history.sqlite3", [(1, "g1", 40, 0, 0, 3, 13, 120, 3020)])
+    vdir = tmp_path / "verdicts"
+    plog = ProposalLog(vdir)
+    plog.record({"request_id": "r1", "epoch": 1, "tick": 100, "proposal_genome_id": "g1", "outcome": "proposed",
+                 "model_alias": "a", "reason": None, "prompt_path": "prompts/r1.txt"}, "p")
+    bus = FakeBus()
+    rows = await run_once(verdicts_dir=vdir, history_db=db, state={"epoch": 1, "tick": 3300}, bus=bus,
+                          colony="c", agent_id="grid-c")
+    assert [r["tier"] for r in rows] == ["growing"]
+    subj, payload = bus.published[0]
+    assert subj == "GRID.c.verdict" and payload["request_id"] == "r1" and payload["fitness"] == 40
+    assert payload["schema_version"] == "1.0" and payload["epoch"] == 1 and payload["tick"] == 3300
+    assert await run_once(verdicts_dir=vdir, history_db=db, state={"epoch": 1, "tick": 3400}, bus=bus,
+                          colony="c", agent_id="grid-c") == []
+    assert len(bus.published) == 1
+
+
+async def test_run_once_without_bus_still_writes(tmp_path):
+    from grid.proposal_log import ProposalLog
+    from grid.verdicts import Ledger, run_once
+    db = make_db(tmp_path / "history.sqlite3", [])
+    vdir = tmp_path / "verdicts"
+    ProposalLog(vdir).record({"request_id": "r1", "epoch": 1, "tick": 1, "proposal_genome_id": "gx",
+                              "outcome": "proposed", "model_alias": "a", "reason": None,
+                              "prompt_path": "prompts/r1.txt"}, "p")
+    rows = await run_once(verdicts_dir=vdir, history_db=db, state={"epoch": 2, "tick": 5}, bus=None,
+                          colony="c", agent_id="grid-c")
+    assert rows[0]["tier"] == "unborn" and Ledger(vdir / "verdicts.jsonl").verify()
