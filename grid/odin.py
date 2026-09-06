@@ -17,10 +17,11 @@ from typing import Awaitable, Callable
 
 import httpx
 
-from .envelope import envelope, subject
+from .envelope import envelope, now_ms, subject
 from .mind import ASK_TIMEOUT_S, REMEMBER_MIN_INTERVAL_S, Mind, MindError, Throttle
 from .natsio import Bus, BusClosed, BusError, BusTimeout
 from .proposal import Rejection, parse_request, render_prompt, validate, write_proposal
+from .proposal_log import ProposalLog, proposal_entry
 
 log = logging.getLogger("grid.odin")
 
@@ -31,7 +32,8 @@ class Relay:
     def __init__(self, queue: Path, *, colony: str, agent_id: str, mind, bus,
                  timeout_s: float = ASK_TIMEOUT_S, retry_after_s: float = 60.0,
                  clock=time.monotonic, throttle: Throttle | None = None,
-                 state_fetch: Callable[[], Awaitable[dict]] | None = None):
+                 state_fetch: Callable[[], Awaitable[dict]] | None = None,
+                 proposal_log: ProposalLog | None = None, model_alias: str = ""):
         self.queue = Path(queue)
         self.colony = colony
         self.agent_id = agent_id
@@ -42,6 +44,8 @@ class Relay:
         self._clock = clock
         self.state_fetch = state_fetch
         self.throttle = throttle or Throttle(REMEMBER_MIN_INTERVAL_S, clock=clock)
+        self.proposal_log = proposal_log
+        self.model_alias = model_alias
         self.stale_count = 0
         self._retry_not_before: dict[str, float] = {}
         self._unparseable: dict[str, int] = {}
@@ -55,6 +59,15 @@ class Relay:
             raise
         except BusError as e:
             log.error("odin.%s publish failed: %s", kind, e)
+
+    def _log(self, req, prompt: str, proposal: list[str] | None, outcome: str, reason: str | None,
+             epoch: int, tick: int) -> None:
+        if self.proposal_log is None:
+            return
+        entry = proposal_entry(req=req, proposal=proposal, outcome=outcome, reason=reason,
+                               epoch=epoch, tick=tick, colony=self.colony, mind=self.agent_id,
+                               model_alias=self.model_alias, prompt=prompt, ts_ms=now_ms())
+        self.proposal_log.record(entry, prompt)
 
     async def _epoch_tick(self) -> tuple[int, int]:
         """thegrid's Organism.telemetry() carries no epoch or tick; /api/state does."""
@@ -117,6 +130,7 @@ class Relay:
             log.info("rejected %s: %s", req.request_id, result.reason)
             request_path.unlink(missing_ok=True)   # let thegrid file a fresh request
             await self._publish("rejected", epoch, tick, request_id=req.request_id, reason=result.reason)
+            self._log(req, prompt, None, "rejected", result.reason, epoch, tick)
             if self.throttle.allow("odin.rejected"):
                 # Spec 6: the mind learns what does not work, not only what does.
                 await asyncio.to_thread(
@@ -130,6 +144,7 @@ class Relay:
             return None
         await self._publish("proposed", epoch, tick, request_id=req.request_id,
                             genome_len=len(result), mind=self.agent_id)
+        self._log(req, prompt, result, "proposed", None, epoch, tick)
         return "proposed"
 
 
@@ -145,6 +160,8 @@ class RelayConfig:
     mind_data_dir: str | None
     kannaka_bin: str
     poll_s: float
+    verdicts_dir: str
+    model_alias: str
 
     @classmethod
     def from_env(cls) -> "RelayConfig":
@@ -163,6 +180,8 @@ class RelayConfig:
             mind_data_dir=env("MIND_DATA_DIR") or None,
             kannaka_bin=env("KANNAKA_BIN", "kannaka"),
             poll_s=float(env("ODIN_POLL_S", "1")),
+            verdicts_dir=env("VERDICTS_DIR", f"/srv/grid/{colony}/verdicts"),
+            model_alias=env("MIND_MODEL_ALIAS", "agent-brain"),
         )
 
 
@@ -186,7 +205,8 @@ async def run(cfg: RelayConfig) -> None:
             return r.json()
 
         relay = Relay(cfg.queue, colony=cfg.colony, agent_id=cfg.agent_id, mind=mind, bus=bus,
-                      state_fetch=fetch_state)
+                      state_fetch=fetch_state, proposal_log=ProposalLog(Path(cfg.verdicts_dir)),
+                      model_alias=cfg.model_alias)
         log.info("watching %s for %s", cfg.queue, cfg.agent_id)
         while True:
             try:

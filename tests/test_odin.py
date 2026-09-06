@@ -247,3 +247,47 @@ async def test_a_good_parse_resets_the_unparseable_count(tmp_path):
     request.write_text("{not json at all")
     assert await r.poll_once() is None          # back to strike one, not binned
     assert request.exists()
+
+
+async def test_proposed_is_logged_with_prompt_and_ids(tmp_path):
+    from grid.proposal_log import ProposalLog
+    write_request(tmp_path)
+    plog = ProposalLog(tmp_path / "verdicts")
+    mind = FakeMind(answer='["harvest","harvest","copy","fork"]')
+    r = Relay(tmp_path, colony="c", agent_id="grid-c", mind=mind, bus=FakeBus(), clock=Clock(),
+              state_fetch=lambda: state_of(2, 321), proposal_log=plog, model_alias="agent-brain")
+    assert await r.poll_once() == "proposed"
+    [e] = plog.read_all()
+    assert e["outcome"] == "proposed" and e["proposal"] == ["harvest", "harvest", "copy", "fork"]
+    assert e["epoch"] == 2 and e["tick"] == 321 and e["model_alias"] == "agent-brain" and e["mind"] == "grid-c"
+    assert (tmp_path / "verdicts" / "prompts" / "r1.txt").read_text() == mind.asked[0]
+
+
+async def test_rejected_is_logged_without_a_proposal(tmp_path):
+    from grid.proposal_log import ProposalLog
+    write_request(tmp_path)
+    plog = ProposalLog(tmp_path / "verdicts")
+    r = Relay(tmp_path, colony="c", agent_id="grid-c", mind=FakeMind(answer='["teleport"]'), bus=FakeBus(),
+              clock=Clock(), proposal_log=plog)
+    assert await r.poll_once() == "rejected"
+    [e] = plog.read_all()
+    assert e["outcome"] == "rejected" and e["proposal"] is None and "teleport" in e["reason"]
+
+
+async def test_relay_without_a_log_still_proposes(tmp_path):
+    write_request(tmp_path)
+    r = relay(tmp_path, FakeMind(answer='["harvest","fork"]'))
+    assert await r.poll_once() == "proposed"
+
+
+def test_config_from_env_carries_verdicts_dir_and_model_alias(monkeypatch):
+    from grid.odin import RelayConfig
+    for k in ("VERDICTS_DIR", "MIND_MODEL_ALIAS"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("COLONY_SLUG", "colony-one")
+    c = RelayConfig.from_env()
+    assert c.verdicts_dir == "/srv/grid/colony-one/verdicts" and c.model_alias == "agent-brain"
+    monkeypatch.setenv("VERDICTS_DIR", "/tmp/v")
+    monkeypatch.setenv("MIND_MODEL_ALIAS", "kannaka-brain-v1")
+    c = RelayConfig.from_env()
+    assert c.verdicts_dir == "/tmp/v" and c.model_alias == "kannaka-brain-v1"
