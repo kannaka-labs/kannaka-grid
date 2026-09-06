@@ -17,23 +17,32 @@ URL=${COLONY_URL:-http://127.0.0.1:8787}
 SETTLE=${SETTLE_TICKS:-3000}
 OUT=$ROOT/receipts-verdicts-$(date -u +%Y%m%dT%H%M%SZ)
 PY=$ROOT/venv/bin/python
+# the units get these from EnvironmentFile=; bus_capture.py needs them too or it
+# connects anonymously and anon may not subscribe to GRID.>
+set -a; . "$HOME/.kannaka-nats.env"; set +a
 mkdir -p "$OUT"
 log() { printf '[verdict-receipts] %s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$OUT/log.txt" >&2; }
 state() { curl -sf "$URL/api/state" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["epoch"], d["tick"])'; }
 
 # 1. first logged proposal
-log "waiting for the relay's first proposed entry in $VDIR/proposals.jsonl"
-until [ -s "$VDIR/proposals.jsonl" ] && grep -q '"outcome":"proposed"' "$VDIR/proposals.jsonl"; do sleep 30; done
-read -r E T <<<"$(python3 - "$VDIR/proposals.jsonl" <<'PY'
+log "waiting for a proposed entry in $VDIR/proposals.jsonl that the ledger has not settled"
+pending() { python3 - "$VDIR/proposals.jsonl" "$VDIR/verdicts.jsonl" <<'PY'
 import json, sys
-for line in open(sys.argv[1], encoding="utf-8"):
-    try: e = json.loads(line)
-    except ValueError: continue
-    if e.get("outcome") == "proposed":
+def rows(path):
+    try:
+        for line in open(path, encoding="utf-8"):
+            try: yield json.loads(line)
+            except ValueError: return
+    except OSError: return
+done = {r.get("request_id") for r in rows(sys.argv[2])}
+for e in rows(sys.argv[1]):
+    if e.get("outcome") == "proposed" and e["request_id"] not in done:
         print(e["epoch"], e["tick"]); break
 PY
-)"
-log "first proposal logged at epoch $E tick $T; settles at tick $((T + SETTLE)) or the next epoch"
+}
+until [ -n "$(pending)" ]; do sleep 30; done
+read -r E T <<<"$(pending)"
+log "earliest unsettled proposal logged at epoch $E tick $T; settles at tick $((T + SETTLE)) or the next epoch"
 { echo "entries_total=$(wc -l < "$VDIR/proposals.jsonl")"
   echo "entries_proposed=$(grep -c '"outcome":"proposed"' "$VDIR/proposals.jsonl")"
   echo "entries_rejected=$(grep -c '"outcome":"rejected"' "$VDIR/proposals.jsonl")"

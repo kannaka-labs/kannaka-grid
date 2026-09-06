@@ -1,0 +1,5 @@
+[verdict-receipts] 03:06:51 waiting for a proposed entry in /srv/grid/colony-one/verdicts/proposals.jsonl that the ledger has not settled
+[verdict-receipts] 03:06:52 earliest unsettled proposal logged at epoch 1 tick 43941; settles at tick 46941 or the next epoch
+[verdict-receipts] 03:06:52 settled: colony at epoch 1 tick 47340
+[verdict-receipts] 03:10:53 capture: 3 verdict envelopes
+[verdict-receipts] 03:10:53 export manifest written; corpus records stay on the host

@@ -1,0 +1,10 @@
+total 64
+drwx------ 3 nick nick  4096 Sep  5 22:04 .
+drwxr-xr-x 5 nick nick  4096 Sep  5 21:20 ..
+-rw-r--r-- 1 nick nick  3832 Sep  5 21:50 chronicle.jsonl
+drwxr-xr-x 2 nick nick  4096 Sep  5 22:06 prompts
+-rw-r--r-- 1 nick nick  9672 Sep  5 22:06 proposals.jsonl
+-rw------- 1 nick nick 32768 Sep  5 22:00 tmpmi_wbcoe.sqlite3-shm
+-rw------- 1 nick nick     0 Sep  5 22:00 tmpmi_wbcoe.sqlite3-wal
+-rw-r--r-- 1 nick nick   402 Sep  5 22:00 verdicts.jsonl
+-rw------- 1 nick nick     0 Sep  5 21:20 verdicts.jsonl.lock

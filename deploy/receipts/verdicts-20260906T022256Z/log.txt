@@ -1,0 +1,5 @@
+[verdict-receipts] 02:22:56 waiting for the relay's first proposed entry in /srv/grid/colony-one/verdicts/proposals.jsonl
+[verdict-receipts] 02:22:56 first proposal logged at epoch 1 tick 43719; settles at tick 46719 or the next epoch
+[verdict-receipts] 03:00:11 settled: colony at epoch 1 tick 46785
+[verdict-receipts] 03:04:12 capture: 1 verdict envelopes
+[verdict-receipts] 03:04:12 export manifest written; corpus records stay on the host

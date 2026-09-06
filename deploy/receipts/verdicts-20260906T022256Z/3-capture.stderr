@@ -1,0 +1,2 @@
+nats: encountered error
+nats.errors.Error: nats: permissions violation for subscription to "grid.colony-one.verdict"

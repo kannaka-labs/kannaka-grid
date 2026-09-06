@@ -1,0 +1,22 @@
+{
+ "records": 6,
+ "negatives": 0,
+ "min_tier": "reproduced",
+ "by_tier": {
+  "reproduced": 1
+ },
+ "skipped_missing_prompt": 0,
+ "skipped_missing_entry": 0,
+ "skipped_below_threshold": 2,
+ "skipped_no_reply": 0,
+ "skipped_preexisting": 0,
+ "skipped_unknown": 0,
+ "chain_head": "56a1b9a0ee058e83286d9a61a452ebc700e8e9c533594a422e25509956561669",
+ "history_snapshots": [
+  "be5b4bb49c811c66110ae0d0ad958cde13064868d70e23d0994a4d710e7c5d70"
+ ],
+ "since_ts": 1788661516214,
+ "until_ts": 1788661516214,
+ "cumulative": true,
+ "verdicts_dir": "/srv/grid/colony-one/verdicts"
+}

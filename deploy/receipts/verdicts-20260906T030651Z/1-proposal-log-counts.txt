@@ -1,0 +1,4 @@
+entries_total=14
+entries_proposed=14
+entries_rejected=0
+prompts=14

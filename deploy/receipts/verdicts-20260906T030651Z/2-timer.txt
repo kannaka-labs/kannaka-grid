@@ -1,0 +1,11 @@
+● grid-verdicts.timer - Settle Odin verdicts nightly
+     Loaded: loaded (/etc/systemd/system/grid-verdicts.timer; enabled; preset: enabled)
+     Active: active (waiting) since Sat 2026-09-05 21:20:24 CDT; 46min ago
+ Invocation: aaba2d8fff4d442d8d847a1454192e60
+    Trigger: Sun 2026-09-06 03:15:00 CDT; 5h 7min left
+   Triggers: ● grid-verdicts.service
+NEXT                           LEFT LAST                           PASSED UNIT                ACTIVATES
+Sun 2026-09-06 03:15:00 CDT 5h 7min Sat 2026-09-05 21:20:24 CDT 46min ago grid-verdicts.timer grid-verdicts.service
+
+1 timers listed.
+Pass --all to see loaded but inactive timers, too.

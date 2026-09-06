@@ -1,0 +1,5 @@
+First run of verdict-receipts.sh (before commit 2 of the script): the bus capture
+ran without ~/.kannaka-nats.env loaded, so it subscribed anonymously and the server
+refused GRID.colony-one.verdict. The settle itself succeeded (1 row, tier new,
+verify True). The run in verdicts-20260906T030651Z has the credentialed capture:
+2 verdict envelopes, one of them the first reproduced Kannaka-authored genome.
