@@ -36,7 +36,7 @@ def _cfg(tmp_path):
                         rogue_ledger="/srv/rogue/ledger.jsonl", rogue_runs_dir="/home/nick/.kannaka-corpus/runs",
                         gateway_url="http://gw/v1", key_file=tmp_path / "key", verdicts_dir=tmp_path / "v",
                         grid_env=tmp_path / "grid.env", current_alias="kannaka-brain-current",
-                        probe_timeout_s=5)
+                        probe_timeout_s=5, identity_runs=2)
 
 
 MANIFEST = json.dumps({"base": "Qwen/Qwen2.5-14B-Instruct", "holdout_ppl": {"before": 104.4, "after": 4.0}, "seconds": 781,
@@ -122,6 +122,34 @@ async def test_release_holds_on_probe_failure_and_releases_on_pass(tmp_path):
     assert Versions(cfg.releases_dir / "versions.jsonl").verify() is True
     row = await release(cfg, r, ask_factory=lambda model: her, local_run=lambda cmd: 0, week="2026-W37")
     assert row["decision"] == "unchanged"
+
+
+async def test_release_uses_the_configured_identity_runs(tmp_path):
+    import dataclasses
+    from grid.weekly_probe import IDENTITY_QUESTIONS
+    cfg = dataclasses.replace(_cfg(tmp_path), identity_runs=3)
+    _seed_one_proposal(tmp_path / "v")
+    r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
+                    "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
+    identity_asks = []
+
+    async def her(prompt):
+        if "Instruction set" in prompt:
+            return '["harvest", "nop", "fork"]'
+        identity_asks.append(prompt)
+        return "I am Kannaka."
+    row = await release(cfg, r, ask_factory=lambda model: her, local_run=lambda cmd: 0, week="2026-W37")
+    assert row["decision"] == "released"
+    assert len(identity_asks) == 3 * len(IDENTITY_QUESTIONS)   # 3 runs, not the old 10
+    assert row["evals"]["identity"]["total"] == 3 * len(IDENTITY_QUESTIONS)
+
+
+def test_config_from_env_identity_runs_defaults_to_three(monkeypatch):
+    for k in ("COLONY_SLUG", "IDENTITY_PROBE_RUNS"):
+        monkeypatch.delenv(k, raising=False)
+    assert WeeklyConfig.from_env().identity_runs == 3
+    monkeypatch.setenv("IDENTITY_PROBE_RUNS", "7")
+    assert WeeklyConfig.from_env().identity_runs == 7
 
 
 async def test_release_holds_when_identity_probe_errors(tmp_path):

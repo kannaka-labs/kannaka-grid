@@ -41,6 +41,7 @@ class WeeklyConfig:
     grid_env: Path
     current_alias: str
     probe_timeout_s: float
+    identity_runs: int
 
     @classmethod
     def from_env(cls) -> "WeeklyConfig":
@@ -56,7 +57,10 @@ class WeeklyConfig:
                    verdicts_dir=Path(env("VERDICTS_DIR", f"/srv/grid/{colony}/verdicts")),
                    grid_env=Path(env("GRID_ENV", "/srv/grid/grid.env")),
                    current_alias=env("CURRENT_ALIAS", "kannaka-brain-current"),
-                   probe_timeout_s=float(env("PROBE_TIMEOUT_S", "900")))
+                   probe_timeout_s=float(env("PROBE_TIMEOUT_S", "900")),
+                   # 10 questions x this many runs = the identity ask count. On a CPU model
+                   # each ask is ~1-2 min, so 3 runs (30 asks) keeps a release under ~1 h.
+                   identity_runs=int(env("IDENTITY_PROBE_RUNS", "3")))
 
 
 def _env_get(path: Path, key: str) -> str | None:
@@ -235,7 +239,7 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
     try:
         # C1: any probe failure (gateway error, timeout, malformed or empty completion) must
         # record `held`, never crash out of `release` (spec §7).
-        evals["identity"] = identity = await run_identity(ask)
+        evals["identity"] = identity = await run_identity(ask, runs=cfg.identity_runs)
         evals["validity"] = validity = await run_validity(ask, cfg.verdicts_dir)
     except Exception as e:
         decision, reason = "held", f"probe failed: {e}"

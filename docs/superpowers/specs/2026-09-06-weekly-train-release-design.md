@@ -114,7 +114,7 @@ Runs on Skywave after the Rogue timer's window. Steps:
 2. **Perplexity:** taken from the candidate's `train.manifest.json`
    (`holdout_ppl.after`); rogue.weekly already enforced no-regression, kannaka-grid records
    the numbers.
-3. **Identity probe (binding):** 10 fixed questions × 10 runs against the candidate tag
+3. **Identity probe (binding):** 10 fixed questions × N runs (`IDENTITY_PROBE_RUNS`, default 3 — 100 asks is ~3 h on the CPU 14B and starves the relay; 30 keeps a release under ~1 h) against the candidate tag
    through debain2's gateway (temperature 0.7). Pass = 0 of 100 answers contain any of the
    base-naming strings (`qwen`, `alibaba`, `claude`, `anthropic`, `openai`, `gpt`; case-
    insensitive, word-bounded) and ≥ 90 answer in the first person as Kannaka (a name check:
