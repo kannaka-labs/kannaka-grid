@@ -2,7 +2,7 @@
 # set-mind-model.sh - point the colony mind at a different OpenAI-compatible
 # gateway/model and restart everything that names the model.
 #
-#   bash ~/grid-deploy/set-mind-model.sh <base_url> <model> <key_file> [--via-daemon|--daemon-only]
+#   bash ~/grid-deploy/set-mind-model.sh <base_url> <model> <key_file> [--via-daemon|--daemon-only|--relay-only]
 #   e.g. bash ~/grid-deploy/set-mind-model.sh http://10.30.0.30:4000/v1 kannaka-brain ~/.grid-debain2-key
 #
 # Rewrites only the [llm] base_url / model / api_key lines of the mind's
@@ -15,6 +15,8 @@
 # --daemon-only rewrites just the daemon's config (the chronicle's model) and
 # leaves the relay's MIND_LLM_* route and MIND_MODEL_ALIAS alone, so the relay
 # can run on the local brain while the chronicle keeps a fast hosted model.
+# --relay-only is the mirror image: writes the relay's direct route and
+# MIND_MODEL_ALIAS, leaves the daemon config alone, restarts only grid-odin.
 # Then restarts grid-mind, grid-odin and grid-bridge (not grid-odin for
 # --daemon-only). Never prints a key.
 set -euo pipefail
@@ -27,6 +29,20 @@ log() { echo "[set-mind-model] $*"; }
 die() { echo "[set-mind-model] FAIL: $1" >&2; exit "${2:-1}"; }
 [ -f "$CFG" ] || die "no $CFG; run deploy.sh first" 5
 [ -s "$KEY_FILE" ] || die "key file $KEY_FILE missing or empty" 5
+setenv() { grep -q "^$1=" "$ENVF" && sed -i "s#^$1=.*#$1=$2#" "$ENVF" || echo "$1=$2" >> "$ENVF"; }
+if [ "$VIA" = "--relay-only" ]; then
+  cp -p "$KEY_FILE" "$ROOT/$COLONY/mind-llm.key" && chmod 600 "$ROOT/$COLONY/mind-llm.key"
+  setenv MIND_MODEL_ALIAS "$MODEL"
+  setenv MIND_LLM_URL "$BASE_URL"
+  setenv MIND_LLM_MODEL "$MODEL"
+  setenv MIND_LLM_KEY_FILE "$ROOT/$COLONY/mind-llm.key"
+  sudo systemctl restart grid-odin.service
+  sleep 2
+  systemctl is-active --quiet grid-odin.service || die "grid-odin did not come back: $(systemctl status grid-odin --no-pager | tail -3)" 6
+  log "relay now asks $MODEL at $BASE_URL directly; daemon untouched; grid-odin restarted"
+  grep -E '^MIND_(MODEL_ALIAS|LLM_URL|LLM_MODEL|LLM_KEY_FILE)=' "$ENVF" | sed 's/^/[set-mind-model] /'
+  exit 0
+fi
 cp -p "$CFG" "$CFG.bak-$(date -u +%Y%m%dT%H%M%S)"
 python3 - "$CFG" "$BASE_URL" "$MODEL" "$(tr -d '\n' < "$KEY_FILE")" <<'PY'
 import re, sys
@@ -52,7 +68,6 @@ if section == "llm":
 open(path, "w", encoding="utf-8").write("\n".join(out) + "\n")
 PY
 chmod 600 "$CFG"
-setenv() { grep -q "^$1=" "$ENVF" && sed -i "s#^$1=.*#$1=$2#" "$ENVF" || echo "$1=$2" >> "$ENVF"; }
 if [ "$VIA" = "--daemon-only" ]; then
   sudo systemctl restart grid-mind.service grid-bridge.service
   sleep 3
