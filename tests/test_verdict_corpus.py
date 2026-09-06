@@ -124,6 +124,16 @@ def test_export_growing_threshold_and_missing_prompt(tmp_path):
     assert manifest["skipped_missing_prompt"] == 1
 
 
+def test_a_repeated_chronicle_line_is_exported_once(tmp_path):
+    vdir, out = tmp_path / "v", tmp_path / "out"
+    seed(vdir)
+    line = (vdir / "chronicle.jsonl").read_text(encoding="utf-8")
+    (vdir / "chronicle.jsonl").write_text(line + line, encoding="utf-8")
+    manifest = export(vdir, out, min_tier="reproduced")
+    ids = [json.loads(l)["id"] for l in (out / "records.jsonl").read_text().splitlines()]
+    assert ids == ["odin-a", "chronicle-c-1-2000-skill"] and manifest["records"] == 2
+
+
 def test_manifest_counts_verdicts_without_a_proposal_entry(tmp_path):
     vdir, out = tmp_path / "v", tmp_path / "out"
     seed(vdir)

@@ -262,6 +262,7 @@ async def test_run_once_settles_publishes_and_is_idempotent(tmp_path):
     subj, payload = bus.published[0]
     assert subj == "GRID.c.verdict" and payload["request_id"] == "r1" and payload["fitness"] == 40
     assert payload["schema_version"] == "1.0" and payload["epoch"] == 1 and payload["tick"] == 3300
+    assert payload["kind"] == "verdict"          # consumers route on kind, not only on subject
     assert await run_once(verdicts_dir=vdir, history_db=db, state={"epoch": 1, "tick": 3400}, bus=bus,
                           colony="c", agent_id="grid-c") == []
     assert len(bus.published) == 1

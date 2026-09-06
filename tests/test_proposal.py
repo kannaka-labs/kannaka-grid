@@ -140,6 +140,10 @@ def test_genome_id_of_agrees_with_thegrid_when_importable():
     try:
         from src.colony.history import genome_id  # type: ignore
     except Exception as e:  # noqa: BLE001 - thegrid may need Linux-only modules
+        # Skywave and CI are Linux and run the colony: there, not importing thegrid
+        # means this test silently stopped checking anything.
+        if sys.platform == "linux":
+            pytest.fail(f"thegrid must be importable on Linux: {e}")
         pytest.skip(f"thegrid not importable here: {e}")
     finally:
         sys.path.remove(str(thegrid))

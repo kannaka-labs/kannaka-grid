@@ -312,7 +312,7 @@ async def run_once(*, verdicts_dir: Path, history_db: Path, state: dict, bus=Non
                 try:
                     await bus.publish(subject(colony, "verdict"),
                                       envelope(agent_id=agent_id, colony=colony, epoch=row["epoch"],
-                                               tick=now_tick, **fields))
+                                               tick=now_tick, kind="verdict", **fields))
                 except Exception as e:  # the row is already in the ledger; the bus is best-effort
                     log.error("verdict publish failed for %s: %s", row["request_id"], e)
     log.info("settled %d proposals (epoch %d tick %d)", len(rows), now_epoch, now_tick)

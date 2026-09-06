@@ -96,9 +96,16 @@ def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced") -
         _seen(v, e, snapshots, stamps)
     chron = vdir / "chronicle.jsonl"
     if chron.exists():
+        # The id is (colony, epoch, tick, kind); a re-published line would otherwise
+        # be trained on twice. The first one is the one that was actually published.
+        seen_chronicle: set[str] = set()
         for line in chron.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                records.append(chronicle_record(json.loads(line)))
+            if not line.strip():
+                continue
+            record = chronicle_record(json.loads(line))
+            if record["id"] not in seen_chronicle:
+                seen_chronicle.add(record["id"])
+                records.append(record)
     for name, rows in (("records.jsonl", records), ("negatives.jsonl", negatives)):
         with open(out / name, "w", encoding="utf-8") as f:
             for r in rows:
