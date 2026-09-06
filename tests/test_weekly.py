@@ -130,19 +130,23 @@ async def test_rollback_picks_previous_release(tmp_path):
 
 async def test_dry_run_release_and_rollback_write_no_ledger_row(tmp_path):
     cfg = _cfg(tmp_path); _seed_one_proposal(tmp_path / "v")
+    grid_env_before = cfg.grid_env.read_text()
     r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
                     "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
     async def her(prompt): return '["harvest", "nop", "fork"]' if "Instruction set" in prompt else "I am Kannaka."
-    row = await release(cfg, r, ask_factory=lambda model: her, local_run=lambda cmd: 0, week="2026-W37", dry_run=True)
+    row = await release(cfg, r, ask_factory=lambda model: her, local_run=lambda cmd: (_ for _ in ()).throw(AssertionError("local_run must not run for real under dry_run")), week="2026-W37", dry_run=True)
     assert row["decision"] == "released"
     from grid.versions import Versions
     assert Versions(cfg.releases_dir / "versions.jsonl").rows() == []
+    assert cfg.grid_env.read_text() == grid_env_before   # flip's env write must not happen under dry_run either
 
     from grid.versions import release_row
     v = Versions(cfg.releases_dir / "versions.jsonl")
     kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={}, verdict_window={}, evals={}, spend_usd=0, rogue_ledger_ts=0, reason="")
     v.append(release_row(week="W1", decision="released", version="kannaka-brain-v3", previous=None, **kw))
     v.append(release_row(week="W2", decision="released", version="kannaka-brain-v4", previous="kannaka-brain-v3", **kw))
-    row2 = rollback(cfg, FakeRemote({}), local_run=lambda cmd: 0, dry_run=True)
+    grid_env_before = cfg.grid_env.read_text()
+    row2 = rollback(cfg, FakeRemote({}), local_run=lambda cmd: (_ for _ in ()).throw(AssertionError("local_run must not run for real under dry_run")), dry_run=True)
     assert row2["decision"] == "rolled_back"
     assert len(Versions(cfg.releases_dir / "versions.jsonl").rows()) == 2   # unchanged: dry-run rollback appended nothing
+    assert cfg.grid_env.read_text() == grid_env_before   # flip's env write must not happen under dry_run either

@@ -139,19 +139,31 @@ def colony_ab(verdicts_dir: Path) -> dict:
             "reproduced_rate": v["reproduced"] / v["proposals"]} for k, v in by.items() if v["proposals"]}}
 
 
-def flip(cfg: WeeklyConfig, remote, version: str, *, local_run) -> str:
-    """Spec §7 order: local env, remote tag copy, relay restart."""
+def flip(cfg: WeeklyConfig, remote, version: str, *, local_run, dry_run: bool = False) -> str:
+    """Spec §7 order: local env, remote tag copy, relay restart.
+
+    `dry_run` performs no real mutation: `remote.run` is already a no-op when the Remote
+    itself is dry-run, but `_env_set` writes `cfg.grid_env` directly on disk and
+    `local_run` may be the real `subprocess.run` restart — neither is safe to call for
+    real here, so both are skipped (and logged) when `dry_run` is true.
+    """
     before = _env_get(cfg.grid_env, "MIND_MODEL_ALIAS")
-    _env_set(cfg.grid_env, "MIND_MODEL_ALIAS", version)
+    if dry_run:
+        log.info("[dry-run] flip: would set MIND_MODEL_ALIAS=%s in %s", version, cfg.grid_env)
+    else:
+        _env_set(cfg.grid_env, "MIND_MODEL_ALIAS", version)
     r = remote.run(f"ollama cp {shlex.quote(version)} {shlex.quote(cfg.current_alias)}", timeout=600)
     if r.returncode != 0:
-        if before is not None:
+        if not dry_run and before is not None:
             _env_set(cfg.grid_env, "MIND_MODEL_ALIAS", before)
         log.error("tag copy failed: %s", r.stderr.strip())
         return "flip_failed"
     # The relay already asks cfg.current_alias (one-time install); a release only changes
     # the author label in grid.env and restarts the relay so it reads it.
     cmd = ["sudo", "-n", "systemctl", "restart", "grid-odin.service"]
+    if dry_run:
+        log.info("[dry-run] flip: would run %s", " ".join(cmd))
+        return "ok"
     for attempt in (1, 2):
         if local_run(cmd) == 0:
             return "ok"
@@ -187,7 +199,7 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
     h["gguf_sha256"] = gguf_hash(remote, cand["tag"])
     decision, reason = decide(candidate=cand["tag"], released=released, identity=identity["pass"], validity=validity["pass"])
     if decision == "released":
-        outcome = flip(cfg, remote, cand["tag"], local_run=local_run)
+        outcome = flip(cfg, remote, cand["tag"], local_run=local_run, dry_run=dry_run)
         if outcome == "flip_failed":
             decision, reason = "held", "flip failed: tag copy"
         elif outcome == "flip_incomplete":
@@ -220,7 +232,7 @@ def rollback(cfg: WeeklyConfig, remote, *, to: str | None = None, local_run, dry
         next((r for r in versions.rows() if r["decision"] == "released" and r["version"] == to), None)
     if target is None:
         raise SystemExit(f"{to or 'the previous release'} was never released; refusing")
-    outcome = flip(cfg, remote, target["version"], local_run=local_run)
+    outcome = flip(cfg, remote, target["version"], local_run=local_run, dry_run=dry_run)
     decision = "rolled_back" if outcome == "ok" else outcome
     row = release_row(week=_iso_week(), decision=decision if decision in ("rolled_back", "flip_incomplete") else "held",
                       version=target["version"], previous=last["version"], base=target.get("base", ""), run=target.get("run", ""),
