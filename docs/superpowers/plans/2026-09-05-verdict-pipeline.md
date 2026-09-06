@@ -627,7 +627,6 @@ import hashlib
 import json
 import logging
 import os
-import shutil
 import sqlite3
 import sys
 import tempfile
@@ -776,7 +775,7 @@ def settle_pending(entries: list[dict], ledger: Ledger, reader: StatsReader, *, 
     return out
 ```
 
-- [ ] **Step 4: Run** `python -m pytest tests/test_verdicts.py -q` → `6 passed`.
+- [ ] **Step 4: Run** `python -m pytest tests/test_verdicts.py -q` → `7 passed`.
 
 - [ ] **Step 5: Mutations, then commit**
 
@@ -923,7 +922,7 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
-- [ ] **Step 4: Run** `python -m pytest tests/test_verdicts.py -q` → `8 passed`.
+- [ ] **Step 4: Run** `python -m pytest tests/test_verdicts.py -q` → `9 passed`.
 
 - [ ] **Step 5: Mutation, then commit**
 
