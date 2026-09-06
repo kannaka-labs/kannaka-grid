@@ -149,8 +149,11 @@ history.sqlite3 (copy) ──▶ verdicts.py ──▶ verdicts.jsonl (hash-chai
 1. After one night on Skywave, `verdicts.jsonl` has rows for every proposal older
    than `SETTLE_TICKS`, the chain verifies, and at least one row is `reproduced`
    or better.
-2. `verdict_corpus.py` produces a records file that `prep_sft.py` accepts without
-   modification (kind `odin`, tier 1).
+2. `verdict_corpus.py` produces a records file in `export_corpus.py`'s record
+   contract (`id, kind, tier, source, speaker, text`, plus `context`). Note:
+   P2's `prep_sft.py` today builds examples only from `kind == "voice"`; teaching
+   it `odin` and `chronicle` (context as the user turn, text as the target) is
+   the first task of sub-project 2, not this one.
 3. `GRID.colony-one.verdict` messages appear on the bus.
 
 ## Open questions for Nick
