@@ -35,6 +35,8 @@ def records() -> list[dict]:
         r = json.loads(line)
         if set(r) != _KEYS:
             raise ValueError(f"identity record has wrong keys: {sorted(r)}")
+        # The guard is on `text` only, by design: `context` (the question) legitimately
+        # names bases for the adversarial questions (e.g. "Are you Qwen?").
         if _BASE_RE.search(r["text"]):
             raise ValueError(f"identity example {r['id']} names the base: {r['text']!r}")
         out.append(r)
@@ -58,19 +60,28 @@ def export(out_dir: Path) -> dict:
 
 async def measure(ask: Ask, *, runs: int = 10) -> dict:
     """Run the full identity probe and report which questions leak, with the model's
-    own offending words, so the example set can target real failures."""
-    by_q: dict[str, dict] = {q: {"asked": 0, "base_named": 0, "leaks": []} for q in IDENTITY_QUESTIONS}
+    own offending words, so the example set can target real failures. A failed ask
+    (timeout, upstream error) never aborts the run: it is counted and skipped, so one
+    bad question does not sink the other 99 asks."""
+    by_q: dict[str, dict] = {q: {"asked": 0, "base_named": 0, "leaks": [], "errors": 0} for q in IDENTITY_QUESTIONS}
     all_answers: list[str] = []
+    errors = 0
     for _ in range(runs):
         for q in IDENTITY_QUESTIONS:
-            a = await ask(q)
+            try:
+                a = await ask(q)
+            except Exception as e:
+                by_q[q]["errors"] += 1
+                errors += 1
+                log.warning("identity probe ask failed for %r: %s", q, e)
+                continue
             all_answers.append(a)
             slot = by_q[q]
             slot["asked"] += 1
             if _BASE_RE.search(a):
                 slot["base_named"] += 1
                 slot["leaks"].append(a)
-    return {"score": score_identity(all_answers), "by_question": by_q, "total": len(all_answers)}
+    return {"score": score_identity(all_answers), "by_question": by_q, "total": len(all_answers), "errors": errors}
 
 
 async def measure_model(gateway_url: str, key: str, model: str, *, runs: int, timeout_s: float, http=None) -> dict:
@@ -97,6 +108,11 @@ def main(argv: list[str] | None = None) -> int:
         manifest = export(Path(a.out))
         print(json.dumps(manifest, indent=1))
         return 0
+    if a.out:
+        p = Path(a.out)
+        if p.is_dir():
+            raise SystemExit("--out must be a file path, not a directory")
+        p.parent.mkdir(parents=True, exist_ok=True)
     key = Path(a.key_file).read_text(encoding="utf-8").strip()
     m = asyncio.run(measure_model(a.gateway_url, key, a.model, runs=a.runs, timeout_s=a.timeout_s))
     leaking = {q: v for q, v in m["by_question"].items() if v["base_named"]}

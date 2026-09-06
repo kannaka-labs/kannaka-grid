@@ -126,9 +126,9 @@ Receipts:
 `rogue-grid-pull` key on Skywave. It now also runs `python -m grid.identity export --out`
 alongside the verdict corpus export and adds `identity_examples.jsonl` and
 `identity_manifest.json` to the tar it streams, so the identity example set travels with every
-pull. Installing a new version is
-`cp deploy/skywave/pull-export.sh /srv/grid/pull-export.sh` — the forced-command key already
-points at that path, so nothing else on Skywave needs to change. Kannaka's `rogue/grid.py`
+pull. deploy.sh installs `pull-export.sh` after updating the checkout; to install by hand, run
+deploy.sh first, then `diff /srv/grid/pull-export.sh ~/grid-deploy/pull-export.sh` before
+copying. Kannaka's `rogue/grid.py`
 consumes the new tar member; that consumer change is coordinated separately, so until it lands
 the member rides along in the tar unused.
 
