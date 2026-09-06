@@ -9,3 +9,5 @@ Result (median seconds per Odin prompt, ~1550-2050 prompt tokens):
   kannaka-brain-7b-v1 (7.6B adapter) 211 (pass 1) / 174 (pass 2, idle box)
 The 7b is slower than the 14b on this host despite half the parameters; its ollama entry shows only num_ctx 4096 / temperature 0.8, so the cause is in the GGUF/runtime, not the prompt. Worth a look on the training side before the next 7b build.
 Winner kept: kannaka-brain. Relay restarted on it via set-mind-model.sh --relay-only with key alias grid-colony-one-20260906T145349.
+
+Post-switch confirmation: relay restarted 15:52:43Z on kannaka-brain (key alias grid-colony-one-20260906T145349); first proposal 15:54:20Z, 97 s, request 9c77b8d36ca6a194, 16 opcodes, tick 104264, logged with model_alias=kannaka-brain. Chronicle daemon on Skywave agent-brain (--daemon-only).
