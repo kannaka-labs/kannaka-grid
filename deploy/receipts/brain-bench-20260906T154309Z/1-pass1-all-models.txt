@@ -1,0 +1,23 @@
+# pass 1 (all four models; inline probe, 7b ran while another tenant's llama-server was active)
+10:01:42 live prompt chars=4860 parent_len=16 hist chars=[6499, 6617] load=0.39
+kannaka-brain-7b-v1    warmup  195.2s (model load + eval, discarded)
+kannaka-brain-7b-v1    live    210.6s prompt_tokens=1551 completion_tokens=55 valid len=16
+kannaka-brain-7b-v1    hist1   219.0s prompt_tokens=2024 completion_tokens=53 shape-ok len=16
+kannaka-brain-7b-v1    hist2   137.6s prompt_tokens=2057 completion_tokens=68 shape-ok len=19
+kannaka-brain          warmup  128.5s (model load + eval, discarded)
+kannaka-brain          live    113.2s prompt_tokens=1527 completion_tokens=54 valid len=16
+kannaka-brain          hist1   127.0s prompt_tokens=2000 completion_tokens=61 shape-ok len=18
+kannaka-brain          hist2    60.0s prompt_tokens=2033 completion_tokens=75 shape-ok len=21
+kannaka-brain-v1       warmup  102.8s (model load + eval, discarded)
+kannaka-brain-v1       live    113.5s prompt_tokens=1551 completion_tokens=55 valid len=16
+kannaka-brain-v1       hist1   131.2s prompt_tokens=2024 completion_tokens=62 shape-ok len=18
+kannaka-brain-v1       hist2  ERROR HTTP Error 500: Internal Server Error
+kannaka-brain-v2       warmup  148.6s (model load + eval, discarded)
+kannaka-brain-v2       live    140.8s prompt_tokens=1551 completion_tokens=58 valid len=17
+kannaka-brain-v2       hist1   156.0s prompt_tokens=2024 completion_tokens=64 shape-ok len=19
+kannaka-brain-v2       hist2   183.0s prompt_tokens=2057 completion_tokens=70 shape-ok len=20
+--- summary: median / min / max seconds over distinct prompts
+kannaka-brain          median  113.2  min   60.0  max  127.0  n=3
+kannaka-brain-v1       median  122.3  min  113.5  max  131.2  n=2
+kannaka-brain-v2       median  156.0  min  140.8  max  183.0  n=3
+kannaka-brain-7b-v1    median  210.6  min  137.6  max  219.0  n=3

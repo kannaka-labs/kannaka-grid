@@ -1,0 +1,9 @@
+# pass 2 (7b vs 14b back to back on an idle box; gateway went down after the 7b's second prompt)
+10:43:09 live prompt chars=4860 parent_len=16 hist chars=[6499, 6617] load=0.11
+kannaka-brain-7b-v1    warmup  102.5s (model load + eval, discarded)
+kannaka-brain-7b-v1    live    162.1s prompt_tokens=1551 completion_tokens=54 valid len=16
+kannaka-brain-7b-v1    hist1   185.8s prompt_tokens=2024 completion_tokens=54 shape-ok len=16
+kannaka-brain-7b-v1    hist2  ERROR <urlopen error [Errno 111] Connection refused>
+kannaka-brain          warmup ERROR <urlopen error [Errno 111] Connection refused>
+--- summary: median / min / max seconds over distinct prompts
+kannaka-brain-7b-v1    median  174.0  min  162.1  max  185.8  n=2

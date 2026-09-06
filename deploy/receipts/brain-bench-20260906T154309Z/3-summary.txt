@@ -1,0 +1,11 @@
+Method: deploy/skywave/brain_bench.py from Skywave against debain2 gateway :4000 (ollama_chat backends, CPU-only Xeon E5-2697 v4, 20 cores).
+Per model: one warm-up on a fourth historical prompt (model load, discarded), then the live request.json prompt (validated with grid.proposal.validate) and two historical prompts (shape-checked against the ISA). grid-odin stopped during the runs.
+All models on both passes: 100% valid/shape-ok proposals of 16-21 opcodes; completion 53-75 tokens.
+
+Result (median seconds per Odin prompt, ~1550-2050 prompt tokens):
+  kannaka-brain (qwen2.5:14b base)   113  (pass 1; 60-127)
+  kannaka-brain-v1 (14b adapter)     122  (pass 1, n=2)
+  kannaka-brain-v2 (14b adapter)     156  (pass 1)
+  kannaka-brain-7b-v1 (7.6B adapter) 211 (pass 1) / 174 (pass 2, idle box)
+The 7b is slower than the 14b on this host despite half the parameters; its ollama entry shows only num_ctx 4096 / temperature 0.8, so the cause is in the GGUF/runtime, not the prompt. Worth a look on the training side before the next 7b build.
+Winner kept: kannaka-brain. Relay restarted on it via set-mind-model.sh --relay-only with key alias grid-colony-one-20260906T145349.

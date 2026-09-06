@@ -1,0 +1,8 @@
+# earlier attempt 2026-09-06 ~14:40Z, before the disk incident (run1 = cold load for the 7b; run2 = ollama prompt-cache hit on identical prompt; v1 401 = gateway DB failing on a full disk)
+prompt chars=4860 parent_len=16 isa=50
+run1 kannaka-brain-7b-v1       44.5s prompt_tokens=1551 completion_tokens=54 valid len=16 | ["harvest", "scan", "move", "harvest", "alloc", "copy", "build", "ifzero", "fork
+run1 kannaka-brain             44.0s prompt_tokens=1527 completion_tokens=58 valid len=17 | ["harvest", "scan", "move", "harvest", "alloc", "copy", "harvest", "ifzero", "fo
+run1 kannaka-brain-v1         137.7s prompt_tokens=1551 completion_tokens=56 valid len=16 | ["harvest", "scan", "move", "harvest", "alloc", "copy", "harvest", "ifzero", "fo
+run2 kannaka-brain-7b-v1        9.6s prompt_tokens=1551 completion_tokens=54 valid len=16 | ["harvest", "scan", "move", "harvest", "alloc", "copy", "build", "ifzero", "fork
+run2 kannaka-brain             80.2s prompt_tokens=1527 completion_tokens=54 valid len=16 | ["harvest", "scan", "move", "harvest", "alloc", "copy", "signal", "ifzero", "for
+run2 kannaka-brain-v1           3.9s prompt_tokens=None completion_tokens=None ERROR HTTP Error 401: Unauthorized | 
