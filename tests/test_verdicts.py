@@ -95,6 +95,51 @@ def test_ledger_truncates_a_partial_tail_before_appending(tmp_path):
     assert Ledger(path).verify() is True
 
 
+def test_ledger_refuses_to_append_past_a_mid_file_corrupt_row(tmp_path):
+    """ext4 after a crash: a zero-filled block in place, the rows after it intact."""
+    path = tmp_path / "verdicts.jsonl"
+    led = Ledger(path)
+    for rid in ("a", "b", "c"):
+        led.append({"request_id": rid, "tier": "new"})
+    lines = path.read_bytes().split(b"\n")
+    lines[1] = b"\0" * len(lines[1])                     # newline-terminated NULs
+    path.write_bytes(b"\n".join(lines))
+    before = path.read_bytes()
+
+    led = Ledger(path)
+    with pytest.raises(RuntimeError, match="corrupt row at line 2"):
+        led.append({"request_id": "d", "tier": "new"})
+    assert path.read_bytes() == before                   # 'c' was not deleted to make room
+    assert Ledger(path).verify() is False                # and verify() does not call it healthy
+
+
+def test_ledger_refuses_a_newline_terminated_garbage_tail(tmp_path):
+    """A complete line that is not JSON was never a torn write; only truncate the unterminated."""
+    path = tmp_path / "verdicts.jsonl"
+    Ledger(path).append({"request_id": "a", "tier": "new"})
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("not json at all\n")
+    before = path.read_bytes()
+    led = Ledger(path)
+    with pytest.raises(RuntimeError, match="corrupt row at line 2"):
+        led.append({"request_id": "b", "tier": "new"})
+    assert path.read_bytes() == before
+
+
+async def test_run_once_lets_a_corrupt_ledger_stop_the_run(tmp_path):
+    from grid.proposal_log import ProposalLog
+    from grid.verdicts import run_once
+    db = make_db(tmp_path / "history.sqlite3", [])
+    vdir = tmp_path / "verdicts"
+    ProposalLog(vdir).record({"request_id": "r1", "epoch": 1, "tick": 1, "proposal_genome_id": "gx",
+                              "outcome": "proposed", "model_alias": "a", "reason": None,
+                              "prompt_path": "prompts/r1.txt"}, "p")
+    (vdir / "verdicts.jsonl").write_text("not json at all\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="corrupt row at line 1"):
+        await run_once(verdicts_dir=vdir, history_db=db, state={"epoch": 2, "tick": 5}, bus=None,
+                       colony="c", agent_id="grid-c")
+
+
 def test_ledger_head_is_cached(tmp_path):
     led = Ledger(tmp_path / "verdicts.jsonl")
     reads = []

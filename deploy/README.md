@@ -78,7 +78,10 @@ Receipts:
    ```bash
    /srv/grid/venv/bin/python -c "from grid.verdicts import Ledger; print(Ledger('/srv/grid/colony-one/verdicts/verdicts.jsonl').verify())"
    ```
-   prints `True`.
+   prints `True`. If it prints `False` and the run exits non-zero with `ledger has a corrupt row at
+   line N; refusing to append`, the ledger has a damaged row mid-file: the timer will keep failing
+   until an operator repairs or archives `verdicts.jsonl` by hand, which is deliberate — appending
+   past it would strand every good row below it.
 2. At least one row reaches `reproduced` or better within a day of the proposal it settles.
 3. The export manifest shows `records ≥ 1`, and `GRID.colony-one.verdict` is seen in a bus capture (`kannaka swarm tail --subject 'GRID.>'` or the nats app's capture).
 

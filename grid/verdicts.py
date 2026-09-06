@@ -100,21 +100,33 @@ class Ledger:
         self._head: str | None = None
         self._ids: set[str] | None = None
         self._partial_tail_offset: int | None = None
+        self._corrupt_line: int | None = None
 
     def rows(self) -> list[dict]:
         out: list[dict] = []
-        self._partial_tail_offset = None
+        self._partial_tail_offset = self._corrupt_line = None
         try:
             with open(self.path, "rb") as f:
+                size = os.fstat(f.fileno()).st_size
                 offset = 0
-                for raw in f:
+                for n, raw in enumerate(f, 1):
                     if raw.strip():
                         try:
                             out.append(json.loads(raw))
                         except ValueError:      # includes a bad UTF-8 decode
-                            log.warning("verdict ledger: unreadable line at byte %d of %s "
-                                        "(partial write?); stopping there", offset, self.path)
-                            self._partial_tail_offset = offset
+                            # A row is fsynced with its newline, so only an
+                            # unterminated final line can be a torn write. Anything
+                            # else — mid-file, or newline-terminated garbage — has
+                            # complete rows after it that must not be destroyed.
+                            if not raw.endswith(b"\n") and offset + len(raw) == size:
+                                log.warning("verdict ledger: torn last line at byte %d (line %d) "
+                                            "of %s; it will be dropped on the next append",
+                                            offset, n, self.path)
+                                self._partial_tail_offset = offset
+                            else:
+                                log.error("verdict ledger: corrupt row at line %d of %s; "
+                                          "refusing to read past it", n, self.path)
+                                self._corrupt_line = n
                             break
                     offset += len(raw)
         except OSError:
@@ -144,6 +156,12 @@ class Ledger:
 
     def append(self, row: dict) -> dict:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self._head is None:
+            self.rows()
+        if self._corrupt_line is not None:
+            # Appending would chain onto a prefix and strand every good row below it.
+            raise RuntimeError(f"ledger has a corrupt row at line {self._corrupt_line}; "
+                               "refusing to append")
         self._truncate_partial_tail()
         full = dict(row, chain=chain_hash(self.head(), row))
         with open(self.path, "a", encoding="utf-8") as f:
@@ -174,7 +192,10 @@ class Ledger:
 
     def verify(self) -> bool:
         prev = GENESIS
-        for row in self.rows():
+        rows = self.rows()
+        if self._corrupt_line is not None:
+            return False        # a prefix that verifies is not a ledger that verifies
+        for row in rows:
             if row.get("chain") != chain_hash(prev, row):
                 return False
             prev = row["chain"]
