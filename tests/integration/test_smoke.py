@@ -142,3 +142,28 @@ async def test_relay_answers_a_request_written_by_thegrid_shape(colony):
     relay = Relay(queue, colony="smoke", agent_id="grid-smoke", mind=StubMind(), bus=NullBus())
     assert await relay.poll_once() == "proposed"
     assert json.loads((queue / "proposal.json").read_text())["genome"][-1] == "nop"
+
+
+@skip
+async def test_verdicts_settle_against_the_real_fossil_db(colony, tmp_path):
+    from grid.proposal_log import ProposalLog
+    from grid.verdicts import Ledger, run_once
+    base, queue = colony
+    state_dir = queue.parent
+    vdir = tmp_path / "verdicts"
+    # a proposal for a genome the colony will never birth -> settles 'unborn' once the epoch retires or 60 ticks pass
+    ProposalLog(vdir).record({"request_id": "smoke-v", "epoch": 1, "tick": 1, "proposal_genome_id": "0" * 16,
+                              "outcome": "proposed", "model_alias": "stub", "reason": None,
+                              "prompt_path": "prompts/smoke-v.txt", "colony": "smoke"}, "p")
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        state = httpx.get(f"{base}/api/state", timeout=2).json()
+        if state["tick"] >= 200:
+            break
+        time.sleep(1)
+    db = state_dir / "history.sqlite3"
+    assert db.exists(), "thegrid did not write history.sqlite3"
+    rows = await run_once(verdicts_dir=vdir, history_db=db, state=state, bus=None, colony="smoke",
+                          agent_id="grid-smoke", settle_ticks=100)
+    assert [r["tier"] for r in rows] == ["unborn"]
+    assert Ledger(vdir / "verdicts.jsonl").verify()
