@@ -78,6 +78,14 @@ def _env_set(path: Path, key: str, value: str) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _run_dir(cfg: WeeklyConfig, run: str) -> str:
+    """The absolute run directory. rogue.weekly's ledger records `run` as a full
+    path (verified on debain2: /home/nick/.kannaka-corpus/runs/gpu-a100-sxm-...),
+    but a bare run name is also accepted, so join it under rogue_runs_dir only
+    when it is not already absolute."""
+    return run if run.startswith("/") else f"{cfg.rogue_runs_dir}/{run}"
+
+
 def find_candidate(remote, cfg: WeeklyConfig) -> dict | None:
     try:
         tag = remote.read(cfg.rogue_current_model).strip()
@@ -91,7 +99,7 @@ def find_candidate(remote, cfg: WeeklyConfig) -> dict | None:
     p = promos[-1]
     run = p.get("run") or ""
     try:
-        manifest = json.loads(remote.read(f"{cfg.rogue_runs_dir}/{run}/train.manifest.json"))
+        manifest = json.loads(remote.read(f"{_run_dir(cfg, run)}/train.manifest.json"))
     except (RemoteError, ValueError):
         manifest = {}
     return {"tag": tag, "run": run, "rogue_ts": float(p.get("ts", 0)), "manifest": manifest}
@@ -100,7 +108,7 @@ def find_candidate(remote, cfg: WeeklyConfig) -> dict | None:
 def hashes(remote, cfg: WeeklyConfig, run: str) -> dict:
     """sha256 of the adapter and the served GGUF, computed on debain2; nothing is copied."""
     out = {"adapter_sha256": "", "gguf_sha256": "", "set_manifest_sha256": ""}
-    r = remote.run(f"sha256sum {shlex.quote(cfg.rogue_runs_dir + '/' + run + '/adapter/adapter_model.safetensors')}")
+    r = remote.run(f"sha256sum {shlex.quote(_run_dir(cfg, run) + '/adapter/adapter_model.safetensors')}")
     if r.returncode == 0:
         out["adapter_sha256"] = r.stdout.split()[0]
     # rogue.weekly writes no manifest into the run directory itself for the weekly SFT

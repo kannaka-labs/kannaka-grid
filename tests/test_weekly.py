@@ -70,6 +70,16 @@ def test_find_candidate_reads_current_model_and_promotion_row(tmp_path):
     assert find_candidate(FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n"}), _cfg(tmp_path)) is None
 
 
+def test_find_candidate_reads_the_manifest_when_run_is_an_absolute_path(tmp_path):
+    # rogue.weekly's ledger records `run` as a FULL path (verified on debain2), not a bare name.
+    abs_run = "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305"
+    ledger = json.dumps({"ts": 1.7e9, "event": "promotion", "model": "kannaka-brain-v4", "run": abs_run}) + "\n"
+    r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ledger,
+                    f"{abs_run}/train.manifest.json": MANIFEST})
+    c = find_candidate(r, _cfg(tmp_path))
+    assert c["run"] == abs_run and c["manifest"]["holdout_ppl"]["after"] == 4.0   # not a doubled path
+
+
 def test_colony_ab_reports_births_per_proposal_by_alias(tmp_path):
     v = tmp_path / "v"; v.mkdir()
     rows = [{"model_alias": "kannaka-brain-v3", "tier": "reproduced", "births": 2, "fitness": 2},
