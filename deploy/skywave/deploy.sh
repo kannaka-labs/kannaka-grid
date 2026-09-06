@@ -126,7 +126,9 @@ PY
 fi
 grep -q '^id = "grid-colony-one"' $MEM/config.toml || die "mind config does not carry agent id grid-colony-one" 1
 grep -q '^provider = "openai"' $MEM/config.toml || die "mind config is not wired to the gateway" 1
-grep -q "^path = '$MEM/kannaka.hrm'" $MEM/config.toml || die "mind config hrm.path is not $MEM/kannaka.hrm" 1
+# kannaka rewrites config.toml on startup and normalises string quotes to double,
+# so accept either quote style here or the guard rejects a correct, running config.
+grep -qE "^path = [\"']$MEM/kannaka.hrm[\"']" $MEM/config.toml || die "mind config hrm.path is not $MEM/kannaka.hrm" 1
 if [ ! -f $MEM/kannaka.hrm ]; then
   log "seeding the mind's store"
   KANNAKA_DATA_DIR=$MEM $KANNAKA remember "grid-colony-one mind initialised on $(hostname) $(date -u +%FT%TZ)" --category grid --tags colony-one,init >/dev/null
