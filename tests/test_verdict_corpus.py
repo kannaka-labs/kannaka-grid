@@ -72,3 +72,31 @@ def test_export_growing_threshold_and_missing_prompt(tmp_path):
     records = [json.loads(l) for l in (out / "records.jsonl").read_text().splitlines()]
     assert [r["id"] for r in records] == ["chronicle-c-1-2000-skill"]      # 'a' skipped: prompt missing
     assert manifest["skipped_missing_prompt"] == 1
+
+
+def test_history_hash_sees_rows_still_in_the_wal(tmp_path):
+    import sqlite3
+    from grid.verdict_corpus import _sha256_db
+    db = tmp_path / "history.sqlite3"
+    c = sqlite3.connect(db)
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("CREATE TABLE t (x INTEGER)")
+    c.commit()
+    before = _sha256_db(db)
+    c.execute("PRAGMA wal_autocheckpoint=0")
+    c.execute("INSERT INTO t VALUES (1)")
+    c.commit()                                    # row lives only in the WAL
+    after = _sha256_db(db)
+    c.close()
+    assert before and after and before != after
+    assert _sha256_db(tmp_path / "absent.sqlite3") == ""
+
+
+def test_manifest_counts_verdicts_without_a_proposal_entry(tmp_path):
+    vdir, out = tmp_path / "v", tmp_path / "out"
+    seed(vdir)
+    Ledger(vdir / "verdicts.jsonl").append({"request_id": "ghost", "proposal_genome_id": "gz", "epoch": 1,
+        "settled_tick": 3100, "births": 9, "generations": 20, "lifetime_ticks": 100, "tier": "growing",
+        "fitness": 9, "model_alias": "m", "outcome": "proposed"})
+    manifest = export(vdir, out, min_tier="reproduced")
+    assert manifest["skipped_missing_entry"] == 1 and manifest["records"] == 2

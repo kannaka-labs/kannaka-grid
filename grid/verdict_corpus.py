@@ -11,7 +11,9 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
 from .proposal_log import ProposalLog
@@ -44,14 +46,30 @@ def chronicle_record(row: dict) -> dict:
     }
 
 
-def _sha256_file(path: Path | None) -> str:
+def _sha256_db(path: Path | None) -> str:
+    """Hash a backup-API snapshot of the DB, so rows still in the WAL count."""
     if path is None or not Path(path).exists():
         return ""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    fd, tmp = tempfile.mkstemp(suffix=".sqlite3")
+    os.close(fd)
+    try:
+        src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            dst = sqlite3.connect(tmp)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        h = hashlib.sha256()
+        with open(tmp, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced",
@@ -60,12 +78,13 @@ def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced",
     out.mkdir(parents=True, exist_ok=True)
     entries = {e["request_id"]: e for e in ProposalLog(vdir).read_all()}
     ledger = Ledger(vdir / "verdicts.jsonl")
-    hist_sha = _sha256_file(history_db)
+    hist_sha = _sha256_db(history_db)
     threshold = TIER_RANK[min_tier]
-    records, negatives, by_tier, skipped = [], [], {}, 0
+    records, negatives, by_tier, skipped, skipped_missing_entry = [], [], {}, 0, 0
     for v in ledger.rows():
         e = entries.get(v["request_id"])
         if e is None:
+            skipped_missing_entry += 1
             continue
         if v["tier"] in NEGATIVE_TIERS:
             negatives.append(record_for(e, v, "", history_sha256=hist_sha))
@@ -88,7 +107,8 @@ def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced",
             for r in rows:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
     manifest = {"records": len(records), "negatives": len(negatives), "min_tier": min_tier,
-                "by_tier": by_tier, "skipped_missing_prompt": skipped, "chain_head": ledger.head(),
+                "by_tier": by_tier, "skipped_missing_prompt": skipped,
+                "skipped_missing_entry": skipped_missing_entry, "chain_head": ledger.head(),
                 "history_sha256": hist_sha, "verdicts_dir": str(vdir)}
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     return manifest
