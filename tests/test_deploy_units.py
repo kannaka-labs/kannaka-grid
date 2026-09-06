@@ -40,3 +40,11 @@ def test_dream_timer_restarts_the_mind_so_new_memories_load():
 def test_bridge_and_relay_read_the_shared_env():
     for name in ("grid-bridge.service", "grid-odin.service"):
         assert "EnvironmentFile=/srv/grid/grid.env" in unit(name), name
+
+
+def test_verdicts_timer_runs_nightly_and_reads_the_shared_env():
+    svc = unit("grid-verdicts.service")
+    assert "Type=oneshot" in svc and "grid.verdicts" in svc and "EnvironmentFile=/srv/grid/grid.env" in svc
+    assert "EnvironmentFile=/home/nick/.kannaka-nats.env" in svc
+    timer = unit("grid-verdicts.timer")
+    assert "OnCalendar=" in timer and "Persistent=true" in timer

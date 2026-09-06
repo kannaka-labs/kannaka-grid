@@ -53,6 +53,33 @@ Receipts (acceptance criteria, spec §12):
 
 Paste the captured payloads for 1, 2, 4 and 5 into the PR that closes the deploy.
 
+## 4. Verdicts (self-improvement sub-project 1)
+`grid-verdicts.timer` runs `python -m grid.verdicts` nightly at 03:15 (host time,
+`Persistent=true` so a missed run fires on the next boot): it settles every
+logged Odin proposal against the fossil record thegrid wrote for that epoch,
+appends a hash-chained verdict to `verdicts.jsonl`, and publishes
+`GRID.colony-one.verdict` for each one.
+```bash
+sudo cp deploy/systemd/grid-verdicts.service deploy/systemd/grid-verdicts.timer /etc/systemd/system/ && sudo systemctl daemon-reload
+sudo systemctl enable --now grid-verdicts.timer
+```
+A manual run, from `/srv/grid/kannaka-grid`, settles without publishing to the bus:
+```bash
+python -m grid.verdicts --no-publish
+```
+Export the week's verdict corpus (positives, negatives, and a manifest with the chain head) for training:
+```bash
+python -m grid.verdict_corpus --out ~/.kannaka-corpus/grid/$(date -u +%G-W%V)
+```
+Receipts:
+1. `verdicts.jsonl` has rows and the ledger's hash chain verifies:
+   ```bash
+   python -c "from grid.verdicts import Ledger; print(Ledger('/srv/grid/colony-one/verdicts/verdicts.jsonl').verify())"
+   ```
+   prints `True`.
+2. At least one row reaches `reproduced` or better within a day of the proposal it settles.
+3. The export manifest shows `records ≥ 1`, and `GRID.colony-one.verdict` is seen in a bus capture (`kannaka swarm tail --subject 'GRID.>'` or the nats app's capture).
+
 ## Known limits (v0.1)
 - Memories written by the bridge become visible to asks only after the 6 h dream+restart.
 - `GRID.*` is unsigned on the wire (spec §8).

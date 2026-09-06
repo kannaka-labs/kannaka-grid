@@ -46,11 +46,13 @@ if [ ! -x $VENV/bin/python ]; then
 fi
 $VENV/bin/pip install -q --upgrade pip
 $VENV/bin/pip install -q -e "$CHECKOUT[dev]" -e $ROOT/thegrid
-install -d -o nick -g nick $ROOT/$COLONY/state $ROOT/$COLONY/state/operator $MEM
+install -d -o nick -g nick $ROOT/$COLONY/state $ROOT/$COLONY/state/operator $MEM $ROOT/$COLONY/verdicts $ROOT/$COLONY/verdicts/prompts
+chmod 700 $ROOT/$COLONY/verdicts
 if [ ! -f $ROOT/grid.env ]; then
   cp $CHECKOUT/deploy/grid.env.example $ROOT/grid.env && chmod 600 $ROOT/grid.env
   log "wrote $ROOT/grid.env from the example"
 fi
+grep -q '^VERDICTS_DIR=' $ROOT/grid.env || printf 'VERDICTS_DIR=%s/%s/verdicts\nMIND_MODEL_ALIAS=agent-brain\n' "$ROOT" "$COLONY" >> $ROOT/grid.env
 $VENV/bin/python -c "import grid, src.colony.live" && log "§0 receipt: grid and thegrid import" || die "§0 import check failed" 1
 
 # ---- §1 mind -------------------------------------------------------------------
@@ -160,5 +162,8 @@ sleep 5
 for u in grid-bridge grid-odin; do
   systemctl is-active --quiet $u.service || die "$u.service not active: $(journalctl -u $u -n 8 --no-pager)" 6
 done
-log "§3 receipt: bridge and relay active"
+sudo cp $CHECKOUT/deploy/systemd/grid-verdicts.service $CHECKOUT/deploy/systemd/grid-verdicts.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now grid-verdicts.timer
+log "§3 receipt: bridge and relay active, verdicts timer enabled"
 log "DONE — run deploy/skywave/receipts.sh to collect the six acceptance receipts"

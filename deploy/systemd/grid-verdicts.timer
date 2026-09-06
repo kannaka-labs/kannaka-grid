@@ -1,0 +1,10 @@
+[Unit]
+Description=Settle Odin verdicts nightly
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+OnBootSec=20m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
