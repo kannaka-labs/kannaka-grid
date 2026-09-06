@@ -7,6 +7,13 @@
 set -euo pipefail
 V=${1:?initial version tag}
 CFG=/srv/kax/gateway/config.yaml
+# ollama on debain2 binds the kax-net docker bridge, not localhost, so the CLI
+# needs OLLAMA_HOST (rogue.weekly derives it the same way). Without it every
+# `ollama` call fails "could not connect to ollama server".
+if [ -z "${OLLAMA_HOST:-}" ]; then
+  BR=$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' kax-net 2>/dev/null || true)
+  [ -n "$BR" ] && export OLLAMA_HOST="$BR:11434"
+fi
 ollama list | grep -q "^kannaka-brain-current" || ollama cp "$V" kannaka-brain-current
 grep -q "model_name: kannaka-brain-current" $CFG || python3 - <<'PY'
 p="/srv/kax/gateway/config.yaml"; s=open(p).read()
