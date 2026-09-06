@@ -186,6 +186,8 @@ corrections, not new scope; the sections stand as written except where noted.
   manifest reports `history_snapshots`, `since_ts`/`until_ts` and
   `"cumulative": true` (an export is the whole ledger to date, not a window),
   plus `skipped_preexisting`, `skipped_unknown` and `skipped_below_threshold`.
+- §3, `manifest.history_sha256` is **removed** in favour of `history_snapshots`; a consumer
+  reading the old key (kannaka-memory's `export_corpus.py`) gets a `KeyError`, not a stale value.
 - §Security, `history_sha256` is the hash of the **settle-time snapshot** the
   verdict was actually scored against, stored inside the hash-chained verdict
   row. Hashing the live DB at export time named a state the verdicts were never

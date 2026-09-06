@@ -76,6 +76,10 @@ def test_genome_id_of_agrees_with_thegrid_when_importable():
     try:
         from src.colony.history import genome_id  # type: ignore
     except Exception as e:  # noqa: BLE001 - thegrid may need Linux-only modules
+        # Skywave and CI are Linux and run the colony: there, not importing thegrid
+        # means this test silently stopped checking anything.
+        if sys.platform == "linux":
+            pytest.fail(f"thegrid must be importable on Linux: {e}")
         pytest.skip(f"thegrid not importable here: {e}")
     finally:
         sys.path.remove(str(thegrid))
@@ -550,9 +554,9 @@ git commit -m "feat: bridge logs every published chronicle line for the verdict 
   - `is_settled(entry_epoch: int, entry_tick: int, *, now_epoch: int, now_tick: int, settle_ticks: int = SETTLE_TICKS) -> bool` — True if `now_epoch > entry_epoch` or `now_tick - entry_tick >= settle_ticks`.
   - `canonical(row: dict) -> str`; `chain_hash(prev: str, row: dict) -> str` (row without `chain`).
   - `verdict_row(entry: dict, stats: dict | None, *, settled_tick: int, epoch_found: int | None = None, history_sha256: str = "") -> dict` with keys `request_id, proposal_genome_id, epoch, epoch_found, settled_tick, births, generations, lifetime_ticks, tier, fitness, model_alias, outcome, history_sha256`; rejected entries → tier `rejected`, births 0; entries logged at the relay's `0/0` fallback → `unknown`; no stats → `unborn`; stats whose `first_tick` predates the entry's own tick (same epoch) → `preexisting` with `fitness` 0.
-  - `class Ledger(path: Path)` with `rows() -> list[dict]` (stops at the first unreadable line and remembers its byte offset), `head() -> str` (genesis `"0"*64`, cached), `append(row: dict) -> dict` (truncates a partial tail, adds `chain`, fsyncs, updates the cache), `lock()` (flock on Linux, no-op elsewhere), `verify() -> bool`, `settled_ids() -> set[str]`.
+  - `class Ledger(path: Path)` with `rows() -> list[dict]` (stops at the first unreadable line, classifying it as a torn tail — unterminated and at EOF — or a corrupt row), `head() -> str` (genesis `"0"*64`, cached), `append(row: dict) -> dict` (truncates a torn tail, raises `RuntimeError` on a corrupt row, adds `chain`, fsyncs, updates the cache), `lock()` (0600 lock file, flock on Linux, no-op elsewhere), `verify() -> bool` (False on a corrupt row), `settled_ids() -> set[str]`.
   - `class StatsReader(db_path: Path, tmp_dir: Path | None = None)` context manager: snapshots the DB through the backup API into `tmp_dir`, opens read-only; `stats(epoch: int, genome_id: str) -> dict | None` returning `{births, first_generation, max_generation, first_tick, last_tick}`; `snapshot_sha256() -> str` (hash of that snapshot, computed once).
-  - `settle_pending(entries: list[dict], ledger: Ledger, reader: StatsReader, *, now_epoch: int, now_tick: int, settle_ticks: int = SETTLE_TICKS) -> list[dict]` — appends and returns the new rows, each stamped with the snapshot hash; falls back to `epoch + 1` (within `NEXT_EPOCH_GRACE_TICKS`) once the colony has moved on.
+  - `settle_pending(entries: list[dict], ledger: Ledger, reader: StatsReader, *, now_epoch: int, now_tick: int, settle_ticks: int = SETTLE_TICKS) -> list[dict]` — appends and returns the new rows, each stamped with the snapshot hash; falls back to `epoch + 1` (`0 < first_tick <= NEXT_EPOCH_GRACE_TICKS`, so founders seeded at tick 0 are excluded) once the colony has moved on.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -653,6 +657,51 @@ def test_ledger_truncates_a_partial_tail_before_appending(tmp_path):
     lines = path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 2 and [json.loads(l)["request_id"] for l in lines] == ["a", "b"]
     assert Ledger(path).verify() is True
+
+
+def test_ledger_refuses_to_append_past_a_mid_file_corrupt_row(tmp_path):
+    """ext4 after a crash: a zero-filled block in place, the rows after it intact."""
+    path = tmp_path / "verdicts.jsonl"
+    led = Ledger(path)
+    for rid in ("a", "b", "c"):
+        led.append({"request_id": rid, "tier": "new"})
+    lines = path.read_bytes().split(b"\n")
+    lines[1] = b"\0" * len(lines[1])                     # newline-terminated NULs
+    path.write_bytes(b"\n".join(lines))
+    before = path.read_bytes()
+
+    led = Ledger(path)
+    with pytest.raises(RuntimeError, match="corrupt row at line 2"):
+        led.append({"request_id": "d", "tier": "new"})
+    assert path.read_bytes() == before                   # 'c' was not deleted to make room
+    assert Ledger(path).verify() is False                # and verify() does not call it healthy
+
+
+def test_ledger_refuses_a_newline_terminated_garbage_tail(tmp_path):
+    """A complete line that is not JSON was never a torn write; only truncate the unterminated."""
+    path = tmp_path / "verdicts.jsonl"
+    Ledger(path).append({"request_id": "a", "tier": "new"})
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("not json at all\n")
+    before = path.read_bytes()
+    led = Ledger(path)
+    with pytest.raises(RuntimeError, match="corrupt row at line 2"):
+        led.append({"request_id": "b", "tier": "new"})
+    assert path.read_bytes() == before
+
+
+async def test_run_once_lets_a_corrupt_ledger_stop_the_run(tmp_path):
+    from grid.proposal_log import ProposalLog
+    from grid.verdicts import run_once
+    db = make_db(tmp_path / "history.sqlite3", [])
+    vdir = tmp_path / "verdicts"
+    ProposalLog(vdir).record({"request_id": "r1", "epoch": 1, "tick": 1, "proposal_genome_id": "gx",
+                              "outcome": "proposed", "model_alias": "a", "reason": None,
+                              "prompt_path": "prompts/r1.txt"}, "p")
+    (vdir / "verdicts.jsonl").write_text("not json at all\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="corrupt row at line 1"):
+        await run_once(verdicts_dir=vdir, history_db=db, state={"epoch": 2, "tick": 5}, bus=None,
+                       colony="c", agent_id="grid-c")
 
 
 def test_ledger_head_is_cached(tmp_path):
@@ -790,6 +839,17 @@ def test_next_epoch_row_past_the_grace_window_is_not_credited(tmp_path):
     assert rows[0]["tier"] == "unborn" and rows[0]["epoch_found"] is None
 
 
+def test_next_epoch_founder_seen_at_tick_zero_is_not_credited(tmp_path):
+    """start_epoch observes the seeded population at observed_tick=0; a born child never is."""
+    db = make_db(tmp_path / "history.sqlite3", [(2, "g1", 500, 0, 0, 0, 180, 0, 9000)])
+    led = Ledger(tmp_path / "verdicts.jsonl")
+    with StatsReader(db) as reader:
+        rows = settle_pending([entry("r1", epoch=1, tick=900, gid="g1")], led, reader,
+                              now_epoch=2, now_tick=100)
+    assert rows[0]["tier"] == "unborn" and rows[0]["fitness"] == 0
+    assert rows[0]["epoch_found"] is None
+
+
 def test_old_epoch_row_is_found_when_now_epoch_is_later(tmp_path):
     db = make_db(tmp_path / "history.sqlite3", [(1, "g1", 40, 0, 0, 3, 13, 950, 3020)])
     led = Ledger(tmp_path / "verdicts.jsonl")
@@ -907,21 +967,33 @@ class Ledger:
         self._head: str | None = None
         self._ids: set[str] | None = None
         self._partial_tail_offset: int | None = None
+        self._corrupt_line: int | None = None
 
     def rows(self) -> list[dict]:
         out: list[dict] = []
-        self._partial_tail_offset = None
+        self._partial_tail_offset = self._corrupt_line = None
         try:
             with open(self.path, "rb") as f:
+                size = os.fstat(f.fileno()).st_size
                 offset = 0
-                for raw in f:
+                for n, raw in enumerate(f, 1):
                     if raw.strip():
                         try:
                             out.append(json.loads(raw))
                         except ValueError:      # includes a bad UTF-8 decode
-                            log.warning("verdict ledger: unreadable line at byte %d of %s "
-                                        "(partial write?); stopping there", offset, self.path)
-                            self._partial_tail_offset = offset
+                            # A row is fsynced with its newline, so only an
+                            # unterminated final line can be a torn write. Anything
+                            # else — mid-file, or newline-terminated garbage — has
+                            # complete rows after it that must not be destroyed.
+                            if not raw.endswith(b"\n") and offset + len(raw) == size:
+                                log.warning("verdict ledger: torn last line at byte %d (line %d) "
+                                            "of %s; it will be dropped on the next append",
+                                            offset, n, self.path)
+                                self._partial_tail_offset = offset
+                            else:
+                                log.error("verdict ledger: corrupt row at line %d of %s; "
+                                          "refusing to read past it", n, self.path)
+                                self._corrupt_line = n
                             break
                     offset += len(raw)
         except OSError:
@@ -951,6 +1023,12 @@ class Ledger:
 
     def append(self, row: dict) -> dict:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self._head is None:
+            self.rows()
+        if self._corrupt_line is not None:
+            # Appending would chain onto a prefix and strand every good row below it.
+            raise RuntimeError(f"ledger has a corrupt row at line {self._corrupt_line}; "
+                               "refusing to append")
         self._truncate_partial_tail()
         full = dict(row, chain=chain_hash(self.head(), row))
         with open(self.path, "a", encoding="utf-8") as f:
@@ -972,16 +1050,25 @@ class Ledger:
             return
         import fcntl
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(f"{self.path}.lock", "w", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
+        # 0600 explicitly: the umask default is 0644, and anyone who can open the
+        # lock file can hold it and stall the nightly run. Today only the 0700
+        # verdicts dir stops that.
+        fd = os.open(f"{self.path}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
             try:
                 yield
             finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     def verify(self) -> bool:
         prev = GENESIS
-        for row in self.rows():
+        rows = self.rows()
+        if self._corrupt_line is not None:
+            return False        # a prefix that verifies is not a ledger that verifies
+        for row in rows:
             if row.get("chain") != chain_hash(prev, row):
                 return False
             prev = row["chain"]
@@ -1076,7 +1163,11 @@ def _lookup(reader: StatsReader, entry: dict, *, now_epoch: int) -> tuple[dict |
         return stats, entry_epoch
     if now_epoch > entry_epoch:
         nxt = reader.stats(entry_epoch + 1, gid)
-        if nxt is not None and int(nxt.get("first_tick", 0)) <= NEXT_EPOCH_GRACE_TICKS:
+        # first_tick 0 is a founder or immigrant: start_epoch observes the seeded
+        # population at observed_tick=0, and those genomes are absent from the old
+        # epoch by construction, which is exactly what got us here. A born child is
+        # observed at its birth tick, which is at least 1.
+        if nxt is not None and 0 < int(nxt.get("first_tick", 0)) <= NEXT_EPOCH_GRACE_TICKS:
             return nxt, entry_epoch + 1
     return None, None
 
@@ -1099,7 +1190,7 @@ def settle_pending(entries: list[dict], ledger: Ledger, reader: StatsReader, *, 
     return out
 ```
 
-- [ ] **Step 4: Run** `python -m pytest tests/test_verdicts.py -q` → `19 passed`.
+- [ ] **Step 4: Run** `python -m pytest tests/test_verdicts.py -q` → `23 passed`.
 
 - [ ] **Step 5: Mutations, then commit**
 
@@ -1250,7 +1341,7 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
-- [ ] **Step 4: Run** `python -m pytest tests/test_verdicts.py -q` → `21 passed`.
+- [ ] **Step 4: Run** `python -m pytest tests/test_verdicts.py -q` → `25 passed`.
 
 - [ ] **Step 5: Mutation, then commit**
 
@@ -1384,6 +1475,23 @@ def test_negatives_carry_the_prompt_and_the_rejected_reply(tmp_path):
     assert negatives["odin-c"]["text"] == '["harvest", "fork"]'
 
 
+def test_a_rejection_logged_before_replies_were_kept_is_not_a_negative(tmp_path):
+    """Without a reply the negative's text would be the literal string 'null'."""
+    vdir, out = tmp_path / "v", tmp_path / "out"
+    seed(vdir)
+    ProposalLog(vdir).record({"ts": 1040, "request_id": "e", "epoch": 1, "tick": 12, "colony": "c",
+                              "proposal": None, "proposal_genome_id": None, "outcome": "rejected",
+                              "model_alias": "m", "reason": "bad",   # pre-wave: no "reply" key
+                              "prompt_path": "prompts/e.txt", "parent_genome": ["harvest"]}, "prompt e")
+    Ledger(vdir / "verdicts.jsonl").append({"request_id": "e", "proposal_genome_id": None, "epoch": 1,
+        "settled_tick": 3100, "births": 0, "generations": 0, "lifetime_ticks": 0, "tier": "rejected",
+        "fitness": 0, "model_alias": "m", "outcome": "rejected", "history_sha256": HIST})
+    manifest = export(vdir, out, min_tier="reproduced")
+    ids = [json.loads(l)["id"] for l in (out / "negatives.jsonl").read_text().splitlines()]
+    assert "odin-e" not in ids and sorted(ids) == ["odin-c", "odin-d"]
+    assert manifest["skipped_no_reply"] == 1
+
+
 def test_a_negative_without_its_prompt_is_skipped(tmp_path):
     vdir, out = tmp_path / "v", tmp_path / "out"
     seed(vdir)
@@ -1497,7 +1605,7 @@ def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced") -
     ledger = Ledger(vdir / "verdicts.jsonl")
     threshold = TIER_RANK[min_tier]
     records, negatives, by_tier = [], [], {}
-    skipped = skipped_missing_entry = skipped_below_threshold = 0
+    skipped = skipped_missing_entry = skipped_below_threshold = skipped_no_reply = 0
     excluded = {t: 0 for t in EXCLUDED_TIERS}
     snapshots: set[str] = set()
     stamps: list[int] = []
@@ -1512,6 +1620,11 @@ def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced") -
         negative = v["tier"] in NEGATIVE_TIERS
         if not negative and TIER_RANK.get(v["tier"], -1) < threshold:
             skipped_below_threshold += 1
+            continue
+        if v["tier"] == "rejected" and not e.get("reply"):
+            # Logged before the relay kept replies: a rejection has no proposal either,
+            # so the negative would be the literal string "null" against a real prompt.
+            skipped_no_reply += 1
             continue
         prompt_path = vdir / e.get("prompt_path", "")
         if not prompt_path.is_file():
@@ -1545,6 +1658,7 @@ def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced") -
                 "by_tier": by_tier, "skipped_missing_prompt": skipped,
                 "skipped_missing_entry": skipped_missing_entry,
                 "skipped_below_threshold": skipped_below_threshold,
+                "skipped_no_reply": skipped_no_reply,
                 "skipped_preexisting": excluded["preexisting"], "skipped_unknown": excluded["unknown"],
                 "chain_head": ledger.head(), "history_snapshots": sorted(snapshots),
                 "since_ts": min(stamps) if stamps else None, "until_ts": max(stamps) if stamps else None,
@@ -1570,7 +1684,7 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
-- [ ] **Step 4: Run** `python -m pytest tests/test_verdict_corpus.py -q` → `9 passed`.
+- [ ] **Step 4: Run** `python -m pytest tests/test_verdict_corpus.py -q` → `10 passed`.
 
 - [ ] **Step 5: Mutation, then commit**
 
@@ -1688,12 +1802,15 @@ async def test_verdicts_settle_against_the_real_fossil_db(colony, tmp_path):
 
 
 class EchoMind:
-    """Answers with the parent genome plus one nop — a valid variant of whatever was asked."""
+    """Answers with a one-opcode nop variant of whatever parent thegrid asked about."""
 
     agent_id = "grid-smoke"
 
     def __init__(self, queue: Path):
         self.queue = queue
+
+    def remember(self, text, tags, *, category="grid"):
+        return True             # the relay remembers rejections in a thread; must not AttributeError
 
     async def recall(self, query, top_k=5):
         return []
@@ -1701,7 +1818,19 @@ class EchoMind:
     async def ask(self, text, *, recall_query=None, timeout_s=180.0):
         request = json.loads((self.queue / "request.json").read_text())
         assert "nop" in [i["name"] for i in request["instruction_set"]], "thegrid's ISA lost nop"
-        return json.dumps(list(request["genome"]) + ["nop"])
+        genome = list(request["genome"])
+        # thegrid's max_genome and grid.proposal.GENOME_CAP are both 64, so appending
+        # to a parent that has drifted to the cap would be rejected, not proposed.
+        # Replace in place instead, at the last opcode that is not already a nop —
+        # replacing a trailing nop would reproduce the parent, which is also rejected.
+        if len(genome) >= GENOME_CAP:
+            for i in range(len(genome) - 1, -1, -1):
+                if genome[i] != "nop":
+                    genome[i] = "nop"
+                    break
+        else:
+            genome.append("nop")
+        return json.dumps(genome)
 
 
 @skip
@@ -1734,6 +1863,14 @@ async def test_a_real_proposal_is_credited_to_its_child(colony, tmp_path):
                   state_fetch=fetch_state, proposal_log=ProposalLog(vdir), model_alias="stub")
     assert await relay.poll_once() == "proposed"
     [entry] = ProposalLog(vdir).read_all()
+
+    # "parent + nop" is exactly an insertion thegrid's own ExperimentalMutator makes,
+    # so in a young homogeneous population the variant may already be alive. That
+    # settles 'preexisting' by design; it is not a pipeline failure.
+    if db.exists():
+        with StatsReader(db) as reader:
+            if reader.stats(entry["epoch"], entry["proposal_genome_id"]) is not None:
+                pytest.skip("variant already alive in this epoch")
 
     deadline = time.time() + 90
     while time.time() < deadline:
