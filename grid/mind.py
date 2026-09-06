@@ -70,6 +70,8 @@ class Mind:
                  http=None):
         # A local CPU model (kannaka-brain on debain2) takes ~2 min on an Odin
         # prompt, so the deadline is a deployment knob (MIND_ASK_TIMEOUT_S).
+        # bus=None is safe whenever llm is set: ask() takes the direct route and
+        # never touches self.bus, and remember()/recall() are not called on that path.
         self.ask_timeout_s = ask_timeout_s
         self.llm = llm
         self._http = http    # test seam: an httpx.AsyncClient factory
