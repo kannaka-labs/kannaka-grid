@@ -1031,8 +1031,17 @@ class Ledger:
                                "refusing to append")
         self._truncate_partial_tail()
         full = dict(row, chain=chain_hash(self.head(), row))
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(full, sort_keys=True, separators=(",", ":")) + "\n")
+        # A torn write can lose only the newline and still parse as a row; appending
+        # straight after it would glue two rows into one unparseable line.
+        sep = b""
+        if self.path.exists() and self.path.stat().st_size:
+            with open(self.path, "rb") as f:
+                f.seek(-1, os.SEEK_END)
+                if f.read(1) != b"\n":
+                    sep = b"\n"
+        line = json.dumps(full, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        with open(self.path, "ab") as f:      # binary: no CRLF translation on any host
+            f.write(sep + line + b"\n")
             f.flush()
             os.fsync(f.fileno())
         self._head = full["chain"]
