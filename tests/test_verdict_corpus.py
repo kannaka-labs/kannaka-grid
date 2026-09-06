@@ -61,7 +61,25 @@ def test_export_filters_by_tier_and_splits_negatives(tmp_path):
     assert records[0]["context"] == "prompt a"
     assert manifest["records"] == 2 and manifest["negatives"] == 2 and manifest["min_tier"] == "reproduced"
     assert manifest["by_tier"] == {"growing": 1} and manifest["chain_head"] == Ledger(vdir / "verdicts.jsonl").head()
+    assert manifest["skipped_below_threshold"] == 1                            # 'b' is only 'new'
     assert json.loads((out / "manifest.json").read_text()) == manifest
+
+
+def test_preexisting_verdicts_are_neither_positive_nor_negative(tmp_path):
+    vdir, out = tmp_path / "v", tmp_path / "out"
+    seed(vdir)
+    ProposalLog(vdir).record({"request_id": "p", "epoch": 1, "tick": 12, "colony": "c",
+                              "proposal": ["harvest", "fork"], "proposal_genome_id": "g4",
+                              "outcome": "proposed", "model_alias": "m", "reason": None,
+                              "prompt_path": "prompts/p.txt", "parent_genome": ["harvest"]}, "prompt p")
+    Ledger(vdir / "verdicts.jsonl").append({"request_id": "p", "proposal_genome_id": "g4", "epoch": 1,
+        "settled_tick": 3100, "births": 90, "generations": 38, "lifetime_ticks": 2950,
+        "tier": "preexisting", "fitness": 0, "model_alias": "m", "outcome": "proposed"})
+    manifest = export(vdir, out, min_tier="reproduced")
+    ids = {json.loads(l)["id"] for l in (out / "records.jsonl").read_text().splitlines()}
+    ids |= {json.loads(l)["id"] for l in (out / "negatives.jsonl").read_text().splitlines()}
+    assert "odin-p" not in ids
+    assert manifest["skipped_preexisting"] == 1 and manifest["skipped_unknown"] == 0
 
 
 def test_export_growing_threshold_and_missing_prompt(tmp_path):

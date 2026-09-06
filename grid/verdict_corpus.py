@@ -23,6 +23,9 @@ log = logging.getLogger("grid.verdict_corpus")
 
 TIER_RANK = {"established": 4, "enduring": 3, "growing": 2, "reproduced": 1, "new": 0}
 NEGATIVE_TIERS = ("unborn", "rejected")
+# Neither a win nor a loss: 'preexisting' credited a genome that was already alive,
+# 'unknown' never learned the epoch it was proposed in. Training on either teaches noise.
+EXCLUDED_TIERS = ("preexisting", "unknown")
 
 
 def record_for(entry: dict, verdict: dict, prompt: str, *, history_sha256: str) -> dict:
@@ -80,16 +83,22 @@ def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced",
     ledger = Ledger(vdir / "verdicts.jsonl")
     hist_sha = _sha256_db(history_db)
     threshold = TIER_RANK[min_tier]
-    records, negatives, by_tier, skipped, skipped_missing_entry = [], [], {}, 0, 0
+    records, negatives, by_tier = [], [], {}
+    skipped = skipped_missing_entry = skipped_below_threshold = 0
+    excluded = {t: 0 for t in EXCLUDED_TIERS}
     for v in ledger.rows():
         e = entries.get(v["request_id"])
         if e is None:
             skipped_missing_entry += 1
             continue
+        if v["tier"] in EXCLUDED_TIERS:
+            excluded[v["tier"]] += 1
+            continue
         if v["tier"] in NEGATIVE_TIERS:
             negatives.append(record_for(e, v, "", history_sha256=hist_sha))
             continue
         if TIER_RANK.get(v["tier"], -1) < threshold:
+            skipped_below_threshold += 1
             continue
         prompt_path = vdir / e.get("prompt_path", "")
         if not prompt_path.is_file():
@@ -108,8 +117,10 @@ def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced",
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
     manifest = {"records": len(records), "negatives": len(negatives), "min_tier": min_tier,
                 "by_tier": by_tier, "skipped_missing_prompt": skipped,
-                "skipped_missing_entry": skipped_missing_entry, "chain_head": ledger.head(),
-                "history_sha256": hist_sha, "verdicts_dir": str(vdir)}
+                "skipped_missing_entry": skipped_missing_entry,
+                "skipped_below_threshold": skipped_below_threshold,
+                "skipped_preexisting": excluded["preexisting"], "skipped_unknown": excluded["unknown"],
+                "chain_head": ledger.head(), "history_sha256": hist_sha, "verdicts_dir": str(vdir)}
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     return manifest
 

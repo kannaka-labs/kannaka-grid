@@ -50,19 +50,26 @@ def chain_hash(prev: str, row: dict) -> str:
 
 
 def verdict_row(entry: dict, stats: dict | None, *, settled_tick: int) -> dict:
+    births = gens = life = 0
     if entry.get("outcome") != "proposed":
-        tier, births, gens, life = "rejected", 0, 0, 0
+        tier = "rejected"
     elif stats is None:
-        tier, births, gens, life = "unborn", 0, 0, 0
+        tier = "unborn"
     else:
         births = int(stats.get("births") or 0)
         gens = int(stats.get("max_generation") or 0) - int(stats.get("first_generation") or 0)
         life = int(stats.get("last_tick") or 0) - int(stats.get("first_tick") or 0)
-        tier = tier_of(births, gens)
+        # genome_stats is keyed by (epoch, genome_id), so a proposal that recreates a
+        # genome already alive would inherit every carrier's births. thegrid's
+        # _observe_genome never lowers first_tick and the relay reads its tick before
+        # writing the proposal, so a child of THIS proposal has first_tick >= our tick.
+        tier = ("preexisting" if int(stats.get("first_tick", 0)) < int(entry.get("tick", 0))
+                else tier_of(births, gens))
     return {"request_id": entry["request_id"], "proposal_genome_id": entry.get("proposal_genome_id"),
             "epoch": int(entry.get("epoch", 0)), "settled_tick": settled_tick,
             "births": births, "generations": gens, "lifetime_ticks": life, "tier": tier,
-            "fitness": births, "model_alias": entry.get("model_alias", ""), "outcome": entry.get("outcome")}
+            "fitness": 0 if tier == "preexisting" else births,
+            "model_alias": entry.get("model_alias", ""), "outcome": entry.get("outcome")}
 
 
 class Ledger:

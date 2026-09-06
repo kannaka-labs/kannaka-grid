@@ -53,6 +53,21 @@ def test_verdict_row_shapes():
     assert rej["tier"] == "rejected" and rej["births"] == 0 and rej["fitness"] == 0
 
 
+def test_preexisting_genome_is_not_credited():
+    """genome_stats is keyed by (epoch, genome_id): a genome already alive carries every carrier's births."""
+    r = verdict_row(entry(tick=100), {"births": 90, "first_generation": 2, "max_generation": 40,
+                                      "first_tick": 50, "last_tick": 3000}, settled_tick=3200)
+    assert r["tier"] == "preexisting" and r["fitness"] == 0
+    assert r["births"] == 90 and r["generations"] == 38 and r["lifetime_ticks"] == 2950
+
+
+def test_child_born_on_or_after_the_proposal_is_credited():
+    """thegrid never lowers first_tick, so first_tick == our tick is our own child."""
+    r = verdict_row(entry(tick=100), {"births": 40, "first_generation": 3, "max_generation": 13,
+                                      "first_tick": 100, "last_tick": 3020}, settled_tick=3200)
+    assert r["tier"] == "growing" and r["fitness"] == 40
+
+
 def test_chain_is_deterministic_and_verifies(tmp_path):
     led = Ledger(tmp_path / "verdicts.jsonl")
     assert led.head() == "0" * 64
