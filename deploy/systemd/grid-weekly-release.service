@@ -1,0 +1,12 @@
+[Unit]
+Description=kannaka-grid weekly release gate: probe the Rogue promotion, ledger it, move kannaka-brain-current
+After=network-online.target grid-verdicts.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=nick
+Group=nick
+WorkingDirectory=/srv/grid/kannaka-grid
+EnvironmentFile=/srv/grid/grid.env
+ExecStart=/srv/grid/venv/bin/python -m grid.weekly release

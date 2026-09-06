@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# deploy/skywave/deploy.sh — run the Skywave runbook (deploy/README.md §0–§3)
+# deploy/skywave/deploy.sh — run the Skywave runbook (deploy/README.md §0–§5)
 # unattended, as user `nick`, on the host itself. Idempotent: every step checks
 # before it acts, so re-running after a partial failure is safe.
 #
@@ -167,4 +167,14 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now grid-verdicts.timer
 systemctl is-active --quiet grid-verdicts.timer || die "grid-verdicts.timer is not active: $(systemctl status grid-verdicts.timer --no-pager | tail -3)" 6
 log "§3 receipt: bridge and relay active, verdicts timer enabled"
+
+# ---- §5 weekly release ----------------------------------------------------------
+install -d -m 700 -o nick -g nick $ROOT/releases
+grep -q '^DEBAIN2_HOST=' $ROOT/grid.env || echo 'DEBAIN2_HOST=debain2' >> $ROOT/grid.env
+grep -q '^RELEASES_DIR=' $ROOT/grid.env || echo "RELEASES_DIR=$ROOT/releases" >> $ROOT/grid.env
+sudo cp $CHECKOUT/deploy/systemd/grid-weekly-release.service $CHECKOUT/deploy/systemd/grid-weekly-release.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now grid-weekly-release.timer
+systemctl is-active --quiet grid-weekly-release.timer || die "grid-weekly-release.timer is not active: $(systemctl status grid-weekly-release.timer --no-pager | tail -3)" 6
+log "§5 receipt: weekly release timer enabled"
 log "DONE — run deploy/skywave/receipts.sh to collect the six acceptance receipts"

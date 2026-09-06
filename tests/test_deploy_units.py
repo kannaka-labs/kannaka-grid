@@ -48,3 +48,11 @@ def test_verdicts_timer_runs_nightly_and_reads_the_shared_env():
     assert "EnvironmentFile=/home/nick/.kannaka-nats.env" in svc
     timer = unit("grid-verdicts.timer")
     assert "OnCalendar=" in timer and "Persistent=true" in timer
+
+
+def test_weekly_release_timer_runs_sunday_morning_after_the_rogue_weekly():
+    svc = unit("grid-weekly-release.service")
+    assert "Type=oneshot" in svc and "grid.weekly release" in svc and "EnvironmentFile=/srv/grid/grid.env" in svc
+    assert "/srv/grid/venv/bin/python" in svc
+    timer = unit("grid-weekly-release.timer")
+    assert "OnCalendar=Sun *-*-* 06:00:00" in timer and "Persistent=true" in timer

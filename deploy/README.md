@@ -121,6 +121,42 @@ Receipts:
 2. At least one row reaches `reproduced` or better within a day of the proposal it settles.
 3. The export manifest shows `records ≥ 1`, and `GRID.colony-one.verdict` is seen in a bus capture (`kannaka swarm tail --subject 'GRID.>'` or the nats app's capture).
 
+## 5. Weekly release (self-improvement sub-project 2)
+`rogue.weekly` trains and promotes a new `kannaka-brain-v*` on debain2 every week; `grid-weekly-release.timer`
+runs `python -m grid.weekly release` on Skywave every Sunday at 06:00 (host time, three hours after the
+rogue-weekly slot, `Persistent=true` so a missed run fires on the next boot). It probes the promoted
+candidate against the fossil identity/validity checks, appends a `released` or `held` row to
+`$RELEASES_DIR/versions.jsonl`, and — only on `released` — copies the candidate's ollama tag onto the
+`kannaka-brain-current` alias and restarts `grid-odin.service` so the relay's proposals are attributed to
+the new version.
+
+One-time, before the first release: create the `kannaka-brain-current` alias on debain2's gateway and mint
+the colony key that can see it (this touches debain2 and mints a key; it is not run by `deploy.sh`):
+```bash
+scp ~/grid-deploy/install-current-alias.sh debain2:~/ && ssh debain2 'bash ~/install-current-alias.sh kannaka-brain-v3'
+scp debain2:~/.grid-key-for-skywave /srv/grid/colony-one/mind-llm.key && chmod 600 /srv/grid/colony-one/mind-llm.key
+bash ~/grid-deploy/set-mind-model.sh http://10.30.0.30:4000/v1 kannaka-brain-current /srv/grid/colony-one/mind-llm.key --relay-only
+sed -i 's/^MIND_MODEL_ALIAS=.*/MIND_MODEL_ALIAS=kannaka-brain-v3/' /srv/grid/grid.env && sudo systemctl restart grid-odin
+```
+The script never prints the minted key; it lands in `~/.grid-key-for-skywave` (0600) on debain2 for the
+`scp` above to carry off.
+
+Manual commands, from `/srv/grid/kannaka-grid`:
+```bash
+/srv/grid/venv/bin/python -m grid.weekly status                # last release, versions.jsonl row count, chain verify, current candidate
+/srv/grid/venv/bin/python -m grid.weekly release --dry-run      # probe and print the decision without ledgering or flipping anything
+/srv/grid/venv/bin/python -m grid.weekly rollback                # flip back to the previous released version
+```
+Receipts:
+1. `$RELEASES_DIR/versions.jsonl` gains a `released` or `held` row naming the candidate, with the
+   identity/validity probe numbers and (on `released`) the adapter/gguf hashes and spend.
+2. `python -c "from grid.versions import Versions; print(Versions('$RELEASES_DIR/versions.jsonl').verify())"`
+   prints `True`.
+3. On `released`, the relay's next `GRID.colony-one` proposal-log entry names the new `model_alias`
+   (`journalctl -u grid-odin` or a bus capture on `GRID.>`).
+4. `python -m grid.weekly rollback` followed by `python -m grid.weekly release --week <the rolled-back week>`
+   once by hand restores the prior version and then re-releases, both landing in `versions.jsonl`.
+
 ## Known limits (v0.1)
 - Memories written by the bridge become visible to asks only after the 6 h dream+restart.
 - `GRID.*` is unsigned on the wire (spec §8).
