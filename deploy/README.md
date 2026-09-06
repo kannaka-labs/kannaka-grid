@@ -144,7 +144,7 @@ The script never prints the minted key; it lands in `~/.grid-key-for-skywave` (0
 Manual commands, from `/srv/grid/kannaka-grid`:
 ```bash
 /srv/grid/venv/bin/python -m grid.weekly status                # last release, versions.jsonl row count, chain verify, current candidate
-/srv/grid/venv/bin/python -m grid.weekly release --dry-run      # probe and print the decision without ledgering or flipping anything
+/srv/grid/venv/bin/python -m grid.weekly release --dry-run      # print the planned remote/local commands and the config it would use; does not contact debain2 or flip anything
 /srv/grid/venv/bin/python -m grid.weekly rollback                # flip back to the previous released version
 ```
 Receipts:

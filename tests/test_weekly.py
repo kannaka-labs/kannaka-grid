@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from grid.weekly import WeeklyConfig, colony_ab, find_candidate, flip, release, rollback
+from grid.mind import MindError
 
 
 class FakeRemote:
@@ -34,7 +35,7 @@ def _cfg(tmp_path):
     return WeeklyConfig(debain2_host="debain2", releases_dir=tmp_path / "releases", rogue_current_model="/srv/rogue/current-model",
                         rogue_ledger="/srv/rogue/ledger.jsonl", rogue_runs_dir="/home/nick/.kannaka-corpus/runs",
                         gateway_url="http://gw/v1", key_file=tmp_path / "key", verdicts_dir=tmp_path / "v",
-                        grid_env=tmp_path / "grid.env", set_mind_model_sh="/x/set-mind-model.sh", current_alias="kannaka-brain-current",
+                        grid_env=tmp_path / "grid.env", current_alias="kannaka-brain-current",
                         probe_timeout_s=5)
 
 
@@ -113,6 +114,41 @@ async def test_release_holds_on_probe_failure_and_releases_on_pass(tmp_path):
     assert row["decision"] == "unchanged"
 
 
+async def test_release_holds_when_identity_probe_errors(tmp_path):
+    # C1: run_identity/run_validity propagate MindError (gateway non-200, timeout, malformed
+    # or empty completion) with no try/except around them in release() -> uncaught out of
+    # asyncio.run -> no ledger row. Mutation: remove the try/except around the two awaits in
+    # grid/weekly.py release() -> this test raises MindError instead of asserting "held".
+    cfg = _cfg(tmp_path); _seed_one_proposal(tmp_path / "v")
+    r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
+                    "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
+    async def broken(prompt): raise MindError("probe: gateway-01: empty answer")
+    row = await release(cfg, r, ask_factory=lambda model: broken, local_run=lambda cmd: 0, week="2026-W37")
+    assert row["decision"] == "held"
+    assert "empty answer" in row["reason"]
+    assert not any(c.startswith("ollama cp") for c in r.commands)
+    from grid.versions import Versions
+    v = Versions(cfg.releases_dir / "versions.jsonl")
+    assert len(v.rows()) == 1 and v.rows()[0]["decision"] == "held"
+    assert v.verify() is True
+
+
+async def test_release_holds_when_candidate_not_on_key(tmp_path):
+    # I1: the probes ask cand["tag"] directly; if the colony key was minted before this vN
+    # existed the gateway would reject the ask. Verify first via the injected key_models.
+    # Mutation: remove the key_models check (or the `held` early-return) in release() -> this
+    # test's asks would be invoked (AssertionError from the fake ask) instead of holding.
+    cfg = _cfg(tmp_path); _seed_one_proposal(tmp_path / "v")
+    r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
+                    "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
+    def fake_key_models(cfg, remote): return ["kannaka-brain-current", "kannaka-brain-v3"]
+    async def must_not_be_called(prompt): raise AssertionError("probe must not run when the candidate is off the key")
+    row = await release(cfg, r, ask_factory=lambda model: must_not_be_called, local_run=lambda cmd: 0,
+                        week="2026-W37", key_models=fake_key_models)
+    assert row["decision"] == "held" and "not on the colony key" in row["reason"]
+    assert not any(c.startswith("ollama cp") for c in r.commands)
+
+
 async def test_rollback_picks_previous_release(tmp_path):
     cfg = _cfg(tmp_path)
     from grid.versions import Versions, release_row
@@ -126,6 +162,15 @@ async def test_rollback_picks_previous_release(tmp_path):
     assert r.commands == ["ollama cp kannaka-brain-v3 kannaka-brain-current"]
     with pytest.raises(SystemExit):
         rollback(cfg, r, to="kannaka-brain-v9", local_run=lambda cmd: 0)     # never released: refuse
+
+    # I2: after release v3, release v4, rollback -> v3 (above), release v5, the default
+    # rollback target must be v3 (last["previous"]) -- not v4, which
+    # previous_released(before=...) would return by walking release-order and ignoring the
+    # intervening rolled_back row. Mutation: revert the default-target line in rollback() to
+    # `versions.previous_released(before=last["version"])` -> this assertion fails (picks v4).
+    v.append(release_row(week="W3", decision="released", version="kannaka-brain-v5", previous="kannaka-brain-v3", **kw))
+    row = rollback(cfg, r, local_run=lambda cmd: 0)
+    assert row["version"] == "kannaka-brain-v3" and row["previous"] == "kannaka-brain-v5"
 
 
 async def test_dry_run_release_and_rollback_write_no_ledger_row(tmp_path):

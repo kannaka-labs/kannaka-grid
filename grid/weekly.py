@@ -39,7 +39,6 @@ class WeeklyConfig:
     key_file: Path
     verdicts_dir: Path
     grid_env: Path
-    set_mind_model_sh: str
     current_alias: str
     probe_timeout_s: float
 
@@ -56,7 +55,6 @@ class WeeklyConfig:
                    key_file=Path(env("MIND_LLM_KEY_FILE", f"/srv/grid/{colony}/mind-llm.key")),
                    verdicts_dir=Path(env("VERDICTS_DIR", f"/srv/grid/{colony}/verdicts")),
                    grid_env=Path(env("GRID_ENV", "/srv/grid/grid.env")),
-                   set_mind_model_sh=env("SET_MIND_MODEL_SH", "/home/nick/grid-deploy/set-mind-model.sh"),
                    current_alias=env("CURRENT_ALIAS", "kannaka-brain-current"),
                    probe_timeout_s=float(env("PROBE_TIMEOUT_S", "900")))
 
@@ -127,6 +125,31 @@ def gguf_hash(remote, tag: str) -> str:
     return r.stdout.split()[0] if r.returncode == 0 and r.stdout.strip() else ""
 
 
+_WILDCARD_MODEL_LISTS = (["all-team-models"], ["*"])
+
+
+def key_models(cfg: WeeklyConfig, remote) -> list[str] | None:
+    """Best-effort read of the colony key's allowed models from the gateway (spec §5: the
+    release step verifies the candidate tag is on the key before flipping). Returns None
+    when it cannot be determined (unreadable key file, curl failure, malformed reply) —
+    callers must not block on that; a real auth failure still surfaces during the probe.
+    """
+    try:
+        key = cfg.key_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    base = cfg.gateway_url[: -len("/v1")] if cfg.gateway_url.endswith("/v1") else cfg.gateway_url.rstrip("/")
+    cmd = f"curl -sf -H {shlex.quote('Authorization: Bearer ' + key)} {shlex.quote(base + '/key/info')}"
+    r = remote.run(cmd)
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    try:
+        models = json.loads(r.stdout).get("info", {}).get("models")
+    except (ValueError, AttributeError, TypeError):
+        return None
+    return models if isinstance(models, list) else None
+
+
 def colony_ab(verdicts_dir: Path) -> dict:
     by: dict[str, dict] = {}
     for row in Ledger(Path(verdicts_dir) / "verdicts.jsonl").rows():
@@ -176,7 +199,7 @@ def _iso_week() -> str:
 
 
 async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: str | None = None,
-                  dry_run: bool = False) -> dict:
+                  dry_run: bool = False, key_models=key_models) -> dict:
     week = week or _iso_week()
     versions = Versions(cfg.releases_dir / "versions.jsonl")
     last = versions.last_released()
@@ -189,11 +212,29 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
         row = release_row(decision=decision, version=(cand or {}).get("tag"), previous=released, adapter_sha256="", gguf_sha256="",
                           set_manifest_sha256="", evals={"colony_ab": colony_ab(cfg.verdicts_dir)}, spend_usd=0.0, reason=reason, **common)
         return _ledger(versions, row, dry_run=dry_run)
+    # I1: the probes ask the concrete candidate tag; the colony key may not list it yet if it
+    # was minted before this vN existed. Verify first — a candidate off the key would just
+    # make the gateway reject the probe, which C1 would then (correctly, but confusingly) hold
+    # as a probe failure. Skip the check (proceed) when the key's model list can't be read.
+    models = key_models(cfg, remote)
+    if models is not None and cand["tag"] not in models and models not in _WILDCARD_MODEL_LISTS:
+        decision, reason = "held", f"candidate {cand['tag']} not on the colony key"
+        row = release_row(decision=decision, version=cand["tag"], previous=released, adapter_sha256="", gguf_sha256="",
+                          set_manifest_sha256="", evals={"colony_ab": colony_ab(cfg.verdicts_dir)}, spend_usd=0.0, reason=reason, **common)
+        return _ledger(versions, row, dry_run=dry_run)
     ask = ask_factory(cand["tag"])
-    identity = await run_identity(ask)
-    validity = await run_validity(ask, cfg.verdicts_dir)
-    evals = {"holdout_ppl": cand["manifest"].get("holdout_ppl", {}), "identity": identity, "validity": validity,
-             "colony_ab": colony_ab(cfg.verdicts_dir)}
+    evals = {"holdout_ppl": cand["manifest"].get("holdout_ppl", {}), "colony_ab": colony_ab(cfg.verdicts_dir)}
+    try:
+        # C1: any probe failure (gateway error, timeout, malformed or empty completion) must
+        # record `held`, never crash out of `release` (spec §7).
+        evals["identity"] = identity = await run_identity(ask)
+        evals["validity"] = validity = await run_validity(ask, cfg.verdicts_dir)
+    except Exception as e:
+        decision, reason = "held", f"probe failed: {e}"
+        evals["probe_error"] = str(e)
+        row = release_row(decision=decision, version=cand["tag"], previous=released, adapter_sha256="", gguf_sha256="",
+                          set_manifest_sha256="", evals=evals, spend_usd=0.0, reason=reason, **common)
+        return _ledger(versions, row, dry_run=dry_run)
     spend = float(cand["manifest"].get("seconds", 0)) / 3600 * A100_USD_PER_H
     h = hashes(remote, cfg, cand["run"])
     h["gguf_sha256"] = gguf_hash(remote, cand["tag"])
@@ -211,7 +252,6 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
 def _window(verdicts_dir: Path) -> dict:
     led = Ledger(Path(verdicts_dir) / "verdicts.jsonl")
     rows = led.rows()
-    ts = [r.get("settled_tick") for r in rows]
     return {"since_ts": None, "until_ts": None, "chain_head": led.head(), "rows": len(rows)}
 
 
@@ -228,8 +268,18 @@ def rollback(cfg: WeeklyConfig, remote, *, to: str | None = None, local_run, dry
     last = versions.last_released()
     if last is None:
         raise SystemExit("nothing has been released; nothing to roll back")
-    target = versions.previous_released(before=last["version"]) if to is None else \
-        next((r for r in versions.rows() if r["decision"] == "released" and r["version"] == to), None)
+    if to is None:
+        # I2: `last["previous"]` is the version this release/rollback actually superseded;
+        # `previous_released(before=...)` walks release-order and would return a version that
+        # was itself later rolled back as bad (e.g. after release v3, release v4, rollback to
+        # v3, release v5: the default target must be v3, not v4).
+        prev_version = last.get("previous")
+        if prev_version is None:
+            raise SystemExit("nothing to roll back to")
+        matches = [r for r in versions.rows() if r["decision"] in ("released", "rolled_back") and r["version"] == prev_version]
+        target = matches[-1] if matches else None
+    else:
+        target = next((r for r in versions.rows() if r["decision"] == "released" and r["version"] == to), None)
     if target is None:
         raise SystemExit(f"{to or 'the previous release'} was never released; refusing")
     outcome = flip(cfg, remote, target["version"], local_run=local_run, dry_run=dry_run)
