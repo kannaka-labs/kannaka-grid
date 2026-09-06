@@ -44,9 +44,9 @@ def test_settle_rule():
 
 
 def test_verdict_row_shapes():
-    r = verdict_row(entry(), {"births": 40, "first_generation": 3, "max_generation": 10, "first_tick": 120, "last_tick": 3020},
+    r = verdict_row(entry(), {"births": 40, "first_generation": 3, "max_generation": 13, "first_tick": 120, "last_tick": 3020},
                     settled_tick=3200)
-    assert r["tier"] == "growing" and r["fitness"] == 40 and r["generations"] == 7 and r["lifetime_ticks"] == 2900
+    assert r["tier"] == "growing" and r["fitness"] == 40 and r["generations"] == 10 and r["lifetime_ticks"] == 2900
     assert r["request_id"] == "r1" and r["proposal_genome_id"] == "g1" and r["settled_tick"] == 3200
     assert verdict_row(entry(), None, settled_tick=3200)["tier"] == "unborn"
     rej = verdict_row(entry(outcome="rejected"), None, settled_tick=3200)
@@ -68,9 +68,9 @@ def test_chain_is_deterministic_and_verifies(tmp_path):
 
 
 def test_stats_reader_reads_a_copy(tmp_path):
-    db = make_db(tmp_path / "history.sqlite3", [(1, "g1", 40, 0, 0, 3, 10, 120, 3020)])
+    db = make_db(tmp_path / "history.sqlite3", [(1, "g1", 40, 0, 0, 3, 13, 120, 3020)])
     with StatsReader(db) as reader:
-        assert reader.stats(1, "g1") == {"births": 40, "first_generation": 3, "max_generation": 10,
+        assert reader.stats(1, "g1") == {"births": 40, "first_generation": 3, "max_generation": 13,
                                          "first_tick": 120, "last_tick": 3020}
         assert reader.stats(1, "missing") is None
         assert reader.stats(2, "g1") is None
@@ -98,8 +98,16 @@ def test_stats_reader_sees_rows_still_in_the_wal(tmp_path):
     db.close()
 
 
+def test_stats_reader_leaves_no_temp_file_when_the_db_is_missing(tmp_path):
+    reader = StatsReader(tmp_path / "absent.sqlite3")
+    with pytest.raises(sqlite3.OperationalError):
+        with reader:
+            pass
+    assert reader.copy_path is not None and not Path(reader.copy_path).exists()
+
+
 def test_settle_pending_appends_only_due_and_unsettled(tmp_path):
-    db = make_db(tmp_path / "history.sqlite3", [(1, "g1", 40, 0, 0, 3, 10, 120, 3020)])
+    db = make_db(tmp_path / "history.sqlite3", [(1, "g1", 40, 0, 0, 3, 13, 120, 3020)])
     led = Ledger(tmp_path / "verdicts.jsonl")
     entries = [entry("r1", tick=100, gid="g1"), entry("r2", tick=200, gid="g2"),
                entry("r3", tick=4000, gid="g3"), entry("r4", tick=100, outcome="rejected")]

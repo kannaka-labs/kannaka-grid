@@ -56,11 +56,9 @@ def verdict_row(entry: dict, stats: dict | None, *, settled_tick: int) -> dict:
         tier, births, gens, life = "unborn", 0, 0, 0
     else:
         births = int(stats.get("births") or 0)
-        max_gen = int(stats.get("max_generation") or 0)
-        first_gen = int(stats.get("first_generation") or 0)
-        gens = max_gen - first_gen
+        gens = int(stats.get("max_generation") or 0) - int(stats.get("first_generation") or 0)
         life = int(stats.get("last_tick") or 0) - int(stats.get("first_tick") or 0)
-        tier = tier_of(births, max_gen)
+        tier = tier_of(births, gens)
     return {"request_id": entry["request_id"], "proposal_genome_id": entry.get("proposal_genome_id"),
             "epoch": int(entry.get("epoch", 0)), "settled_tick": settled_tick,
             "births": births, "generations": gens, "lifetime_ticks": life, "tier": tier,
@@ -120,17 +118,22 @@ class StatsReader:
     def __enter__(self) -> "StatsReader":
         fd, self.copy_path = tempfile.mkstemp(suffix=".sqlite3")
         os.close(fd)
-        src = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
         try:
-            dst = sqlite3.connect(self.copy_path)
+            src = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
             try:
-                src.backup(dst)
+                dst = sqlite3.connect(self.copy_path)
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
             finally:
-                dst.close()
-        finally:
-            src.close()
-        self._db = sqlite3.connect(f"file:{self.copy_path}?mode=ro", uri=True)
-        self._db.row_factory = sqlite3.Row
+                src.close()
+            self._db = sqlite3.connect(f"file:{self.copy_path}?mode=ro", uri=True)
+            self._db.row_factory = sqlite3.Row
+        except Exception:
+            if os.path.exists(self.copy_path):
+                os.unlink(self.copy_path)
+            raise
         return self
 
     def __exit__(self, *exc) -> None:
