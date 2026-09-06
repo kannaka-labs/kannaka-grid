@@ -230,6 +230,17 @@ def test_next_epoch_row_past_the_grace_window_is_not_credited(tmp_path):
     assert rows[0]["tier"] == "unborn" and rows[0]["epoch_found"] is None
 
 
+def test_next_epoch_founder_seen_at_tick_zero_is_not_credited(tmp_path):
+    """start_epoch observes the seeded population at observed_tick=0; a born child never is."""
+    db = make_db(tmp_path / "history.sqlite3", [(2, "g1", 500, 0, 0, 0, 180, 0, 9000)])
+    led = Ledger(tmp_path / "verdicts.jsonl")
+    with StatsReader(db) as reader:
+        rows = settle_pending([entry("r1", epoch=1, tick=900, gid="g1")], led, reader,
+                              now_epoch=2, now_tick=100)
+    assert rows[0]["tier"] == "unborn" and rows[0]["fitness"] == 0
+    assert rows[0]["epoch_found"] is None
+
+
 def test_old_epoch_row_is_found_when_now_epoch_is_later(tmp_path):
     db = make_db(tmp_path / "history.sqlite3", [(1, "g1", 40, 0, 0, 3, 13, 950, 3020)])
     led = Ledger(tmp_path / "verdicts.jsonl")

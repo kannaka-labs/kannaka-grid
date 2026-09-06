@@ -269,7 +269,11 @@ def _lookup(reader: StatsReader, entry: dict, *, now_epoch: int) -> tuple[dict |
         return stats, entry_epoch
     if now_epoch > entry_epoch:
         nxt = reader.stats(entry_epoch + 1, gid)
-        if nxt is not None and int(nxt.get("first_tick", 0)) <= NEXT_EPOCH_GRACE_TICKS:
+        # first_tick 0 is a founder or immigrant: start_epoch observes the seeded
+        # population at observed_tick=0, and those genomes are absent from the old
+        # epoch by construction, which is exactly what got us here. A born child is
+        # observed at its birth tick, which is at least 1.
+        if nxt is not None and 0 < int(nxt.get("first_tick", 0)) <= NEXT_EPOCH_GRACE_TICKS:
             return nxt, entry_epoch + 1
     return None, None
 
