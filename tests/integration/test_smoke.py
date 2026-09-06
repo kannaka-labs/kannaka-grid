@@ -167,3 +167,72 @@ async def test_verdicts_settle_against_the_real_fossil_db(colony, tmp_path):
                           agent_id="grid-smoke", settle_ticks=100)
     assert [r["tier"] for r in rows] == ["unborn"]
     assert Ledger(vdir / "verdicts.jsonl").verify()
+
+
+class EchoMind:
+    """Answers with the parent genome plus one nop — a valid variant of whatever was asked."""
+
+    agent_id = "grid-smoke"
+
+    def __init__(self, queue: Path):
+        self.queue = queue
+
+    async def recall(self, query, top_k=5):
+        return []
+
+    async def ask(self, text, *, recall_query=None, timeout_s=180.0):
+        request = json.loads((self.queue / "request.json").read_text())
+        assert "nop" in [i["name"] for i in request["instruction_set"]], "thegrid's ISA lost nop"
+        return json.dumps(list(request["genome"]) + ["nop"])
+
+
+@skip
+async def test_a_real_proposal_is_credited_to_its_child(colony, tmp_path):
+    """The whole pipeline on a genome thegrid really births: propose, consume, credit.
+
+    The 'unborn' smoke above proves the negative path. Only this one proves the
+    join actually lands — that our genome_id names the child thegrid recorded.
+    """
+    from grid.proposal_log import ProposalLog
+    from grid.verdicts import Ledger, StatsReader, run_once
+    base, queue = colony
+    db = queue.parent / "history.sqlite3"
+    request_path = queue / "request.json"
+
+    def state() -> dict:
+        return httpx.get(f"{base}/api/state", timeout=2).json()
+
+    async def fetch_state() -> dict:
+        return state()
+
+    deadline = time.time() + 90
+    while time.time() < deadline and not request_path.exists():
+        time.sleep(0.5)
+    if not request_path.exists():
+        pytest.skip("thegrid filed no Odin request in 90s (its mutator asks on ~5% of births)")
+
+    vdir = tmp_path / "verdicts"
+    relay = Relay(queue, colony="smoke", agent_id="grid-smoke", mind=EchoMind(queue), bus=NullBus(),
+                  state_fetch=fetch_state, proposal_log=ProposalLog(vdir), model_alias="stub")
+    assert await relay.poll_once() == "proposed"
+    [entry] = ProposalLog(vdir).read_all()
+
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        if not (queue / "proposal.json").exists() and db.exists():
+            with StatsReader(db) as reader:
+                if reader.stats(entry["epoch"], entry["proposal_genome_id"]) is not None:
+                    break
+        time.sleep(1)
+    else:
+        pytest.skip("thegrid did not consume and birth the proposed genome within 90s")
+
+    rows = await run_once(verdicts_dir=vdir, history_db=db, state=state(), bus=None, colony="smoke",
+                          agent_id="grid-smoke", settle_ticks=1)
+    assert [r["request_id"] for r in rows] == [entry["request_id"]]
+    assert rows[0]["tier"] not in ("unborn", "preexisting")
+    assert rows[0]["fitness"] >= 1 and rows[0]["epoch_found"] is not None
+    assert Ledger(vdir / "verdicts.jsonl").verify()
+    with StatsReader(db) as reader:
+        stats = reader.stats(entry["epoch"], entry["proposal_genome_id"])
+    assert stats["first_tick"] >= entry["tick"]      # the child is ours, not a strain already alive
