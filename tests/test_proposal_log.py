@@ -51,3 +51,13 @@ def test_log_never_raises_when_the_directory_is_unwritable(tmp_path):
                        colony="c", mind="m", model_alias="a", prompt="p", ts_ms=1)
     assert log.record(e, "p") is False
     assert log.read_all() == []
+
+
+def test_read_all_stops_at_a_partial_trailing_line(tmp_path):
+    log = ProposalLog(tmp_path)
+    e = proposal_entry(req=req("a"), proposal=["fork"], outcome="proposed", reason=None, epoch=1, tick=1,
+                       colony="c", mind="m", model_alias="a", prompt="p", ts_ms=1)
+    assert log.record(e, "p") is True
+    with open(tmp_path / "proposals.jsonl", "a", encoding="utf-8") as f:
+        f.write('{"request_id": "b", "truncated')          # crash mid-write
+    assert [x["request_id"] for x in log.read_all()] == ["a"]

@@ -40,7 +40,10 @@ class ProposalLog:
     def record(self, entry: dict, prompt: str) -> bool:
         try:
             (self.dir / "prompts").mkdir(parents=True, exist_ok=True)
-            (self.dir / entry["prompt_path"]).write_text(prompt, encoding="utf-8")
+            with open(self.dir / entry["prompt_path"], "w", encoding="utf-8") as p:
+                p.write(prompt)
+                p.flush()
+                os.fsync(p.fileno())
             with open(self.path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, separators=(",", ":"), sort_keys=True) + "\n")
                 f.flush()
@@ -51,8 +54,17 @@ class ProposalLog:
             return False
 
     def read_all(self) -> list[dict]:
+        out: list[dict] = []
         try:
             with open(self.path, encoding="utf-8") as f:
-                return [json.loads(line) for line in f if line.strip()]
+                for n, line in enumerate(f, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        out.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        log.warning("proposal log: stopping at unreadable line %d (partial write?)", n)
+                        break
         except OSError:
             return []
+        return out
