@@ -165,5 +165,6 @@ done
 sudo cp $CHECKOUT/deploy/systemd/grid-verdicts.service $CHECKOUT/deploy/systemd/grid-verdicts.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now grid-verdicts.timer
+systemctl is-active --quiet grid-verdicts.timer || die "grid-verdicts.timer is not active: $(systemctl status grid-verdicts.timer --no-pager | tail -3)" 6
 log "§3 receipt: bridge and relay active, verdicts timer enabled"
 log "DONE — run deploy/skywave/receipts.sh to collect the six acceptance receipts"

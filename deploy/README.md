@@ -54,6 +54,8 @@ Receipts (acceptance criteria, spec §12):
 Paste the captured payloads for 1, 2, 4 and 5 into the PR that closes the deploy.
 
 ## 4. Verdicts (self-improvement sub-project 1)
+Verdicts logs live under `/srv/grid/colony-one/verdicts` (mode 700): `proposals.jsonl`,
+`prompts/`, `verdicts.jsonl`, and `chronicle.jsonl`.
 `grid-verdicts.timer` runs `python -m grid.verdicts` nightly at 03:15 (host time,
 `Persistent=true` so a missed run fires on the next boot): it settles every
 logged Odin proposal against the fossil record thegrid wrote for that epoch,
@@ -65,16 +67,16 @@ sudo systemctl enable --now grid-verdicts.timer
 ```
 A manual run, from `/srv/grid/kannaka-grid`, settles without publishing to the bus:
 ```bash
-python -m grid.verdicts --no-publish
+/srv/grid/venv/bin/python -m grid.verdicts --no-publish
 ```
 Export the week's verdict corpus (positives, negatives, and a manifest with the chain head) for training:
 ```bash
-python -m grid.verdict_corpus --out ~/.kannaka-corpus/grid/$(date -u +%G-W%V)
+/srv/grid/venv/bin/python -m grid.verdict_corpus --out ~/.kannaka-corpus/grid/$(date -u +%G-W%V)
 ```
 Receipts:
 1. `verdicts.jsonl` has rows and the ledger's hash chain verifies:
    ```bash
-   python -c "from grid.verdicts import Ledger; print(Ledger('/srv/grid/colony-one/verdicts/verdicts.jsonl').verify())"
+   /srv/grid/venv/bin/python -c "from grid.verdicts import Ledger; print(Ledger('/srv/grid/colony-one/verdicts/verdicts.jsonl').verify())"
    ```
    prints `True`.
 2. At least one row reaches `reproduced` or better within a day of the proposal it settles.
