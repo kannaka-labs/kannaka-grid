@@ -22,6 +22,10 @@ log = logging.getLogger("grid.verdicts")
 SETTLE_TICKS = 3000
 TIERS = ("established", "enduring", "growing", "reproduced", "new")
 GENESIS = "0" * 64
+# A proposal written near the end of an epoch is often consumed by the first births
+# of the next one. Only the very start of that epoch can be our child; later rows
+# are somebody else's strain that happens to share the id.
+NEXT_EPOCH_GRACE_TICKS = 1000
 
 
 def tier_of(births: int, generations: int) -> str:
@@ -49,10 +53,17 @@ def chain_hash(prev: str, row: dict) -> str:
     return hashlib.sha256((prev + canonical(row)).encode()).hexdigest()
 
 
-def verdict_row(entry: dict, stats: dict | None, *, settled_tick: int) -> dict:
+def verdict_row(entry: dict, stats: dict | None, *, settled_tick: int,
+                epoch_found: int | None = None) -> dict:
+    entry_epoch, entry_tick = int(entry.get("epoch", 0)), int(entry.get("tick", 0))
     births = gens = life = 0
     if entry.get("outcome") != "proposed":
-        tier = "rejected"
+        tier, epoch_found = "rejected", None
+    elif entry_epoch == 0 and entry_tick == 0:
+        # The relay's _epoch_tick fallback: /api/state was unreachable, so the
+        # (epoch, genome_id) key is a guess. A missing row is then no evidence the
+        # child was never born, and a present one is no evidence it was ours.
+        tier, epoch_found = "unknown", None
     elif stats is None:
         tier = "unborn"
     else:
@@ -63,10 +74,12 @@ def verdict_row(entry: dict, stats: dict | None, *, settled_tick: int) -> dict:
         # genome already alive would inherit every carrier's births. thegrid's
         # _observe_genome never lowers first_tick and the relay reads its tick before
         # writing the proposal, so a child of THIS proposal has first_tick >= our tick.
-        tier = ("preexisting" if int(stats.get("first_tick", 0)) < int(entry.get("tick", 0))
-                else tier_of(births, gens))
+        # Epoch ticks restart at 0, so the guard only means anything within our epoch.
+        stale = (epoch_found is None or epoch_found == entry_epoch) and \
+            int(stats.get("first_tick", 0)) < entry_tick
+        tier = "preexisting" if stale else tier_of(births, gens)
     return {"request_id": entry["request_id"], "proposal_genome_id": entry.get("proposal_genome_id"),
-            "epoch": int(entry.get("epoch", 0)), "settled_tick": settled_tick,
+            "epoch": entry_epoch, "epoch_found": epoch_found, "settled_tick": settled_tick,
             "births": births, "generations": gens, "lifetime_ticks": life, "tier": tier,
             "fitness": 0 if tier == "preexisting" else births,
             "model_alias": entry.get("model_alias", ""), "outcome": entry.get("outcome")}
@@ -156,6 +169,27 @@ class StatsReader:
         return dict(row) if row else None
 
 
+def _lookup(reader: StatsReader, entry: dict, *, now_epoch: int) -> tuple[dict | None, int | None]:
+    """The genome's stats and the epoch they came from, or (None, None).
+
+    thegrid consumes proposal.json at the next qualifying birth, which for a
+    proposal written late in an epoch can fall after the epoch rolled over. Only
+    the first NEXT_EPOCH_GRACE_TICKS of that epoch could be our child.
+    """
+    gid = entry.get("proposal_genome_id")
+    if not gid:
+        return None, None
+    entry_epoch = int(entry.get("epoch", 0))
+    stats = reader.stats(entry_epoch, gid)
+    if stats is not None:
+        return stats, entry_epoch
+    if now_epoch > entry_epoch:
+        nxt = reader.stats(entry_epoch + 1, gid)
+        if nxt is not None and int(nxt.get("first_tick", 0)) <= NEXT_EPOCH_GRACE_TICKS:
+            return nxt, entry_epoch + 1
+    return None, None
+
+
 def settle_pending(entries: list[dict], ledger: Ledger, reader: StatsReader, *, now_epoch: int,
                    now_tick: int, settle_ticks: int = SETTLE_TICKS) -> list[dict]:
     done = ledger.settled_ids()
@@ -166,8 +200,8 @@ def settle_pending(entries: list[dict], ledger: Ledger, reader: StatsReader, *, 
         if not is_settled(int(e.get("epoch", 0)), int(e.get("tick", 0)), now_epoch=now_epoch,
                           now_tick=now_tick, settle_ticks=settle_ticks):
             continue
-        stats = reader.stats(int(e.get("epoch", 0)), e["proposal_genome_id"]) if e.get("proposal_genome_id") else None
-        out.append(ledger.append(verdict_row(e, stats, settled_tick=now_tick)))
+        stats, found = _lookup(reader, e, now_epoch=now_epoch)
+        out.append(ledger.append(verdict_row(e, stats, settled_tick=now_tick, epoch_found=found)))
         done.add(e["request_id"])
     return out
 

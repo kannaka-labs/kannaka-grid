@@ -136,6 +136,45 @@ def test_settle_pending_appends_only_due_and_unsettled(tmp_path):
     assert led.verify() is True and len(led.rows()) == 3
 
 
+def test_unknown_epoch_settles_as_unknown_not_unborn(tmp_path):
+    """0/0 is the relay's fallback when /api/state was down, not epoch 0 tick 0."""
+    db = make_db(tmp_path / "history.sqlite3", [(0, "g1", 40, 0, 0, 3, 13, 0, 3020)])
+    led = Ledger(tmp_path / "verdicts.jsonl")
+    with StatsReader(db) as reader:
+        rows = settle_pending([entry("r0", epoch=0, tick=0, gid="g1")], led, reader,
+                              now_epoch=1, now_tick=50)
+    assert [r["tier"] for r in rows] == ["unknown"]        # the (0, g1) row is not evidence
+    assert rows[0]["births"] == 0 and rows[0]["fitness"] == 0 and rows[0]["epoch_found"] is None
+    assert led.settled_ids() == {"r0"}                     # settled: it leaves the pending set
+
+
+def test_proposal_consumed_in_the_next_epoch_is_found(tmp_path):
+    db = make_db(tmp_path / "history.sqlite3", [(2, "g1", 40, 0, 0, 3, 13, 40, 900)])
+    led = Ledger(tmp_path / "verdicts.jsonl")
+    with StatsReader(db) as reader:
+        rows = settle_pending([entry("r1", epoch=1, tick=900, gid="g1")], led, reader,
+                              now_epoch=2, now_tick=100)
+    assert rows[0]["tier"] == "growing" and rows[0]["fitness"] == 40 and rows[0]["epoch_found"] == 2
+
+
+def test_next_epoch_row_past_the_grace_window_is_not_credited(tmp_path):
+    db = make_db(tmp_path / "history.sqlite3", [(2, "g1", 40, 0, 0, 3, 13, 5000, 9000)])
+    led = Ledger(tmp_path / "verdicts.jsonl")
+    with StatsReader(db) as reader:
+        rows = settle_pending([entry("r1", epoch=1, tick=900, gid="g1")], led, reader,
+                              now_epoch=2, now_tick=100)
+    assert rows[0]["tier"] == "unborn" and rows[0]["epoch_found"] is None
+
+
+def test_old_epoch_row_is_found_when_now_epoch_is_later(tmp_path):
+    db = make_db(tmp_path / "history.sqlite3", [(1, "g1", 40, 0, 0, 3, 13, 950, 3020)])
+    led = Ledger(tmp_path / "verdicts.jsonl")
+    with StatsReader(db) as reader:
+        rows = settle_pending([entry("r1", epoch=1, tick=900, gid="g1")], led, reader,
+                              now_epoch=2, now_tick=100)
+    assert rows[0]["tier"] == "growing" and rows[0]["epoch_found"] == 1
+
+
 class FakeBus:
     def __init__(self):
         self.published = []
