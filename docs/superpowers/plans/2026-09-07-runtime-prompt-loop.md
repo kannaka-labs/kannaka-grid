@@ -39,7 +39,7 @@
 - `grid/proposal.py` — `render_prompt` renders a `Variant` instead of a hardcoded f-string.
 - `grid/odin.py` — per-dimension arm assignment; the chosen variant drives the render, the sampling and whether recall is called; the log records the variant.
 - `grid/mind.py` — `ask` accepts sampling parameters instead of hardcoding them.
-- `grid/proposal_log.py` — `proposal_entry` gains `prompt_variant` and `prompt_sha256`. (It lives here, not in `grid/verdicts.py`.)
+- `grid/proposal_log.py` — `proposal_entry` gains `prompt_variant` and `prompt_variant_sha256`. (It lives here, not in `grid/verdicts.py`. The template hash needs its own name: `prompt_sha256` already exists and hashes the RENDERED prompt.)
 - `grid/weekly.py` — validity counts and floor; dimensions; exclusivity; factorial; CLI.
 - `grid/versions.py` — the ledger row gains `dimension`.
 - `deploy/README.md`, `deploy/grid.env.example`, `deploy/skywave/verdict-receipts.sh` — operator documentation and the new environment keys.
@@ -170,7 +170,7 @@ git commit -F <message-file>
 - Consumes from Task 1: `get_variant`, `Variant`.
 - Produces, for Tasks 3-6:
   - `assign(request_id: str, *, dimension: str, arms: list[str], weights: list[float]) -> str` in `grid/odin.py`, returning an arm label
-  - proposal log entries carrying `prompt_variant: str` and `prompt_sha256: str`
+  - proposal log entries carrying `prompt_variant: str` and `prompt_variant_sha256: str`
   - `RelayConfig` fields `prompt_variant: str` (from `MIND_PROMPT_VARIANT`, empty means the registry default) and `prompt_candidate: str` (from `MIND_PROMPT_CANDIDATE`, empty means no prompt A/B)
 
 - [ ] **Step 1: Write the failing test for dimension-salted independence**
@@ -241,7 +241,7 @@ Choose the variant before the recall call, because the variant decides whether r
 
 - [ ] **Step 7: Log the variant**
 
-`proposal_entry` gains `prompt_variant` and `prompt_sha256`, both defaulting to `""` so old log lines still parse. `Relay._log` passes the variant that produced the prompt, including on the deferred-bin rejection path, where the arm that could not answer is still the arm that was asked.
+`proposal_entry` gains `prompt_variant` and `prompt_variant_sha256`, both defaulting to `""` so old log lines still parse. `Relay._log` passes the variant that produced the prompt, including on the deferred-bin rejection path, where the arm that could not answer is still the arm that was asked.
 
 - [ ] **Step 8: Write the behavioural tests**
 
