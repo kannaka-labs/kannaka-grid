@@ -1,0 +1,7 @@
+## grid.env A/B lines (the hand-started smoke)
+MIND_MODEL_ALIAS=kannaka-brain-7b-v1
+MIND_LLM_CANDIDATE=kannaka-brain-current
+MIND_AB_SPLIT=0.2
+
+## relay announcing the split
+Sep 07 13:41:26 nick-debain1 python[2450055]: 2026-09-07 13:41:26,709 grid.odin INFO A/B: candidate kannaka-brain-current at split 0.20

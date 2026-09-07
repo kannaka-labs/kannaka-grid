@@ -1,0 +1,52 @@
+Colony live A/B (sub-project 3) — deploy and smoke receipt
+Skywave (10.30.0.20), 2026-09-07. Checkout at 2c0354e.
+
+WHAT THIS PROVES
+
+1-deploy.txt      the merged branch is installed, all five units active, and
+                  grid-verdicts.service carries the nightly reconciler as its
+                  ExecStartPost.
+
+2-ab-started.txt  a hand-started A/B, per the spec's §7 receipt: the candidate
+                  and split written into grid.env by hand, grid-odin restarted,
+                  and the relay announcing "A/B: candidate ... at split 0.20".
+
+3-reconciler-...  the finding that mattered most before deploying. The nightly
+                  reconciler repairs grid.env against the ledger, and it must
+                  never touch an A/B an operator started by hand. In production
+                  it warned, left the file byte-identical (same md5 before and
+                  after), wrote no ledger row, and exited 0.
+
+4-ab-view.txt     the CLI reporting an A/B that exists only in the environment,
+                  with both arms and an explicit note that the window start is
+                  unknown.
+
+5-arm-assignment  every live request answered by the arm its hash selects, and
+6-observed-split  the hash splitting 19.7% candidate over 20000 synthetic ids.
+                  The observed live split ran under target (1 of 15 against an
+                  expected 3), which is ordinary small-sample noise: what makes
+                  the routing provable is 0 mismatches, not the ratio.
+
+7-alias-digests   why the candidate was repointed mid-smoke. kannaka-brain-current,
+                  kannaka-brain-serve and kannaka-brain-7b-v1 all share digest
+                  67ed8d0a3526, so the first candidate was the incumbent's own
+                  weights and the A/B was a model against itself. Repointed at
+                  kannaka-brain-v3 (c4045382428a, a genuinely different model).
+
+8-abort.txt       the operator abort: a held row carrying the arms it threw away,
+                  the candidate cleared, the relay restarted and reporting
+                  "A/B: none", and the CLI back to null.
+
+TWO THINGS FOR NICK, BOTH RAISED ON THE COORDINATION BOARD
+
+The `current` alias was re-pointed onto the 7b adapter by hand, and the relay
+moved with it on 09-06 with no committed receipt. The gate promotes a winner by
+copying it onto that alias, so a by-hand promotion leaves no ledger row: the
+gate still reports released=null and would flip the alias out from under that
+choice on the first Sunday a candidate wins.
+
+The abort's arms snapshot covers all recorded history, not an A/B window, so it
+is a hint and not a result — but it is a loud one. Over that history the 14b v3
+reproduced 8 of 33 settled proposals (0.24) against the 7b's 1 of 49 (0.02).
+If that gap survives a real A/B, the 7b promotion cost an order of magnitude of
+proposal quality.

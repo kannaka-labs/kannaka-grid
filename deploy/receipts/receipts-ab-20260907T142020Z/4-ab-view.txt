@@ -1,0 +1,2 @@
+## the env-only A/B view
+{"ab": {"source": "env", "candidate": "kannaka-brain-current", "incumbent": "kannaka-brain-7b-v1", "split": "0.2", "arms": {"kannaka-brain-7b-v1": {"settled": 49, "reproduced": 1, "rate": 0.02040816326530612, "births_per_proposal": 0.8367346938775511}, "kannaka-brain-current": {"settled": 0, "reproduced": 0, "rate": 0.0, "births_per_proposal": 0.0}}, "note": "env-only A/B: no ab_started row, so the window start is unknown; arms cover all recorded history"}}

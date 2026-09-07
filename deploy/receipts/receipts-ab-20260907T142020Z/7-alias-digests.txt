@@ -1,0 +1,8 @@
+## ollama model digests on debain2 (read-only)
+kannaka-brain-7b-read:latest     f8b637e1ae31    4.8 GB  7.6B
+kannaka-brain-7b-v1:latest       67ed8d0a3526    4.7 GB  7.6B
+kannaka-brain-current:latest     67ed8d0a3526    4.7 GB  7.6B
+kannaka-brain-serve:latest       67ed8d0a3526    4.7 GB  7.6B
+kannaka-brain-v1:latest          6d74b256b0b0    9.0 GB  14.8B
+kannaka-brain-v2:latest          ec6b891ed7cc    9.0 GB  14.8B
+kannaka-brain-v3:latest          c4045382428a    9.0 GB  14.8B

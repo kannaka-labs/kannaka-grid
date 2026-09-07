@@ -1,0 +1,16 @@
+# colony live A/B deploy receipt
+
+## checkout
+2c0354e docs(reviews): keep the colony A/B review record out of the scratch worktree
+af71b22 feat(weekly): colony live A/B — the gate tests a candidate on real colony traffic
+c43bdcf fix(ab): make the hand-start exemption permanent, and unoverload short_arms
+
+## units
+active
+active
+active
+active
+active
+
+## grid-verdicts.service ExecStartPost
+14:ExecStartPost=/srv/grid/venv/bin/python -m grid.weekly ab --check

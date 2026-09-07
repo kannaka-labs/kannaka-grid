@@ -1,0 +1,15 @@
+## the reconciler must NOT touch a hand-started A/B (finding D1 / verification Q2)
+
+$ md5sum /srv/grid/grid.env   # before
+efd50ba77215cba62f937413ead33001  /srv/grid/grid.env
+
+$ python -m grid.weekly ab --check
+2026-09-07 14:20:28,381 grid.weekly WARNING colony A/B: kannaka-brain-current is split in /srv/grid/grid.env with no ledger row; hand-started, leaving it alone
+no A/B running
+exit=0
+
+$ md5sum /srv/grid/grid.env   # after
+efd50ba77215cba62f937413ead33001  /srv/grid/grid.env
+
+$ wc -l versions.jsonl   # no row written
+1

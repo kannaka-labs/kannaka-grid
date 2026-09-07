@@ -1,0 +1,18 @@
+## ab --abort ends the hand-started A/B
+
+$ python -m grid.weekly ab --abort
+2026-09-07 16:10:19,890 grid.weekly INFO 2026-W37: held (colony A/B aborted by operator)
+{"ts": 1788815419.8766875, "week": "2026-W37", "decision": "held", "version": "kannaka-brain-v3", "previous": null, "base": "", "run": "", "adapter_sha256": "", "gguf_sha256": "", "set_manifest_sha256": "", "grid_examples": {}, "verdict_window": {"since_ts": null, "until_ts": null, "chain_head": "ff828762dd19b45b4f39d70cfaaa79369667f7390941771d1d344b1a2d8fc866", "rows": 265}, "evals": {"colony_ab": {"source": "env", "candidate": "kannaka-brain-v3", "incumbent": "kannaka-brain-7b-v1", "split": "0.2", "arms": {"kannaka-brain-7b-v1": {"settled": 49, "reproduced": 1, "rate": 0.02040816326530612, "births_per_proposal": 0.8367346938775511}, "kannaka-brain-v3": {"settled": 33, "reproduced": 8, "rate": 0.24242424242424243, "births_per_proposal": 4.787878787878788}}, "note": "env-only A/B: no ab_started row, so the window start is unknown; arms cover all recorded history", "binding": false, "winner": null}}, "spend_usd": 0.0, "over_budget": false, "rogue_ledger_ts": 0.0, "reason": "colony A/B aborted by operator"}
+exit=0
+
+$ grep A/B lines in grid.env   # candidate cleared
+MIND_MODEL_ALIAS=kannaka-brain-7b-v1
+MIND_LLM_CANDIDATE=
+MIND_AB_SPLIT=0.2
+
+$ relay after the restart
+2026-09-07 16:10:20,414 grid.odin INFO A/B: none
+2026-09-07 16:10:20,455 grid.odin INFO watching /srv/grid/colony-one/state/operator for grid-colony-one
+
+$ python -m grid.weekly ab
+{"ab": null}

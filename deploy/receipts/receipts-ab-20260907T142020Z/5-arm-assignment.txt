@@ -1,0 +1,8 @@
+ed96c58128a512   predicted=incumbent answered=incumbent
+6ebaddedc8011b   predicted=incumbent answered=incumbent
+5a9481e34d1cee   predicted=incumbent answered=incumbent
+0b058a2b2b57f7   predicted=incumbent answered=incumbent
+449051bc773308   predicted=incumbent answered=incumbent
+b998e7aa52db77   predicted=incumbent answered=incumbent
+mismatches: 0 of 6
+arm_for over 20000 synthetic ids: {'incumbent': 16032, 'candidate': 3968}

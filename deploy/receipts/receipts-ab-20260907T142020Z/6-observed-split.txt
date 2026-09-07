@@ -1,0 +1,8 @@
+## observed traffic split, and every request answered by the arm its hash selects
+
+A/B window: 14:45 -> 16:07
+proposals: 15   incumbent(7b-v1): 14   candidate(v3): 1   observed split: 6.7%  (target 20%)
+arm mismatches: 0 of 15  (every request answered by the arm its hash selects)
+
+candidate-answered proposals:
+  16:02  kannaka-brain-v3  proposed  request f309b04250fa2f
