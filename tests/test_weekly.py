@@ -439,7 +439,10 @@ async def test_release_start_ab_records_flip_incomplete_when_relay_restart_fails
     # C2: if the restart fails after a START, the candidate arm never runs and must not
     # be recorded as `ab_started` -- otherwise ab_check would falsely call it stuck 48h
     # later and permanently block it via lost_tags.
+    # N2: nor may the env go on claiming a candidate the ledger doesn't track -- start_ab
+    # must revert its own env writes on a failed restart, same as flip() does for C1.
     cfg = _cfg(tmp_path); _seed_one_proposal(tmp_path / "v")
+    grid_env_before = cfg.grid_env.read_text()
     r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
                     "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
     async def her(p): return '["harvest", "nop", "fork"]' if "Instruction set" in p else "I am Kannaka."
@@ -447,7 +450,8 @@ async def test_release_start_ab_records_flip_incomplete_when_relay_restart_fails
     assert row["decision"] == "flip_incomplete"
     assert "relay restart failed" in row["reason"]
     env = (tmp_path / "grid.env").read_text()
-    assert "MIND_LLM_CANDIDATE=kannaka-brain-v4" in env   # the env write happened; only the restart failed
+    assert "MIND_LLM_CANDIDATE=kannaka-brain-v4" not in env   # N2: reverted, not left stray
+    assert env == grid_env_before + "MIND_LLM_CANDIDATE=\nMIND_AB_SPLIT=\n"   # both keys land empty (no prior value)
     from grid.versions import Versions
     assert ab_state(Versions(cfg.releases_dir / "versions.jsonl")) is None   # not left "running"
 
@@ -560,3 +564,53 @@ def test_ab_cli_rejects_combined_flags():
     from grid.weekly import main
     with pytest.raises(SystemExit):
         main(["ab", "--abort", "--check"])
+
+
+# ---- Fix round 2: two holes the C2 change opened ----
+
+async def test_lost_tags_remembers_a_loss_recorded_as_flip_incomplete(tmp_path):
+    # N1: a loss verdict that lands as flip_incomplete (C2: the relay restart failed) must
+    # be remembered exactly like a `held` loss -- ab_state() already treats flip_incomplete
+    # as closing the A/B, so if lost_tags didn't also count it the colony's rejection would
+    # be erased and the gate would probe-and-restart an A/B on the very model it just lost.
+    row, r, env, restarts = await _run_ab_week(tmp_path, inc_rep=30, cand_rep=10, local_run=lambda c: 1)
+    assert row["decision"] == "flip_incomplete" and "colony A/B lost" in row["reason"]
+    from grid.versions import Versions
+    vs = Versions(tmp_path / "releases" / "versions.jsonl")
+    assert ab_state(vs) is None                        # the A/B reads as closed either way
+    assert "kannaka-brain-v4" in lost_tags(vs)          # ...but the loss must still be remembered
+
+    # a fresh release() on the same tag must hold as "already lost/stuck", never re-probe
+    cfg2 = _cfg(tmp_path)   # resets grid.env to a clean, no-candidate state for the retest
+    r2 = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
+                     "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
+    async def never(p): raise AssertionError("a remembered loser must not be re-probed")
+    row2 = await release(cfg2, r2, ask_factory=lambda m: never, local_run=lambda c: 0, week="W3")
+    assert row2["decision"] == "held" and "already lost/stuck" in row2["reason"]
+
+
+def test_ab_abort_clears_a_stray_env_only_candidate(tmp_path, monkeypatch, capsys):
+    # N2: a start-path restart failure (before this fix) could leave MIND_LLM_CANDIDATE set
+    # with no ledger-tracked A/B at all. `ab --abort` must still be able to clear that stray
+    # split -- not refuse via the I4 "no A/B running" guard, which must fire only when
+    # NEITHER the ledger nor the env shows anything running.
+    import grid.weekly as weekly_mod
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)   # no real subprocess/sudo call
+    grid_env = tmp_path / "grid.env"
+    grid_env.write_text("MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_MODEL=kannaka-brain-current\n"
+                        "MIND_LLM_CANDIDATE=kannaka-brain-v4\nMIND_AB_SPLIT=0.2\n")
+    monkeypatch.setenv("RELEASES_DIR", str(tmp_path / "releases"))
+    monkeypatch.setenv("VERDICTS_DIR", str(tmp_path / "v"))
+    monkeypatch.setenv("GRID_ENV", str(grid_env))
+    monkeypatch.setenv("DEBAIN2_HOST", "debain2")
+
+    assert weekly_mod.main(["ab", "--abort"]) == 0
+    out = capsys.readouterr().out
+    assert "no A/B running" not in out
+    env = grid_env.read_text()
+    assert "MIND_LLM_CANDIDATE=kannaka-brain-v4" not in env   # the stray split is cleared
+    from grid.versions import Versions
+    rows = Versions(tmp_path / "releases" / "versions.jsonl").rows()
+    assert len(rows) == 1
+    assert rows[0]["decision"] == "held" and rows[0]["version"] == "kannaka-brain-v4"
+    assert rows[0]["reason"] == "colony A/B aborted by operator"
