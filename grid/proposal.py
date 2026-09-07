@@ -14,6 +14,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from grid.variants import Variant, get_variant
+
 GENOME_CAP = 64
 _ARRAY = re.compile(r"\[[^\[\]]*\]", re.S)
 
@@ -86,7 +88,7 @@ SANDBOX_CONTEXT = (
 )
 
 
-def render_prompt(req: Request, recall: list[str]) -> str:
+def render_prompt(req: Request, recall: list[str], variant: Variant | None = None) -> str:
     """Build the ask for the colony mind.
 
     The prompt opens with SANDBOX_CONTEXT because, without it, the model's
@@ -94,25 +96,28 @@ def render_prompt(req: Request, recall: list[str]) -> str:
     preserve viable replication") plus opcodes named steal/corrupt/parasitism
     as a request to write self-replicating malware and returns an empty
     completion (finish_reason=content_filter, seen live on Skywave 2026-09-05).
+
+    `variant` selects which template from the prompt-variant registry
+    (grid/data/prompt_variants.json) to render; None uses the registry's
+    default, which today renders byte-identically to this function's prior,
+    hardcoded prompt.
     """
+    if variant is None:
+        variant = get_variant()
     isa_lines = "\n".join(f"- {i['name']} (cost {i.get('cost', '?')}): {i.get('effect', '')}"
                           for i in req.instruction_set)
     ecology = "\n".join(f"- {k}: {v}" for k, v in req.ecology.items())
     memory = "\n".join(f"- {m}" for m in recall) or "- (nothing yet)"
     parent = json.dumps(req.parent, sort_keys=True)
-    return (
-        f"{SANDBOX_CONTEXT}\n\n"
-        f"{req.directive}\n\n"
-        f"You are the mind of this colony. Propose ONE variant of the parent genome.\n\n"
-        f"Instruction set:\n{isa_lines}\n\n"
-        f"Ecology:\n{ecology}\n\n"
-        f"Parent telemetry: {parent}\n"
-        f"Parent genome ({len(req.genome)} instructions): {json.dumps(req.genome)}\n\n"
-        f"What you remember about this colony:\n{memory}\n\n"
-        f"Rules: use only instruction names from the set above; at most {GENOME_CAP} "
-        f"instructions; the variant must differ from the parent and must still be able "
-        f"to replicate.\n"
-        f"Answer with a JSON array of instruction names and nothing else."
+    return variant.template.format(
+        directive=req.directive,
+        isa_lines=isa_lines,
+        ecology=ecology,
+        parent=parent,
+        genome_count=len(req.genome),
+        genome_json=json.dumps(req.genome),
+        memory=memory,
+        genome_cap=GENOME_CAP,
     )
 
 

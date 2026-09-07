@@ -1,0 +1,13 @@
+{
+  "default": "v1-sandbox",
+  "variants": {
+    "v1-sandbox": {
+      "template_file": "prompts/v1-sandbox.md",
+      "sha256": "121474be5d32462d077119265b0e1662ac2d02b568da14410e97cf6b90f42741",
+      "temperature": 0.7,
+      "max_tokens": 400,
+      "recall": true,
+      "note": "The prompt as shipped 2026-09-05. Opens with the sandbox-context paragraph: without it the safety layer reads thegrid's directive plus opcodes named steal and corrupt as a request for self-replicating malware and returns an empty completion. A variant that drops it will fail the validity floor fast."
+    }
+  }
+}
