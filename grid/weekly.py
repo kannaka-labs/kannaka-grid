@@ -234,9 +234,19 @@ def ab_decide(arms: dict, *, incumbent: str, candidate: str, min_sample: int = M
 
 
 def short_arms(arms: dict, *, incumbent: str, candidate: str, min_sample: int = MIN_SAMPLE) -> list[str]:
-    """Which arms are under sample. I3: only a CANDIDATE-alone shortfall is the candidate's
-    fault and worth remembering; both arms short is a colony throughput fault (the relay was
-    down, verdicts did not settle) and must not blacklist a model that never got its turn."""
+    """Which arms failed to reach the bar the CALLER is applying, candidate first.
+
+    I3: only a candidate-alone shortfall is the candidate's fault and worth remembering; both
+    arms short is a colony throughput fault (the relay was down, verdicts did not settle) and
+    must not blacklist a model that never got its turn.
+
+    D2: `min_sample` is the caller's bar, not always MIN_SAMPLE. `release()` judges a week, so
+    its bar is MIN_SAMPLE. `ab_check` judges liveness, so its bar is 1 -- "produced nothing at
+    all". They must not be conflated: a classically stuck A/B has an incumbent between
+    STUCK_INCUMBENT_MIN (50) and MIN_SAMPLE (100), so judging it at MIN_SAMPLE would report
+    both arms short and stop `lost_tags` blacklisting every stuck tag, reopening the §8
+    livelock.
+    """
     return [t for t in (candidate, incumbent) if arms[t]["settled"] < min_sample]
 
 
@@ -445,10 +455,13 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
             # Without the cap `ab_inconclusive` never closes an A/B, so the gate would take
             # this branch every Sunday forever: no probes, no releases, the relay splitting
             # to an unjudgeable candidate, and the nightly check silent.
-            # `short_arms: []` because nothing was measured; the reason is what actually keeps
-            # lost_tags off it (an operator's mislabel is not the candidate's rejection).
+            # D3: `short_arms` names BOTH arms, because that is what happened -- `arms` is {}
+            # and neither arm was judged. `[]` would have been the encoding a genuine loss
+            # carries ("both fully sampled, decided on the merits"), i.e. the strongest possible
+            # attribution to the candidate, leaving only the reason prefix between an operator's
+            # mislabel and a blacklisting. Now lost_tags abstains for two independent reasons.
             block = {**started_ab, "binding": True, "arms": {}, "weeks": state["weeks"] + 1,
-                     "winner": None, "short_arms": []}
+                     "winner": None, "short_arms": [state["candidate"], state["incumbent"]]}
             base_reason = (f"incumbent label changed mid-A/B ({env_incumbent} != "
                            f"{state['incumbent']}); evaluation skipped")
             if state["weeks"] + 1 >= MAX_WEEKS:
@@ -604,9 +617,13 @@ def ab_reconcile(cfg: WeeklyConfig, *, local_run, dry_run: bool = False) -> dict
     rows = versions.rows()
     state = ab_state(versions)
     env_candidate = _env_get(cfg.grid_env, "MIND_LLM_CANDIDATE")
-    if env_candidate and env_candidate not in {r.get("version") for r in rows if r["decision"] in _AB_DECISIONS}:
+    if env_candidate and env_candidate not in {r.get("version") for r in rows if r["decision"] == "ab_started"}:
         # Spec §7's own smoke receipt hand-starts an A/B by editing grid.env. Clearing it would
         # be worse than the bug this function exists to fix: be loud and touch nothing.
+        # D1: the test is "did the GATE start an A/B on this tag?", which only an `ab_started`
+        # row answers -- not "has this tag ever appeared in the ledger". Keyed the broad way,
+        # the receipt's own closing `ab --abort` (a `held` row for that tag) spent the
+        # exemption, and the next hand-start of the same tag was cleared by the next nightly.
         log.warning("colony A/B: %s is split in %s with no ledger row; hand-started, leaving it alone",
                     env_candidate, cfg.grid_env)
         return None
@@ -669,11 +686,12 @@ def ab_check(cfg: WeeklyConfig, *, now_ms: int | None = None, local_run, dry_run
     started_ab = (state["started_row"].get("evals") or {}).get("colony_ab") or {}   # I3
     last = versions.last_released()
     incumbent_settled = arms[state["incumbent"]]["settled"]
-    # N2: is_stuck guarantees the incumbent is either >= STUCK_INCUMBENT_MIN or at zero, so a
-    # zero here means BOTH arms produced nothing -- a colony outage, not the candidate's fault.
-    # lost_tags reads this; without it a 48 h outage blacklists an innocent tag.
+    # N2: lost_tags reads this; without it a 48 h outage blacklists an innocent tag. D2: the bar
+    # here is 1, not MIN_SAMPLE -- stuck is about producing NOTHING. is_stuck guarantees the
+    # incumbent is either >= STUCK_INCUMBENT_MIN or at zero, so this yields [candidate] for the
+    # classic case (blacklisted, correct) and both arms for a colony outage (not blacklisted).
     block = {**started_ab, "binding": True, "arms": arms, "weeks": state["weeks"], "winner": None,
-             "short_arms": [state["candidate"]] if incumbent_settled else [state["candidate"], state["incumbent"]]}
+             "short_arms": short_arms(arms, incumbent=state["incumbent"], candidate=state["candidate"], min_sample=1)}
     base_reason = ("colony A/B stuck: no proposals from either arm in 48h" if incumbent_settled == 0
                    else f"colony A/B stuck: candidate 0 settled in 48h (incumbent {incumbent_settled})")
     if outcome == "ok":
@@ -767,10 +785,17 @@ def _ab_snapshot(cfg: WeeklyConfig, state: dict | None, candidate: str) -> dict:
 
 
 def _exit_code(row: dict) -> int:
-    """N6: one contract for every verb that can record `flip_incomplete` -- `release`,
-    `ab --check`, `ab --abort` and `rollback`. 3 means grid.env and the live relay disagree and
-    a human must restart grid-odin; anything a script wraps should be able to see that."""
-    return 3 if row["decision"] == "flip_incomplete" else 0
+    """N6: one contract for `release`, `ab --check`, `ab --abort` and `rollback`. 3 means the
+    verb did not do what it says: grid.env and the live relay disagree and a human must restart
+    grid-odin, or the alias was never moved at all.
+
+    D5: `flip_failed` is not a decision -- `rollback` records `held` and puts the flip's own
+    outcome verbatim at the end of the reason (`rollback from X: flip_failed`), which is the
+    only machine-readable channel it has. A rollback that did not roll back must not exit 0.
+    (`release`'s C2 win-but-copy-failed row stays 0 on purpose: `end_ab` ran, env, relay and
+    ledger agree, `held` is that verb's normal terminal state, and the gate retries on Sunday.)
+    """
+    return 3 if row["decision"] == "flip_incomplete" or str(row.get("reason", "")).endswith(": flip_failed") else 0
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -63,18 +63,40 @@ def test_verdicts_unit_runs_the_ab_stuck_check_after_settling():
     assert "ExecStartPost=/srv/grid/venv/bin/python -m grid.weekly ab --check" in svc
 
 
+def inline_comment_keys(text: str) -> list[tuple[int, str]]:
+    """(line number, key) for every KEY=value line whose VALUE contains a `#`.
+
+    Commented-out keys count: they are templates an operator uncomments. D6: any `#` at all,
+    not just ` #` -- `ODIN_RETRY_S=60# x` and a tab before the `#` kill the relay identically.
+    """
+    import re
+    out = []
+    for n, line in enumerate(text.splitlines(), 1):
+        m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line.lstrip("#").lstrip())
+        if m and "#" in m.group(2):
+            out.append((n, m.group(1)))
+    return out
+
+
 def test_grid_env_example_has_no_inline_comments():
     """N3: systemd's EnvironmentFile keeps everything after the `=`, so a value line such as
     `ODIN_RETRY_S=60          # 900 with a CPU model` makes float() raise inside
     RelayConfig.from_env -- grid-odin then crash-loops into its StartLimit and stays dead, the
     exact C1 failure, shipped from the example file. Neither the gate nor the relay strips
     comments (deliberately: they must read a value identically), so the file must never carry
-    one after a value. Commented-out keys are checked too -- they are templates for real lines.
-    Mutation: put the comment back on ODIN_RETRY_S -> RED.
+    one after a value. Mutation: put the comment back on ODIN_RETRY_S -> RED.
     """
-    import re
     example = UNITS.parent / "grid.env.example"
-    for n, line in enumerate(example.read_text(encoding="utf-8").splitlines(), 1):
-        m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line.lstrip("#").lstrip())
-        if m:
-            assert " #" not in m.group(2), f"{example.name}:{n}: inline comment in {m.group(1)}'s value"
+    assert inline_comment_keys(example.read_text(encoding="utf-8")) == []
+
+
+def test_the_inline_comment_guard_catches_every_shape():
+    # D6: the guard matched only " #", so a tight `KEY=60# x` and a tab before the `#` both
+    # sailed past while killing the relay exactly the same way. Mutation: `"#" in m.group(2)`
+    # -> `" #" in m.group(2)` -> the tight and tabbed cases come back empty.
+    assert inline_comment_keys("ODIN_RETRY_S=60          # spaced\n") == [(1, "ODIN_RETRY_S")]
+    assert inline_comment_keys("ODIN_RETRY_S=60# tight\n") == [(1, "ODIN_RETRY_S")]
+    assert inline_comment_keys("ODIN_RETRY_S=60\t# tabbed\n") == [(1, "ODIN_RETRY_S")]
+    assert inline_comment_keys("#MIND_AB_SPLIT=0.2  # a commented-out template\n") == [(1, "MIND_AB_SPLIT")]
+    assert inline_comment_keys("# prose about key=value with a # in it\n") == []      # not a key line
+    assert inline_comment_keys("ODIN_RETRY_S=60\nMIND_MODEL_ALIAS=kannaka-brain-v3\n") == []

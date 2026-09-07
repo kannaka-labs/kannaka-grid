@@ -206,8 +206,11 @@ for the verdict Sunday.
 last decision was `flip_incomplete`, or `grid.env` still splits to a candidate whose A/B the ledger
 has closed, or the ledger has an A/B open that nothing is splitting to, it clears the candidate,
 restarts grid-odin, and records a `colony A/B reconciled: …` row (exit 3, and it retries every night,
-if that restart fails). It keys on the ledger, so an A/B you started by hand — one the ledger has
-never seen — is logged at WARNING and left completely alone.
+if that restart fails). It keys on `ab_started` rows, i.e. on "did the *gate* start this?", so an A/B
+you started by hand is logged at WARNING and left completely alone — and stays exempt across as many
+runs of the hand-start receipt as you like, because `ab --abort` writes a `held` row, never an
+`ab_started` one. While a hand-started split is in `grid.env` the reconciler does nothing else
+either, so it suspends the repairs above for its duration.
 
 A release therefore takes two Sundays at minimum: the gate starts the A/B on the Sunday the promotion first passes its probes, and renders the colony's verdict on the following Sunday (continuing up to two weeks if the sample is short); the nightly `ab --check` only aborts a stuck A/B within that window.
 
@@ -233,10 +236,12 @@ Exit codes — `release`, `rollback`, `ab --check` and `ab --abort` share one co
 runs as `grid-verdicts.service`'s `ExecStartPost`, so a non-zero exit marks that nightly unit failed:
 - `0` — nothing needed doing (no A/B running, or one running and not stuck), or the work was done
   cleanly (a `held` row printed: the A/B was stuck, or reconciled, and the relay restarted).
-- `3` — the row is `flip_incomplete`: the candidate was cleared in `grid.env` but the relay restart
-  failed twice, so the live relay is still splitting to a candidate the ledger has closed. Run
-  `sudo systemctl restart grid-odin.service` and check `journalctl -u grid-odin` for `A/B: none`.
-  The nightly reconciler retries this every night, so the unit stays failed until it is fixed.
+- `3` — the verb did not do what it says. Either the row is `flip_incomplete` (the candidate was
+  cleared in `grid.env` but the relay restart failed twice, so the live relay is still splitting to a
+  candidate the ledger has closed): run `sudo systemctl restart grid-odin.service` and check
+  `journalctl -u grid-odin` for `A/B: none` — the nightly reconciler retries this, so the unit stays
+  failed until it is fixed. Or the reason ends `: flip_failed` (a `rollback` whose `ollama cp` failed,
+  so the alias was never moved): check debain2's ollama and re-run it.
 
 Never put a comment after a value in `grid.env` (`ODIN_RETRY_S=60   # 900 on a CPU model`): systemd's
 `EnvironmentFile` keeps it *in the value*, `float()` on it kills the relay at boot, and neither the
