@@ -58,6 +58,19 @@ def test_chronicle_record_shape():
     assert r["id"] == "chronicle-c-1-2000-skill" and r["context"] == "Q?" and r["text"] == "fork early via fork."
 
 
+def test_export_skips_a_proposal_log_line_with_no_request_id(tmp_path):
+    # N5: the same guard ab_arms got in round 1 -- this line was the identical
+    # `{e["request_id"]: e for e in ...}` and would KeyError the whole weekly corpus export on
+    # one malformed proposal-log line. Mutation: drop the `if e.get("request_id")` in
+    # grid/verdict_corpus.py export() -> KeyError instead of a clean export.
+    vdir, out = tmp_path / "v", tmp_path / "out"
+    seed(vdir)
+    with open(vdir / "proposals.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": 1040, "outcome": "proposed", "model_alias": "m"}) + "\n")
+    manifest = export(vdir, out, min_tier="reproduced")
+    assert manifest["records"] == 2 and manifest["negatives"] == 2      # unchanged by the bad line
+
+
 def test_export_filters_by_tier_and_splits_negatives(tmp_path):
     vdir, out = tmp_path / "v", tmp_path / "out"
     seed(vdir)

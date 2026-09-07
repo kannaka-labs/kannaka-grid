@@ -431,6 +431,10 @@ def test_ab_check_aborts_a_stuck_ab(tmp_path):
     row = ab_check(cfg, now_ms=since + 49*3600*1000, local_run=lambda c: restarts.append(c) or 0)
     assert row["decision"] == "held" and row["reason"].startswith("colony A/B stuck") and restarts
     assert "MIND_LLM_CANDIDATE=kannaka-brain-v4" not in (tmp_path / "grid.env").read_text() and ab_state(vs) is None
+    # N2: the candidate arm alone produced nothing while the incumbent kept settling, so this
+    # one IS the candidate's fault and stays remembered.
+    assert row["evals"]["colony_ab"]["short_arms"] == ["kannaka-brain-v4"]
+    assert lost_tags(vs) == {"kannaka-brain-v4"}
 
 
 async def test_dry_run_ab_writes_nothing(tmp_path):
@@ -734,12 +738,18 @@ def test_ab_check_aborts_a_wedged_relay_with_both_arms_at_zero(tmp_path):
     assert row["reason"] == "colony A/B stuck: no proposals from either arm in 48h"
     assert restarts and ab_state(vs) is None
     assert "MIND_LLM_CANDIDATE=kannaka-brain-v4" not in (tmp_path / "grid.env").read_text()
+    # N2: C3 made this case reachable, and lost_tags used to blacklist on any `colony A/B
+    # stuck` reason. A 48 h colony outage is not the candidate's fault. Mutation: drop
+    # `short_arms` from ab_check's block -> lost_tags reads None, blacklists the tag, RED.
+    assert row["evals"]["colony_ab"]["short_arms"] == ["kannaka-brain-v4", "kannaka-brain-v3"]
+    assert lost_tags(vs) == set()
 
 
 def test_lost_tags_remembers_only_a_candidate_alone_shortfall(tmp_path):
-    # I3: both arms short is a colony throughput fault (the relay was down, nothing settled),
-    # not the candidate's -- blacklisting on it buries a model that never got its turn.
-    # Mutation: match the bare "colony A/B inconclusive" prefix again -> v5 is blocked too.
+    # I3 + N2: ONE rule for lost/stuck/inconclusive alike -- remember a tag unless some arm
+    # OTHER than that tag was under sample. Both arms short is a colony throughput fault (the
+    # relay down, the gateway down, the key drained) and must not bury a model that never got
+    # its turn. Mutation: match the three prefixes unconditionally again -> v5, v8 blocked too.
     from grid.versions import Versions, release_row
     v = Versions(tmp_path / "versions.jsonl")
     kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0)
@@ -756,15 +766,32 @@ def test_lost_tags_remembers_only_a_candidate_alone_shortfall(tmp_path):
     v.append(release_row(week="W3", decision="held", version="v6", previous="v3", evals={},
                          reason="colony A/B inconclusive after 2 weeks: sample 40/120 below 100 per arm", **kw))
     assert lost_tags(v) == {"v4", "v6"}
+    # N2: a real loss carries `short_arms: []` -- NOTHING was short, the colony decided on the
+    # merits -- and must stay remembered. This is the case a literal `short_arms == [tag]` rule
+    # would silently stop remembering, so it is asserted alongside the stuck pair below.
+    v.append(release_row(week="W4", decision="held", version="v7", previous="v3",
+                         evals={"colony_ab": {"short_arms": []}},
+                         reason="colony A/B lost: 0.100 vs 0.250", **kw))
+    assert lost_tags(v) == {"v4", "v6", "v7"}
+    v.append(release_row(week="W5", decision="held", version="v8", previous="v3",
+                         evals={"colony_ab": {"short_arms": ["v8", "v3"]}},
+                         reason="colony A/B stuck: no proposals from either arm in 48h", **kw))
+    assert lost_tags(v) == {"v4", "v6", "v7"}      # a colony outage is not v8's rejection
+    v.append(release_row(week="W6", decision="held", version="v9", previous="v3",
+                         evals={"colony_ab": {"short_arms": ["v9"]}},
+                         reason="colony A/B stuck: candidate 0 settled in 48h (incumbent 60)", **kw))
+    assert lost_tags(v) == {"v4", "v6", "v7", "v9"}
 
 
-def test_env_get_strips_an_inline_comment(tmp_path):
-    # Minor: without this a revert copies " # ..." back into the value, and systemd's
-    # EnvironmentFile has no trailing-comment syntax -- the relay would read it literally.
+def test_env_get_reads_a_value_exactly_as_the_relay_would(tmp_path):
+    # N3: round 1 stripped an inline comment here. RelayConfig.from_env strips nothing, so that
+    # made the gate and the relay disagree about a value's text by construction -- and I2's
+    # guard compares gate-read to gate-read, so it was the one divergence I2 could not see.
+    # Mutation: restore `.split(" #", 1)[0].strip()` -> this asserts the stripped value.
     from grid.weekly import _env_get
     p = tmp_path / "grid.env"
-    p.write_text("MIND_MODEL_ALIAS=kannaka-brain-v3 # the incumbent's concrete label\nMIND_AB_SPLIT=0.2\n")
-    assert _env_get(p, "MIND_MODEL_ALIAS") == "kannaka-brain-v3"
+    p.write_text("MIND_MODEL_ALIAS=kannaka-brain-v3 # a comment systemd keeps\nMIND_AB_SPLIT=0.2\n")
+    assert _env_get(p, "MIND_MODEL_ALIAS") == "kannaka-brain-v3 # a comment systemd keeps"
     assert _env_get(p, "MIND_AB_SPLIT") == "0.2"
 
 
@@ -850,3 +877,202 @@ def test_ab_abort_of_a_stray_env_candidate_records_the_env_view(tmp_path, monkey
     block = json.loads(capsys.readouterr().out)["evals"]["colony_ab"]
     assert block["source"] == "env" and block["binding"] is False and block["note"]
     assert block["arms"]["kannaka-brain"]["settled"] == 3
+
+
+# ---- Fix round 3: the re-review of b99bdcc ----
+
+async def _relabelled_ab_to_max_weeks(tmp_path, local_run):
+    """Two Sundays of an A/B whose incumbent was relabelled mid-flight."""
+    alias = "kannaka-brain-experimental"
+    row, r, env, restarts = await _run_ab_week(tmp_path, inc_rep=30, cand_rep=10, alias=alias)
+    assert row["decision"] == "ab_inconclusive"          # week 1: the week is spent, A/B open
+    cfg = _cfg(tmp_path)
+    (tmp_path / "grid.env").write_text(f"MIND_MODEL_ALIAS={alias}\nMIND_LLM_MODEL=kannaka-brain-current\n"
+                                       "MIND_LLM_CANDIDATE=kannaka-brain-v4\nMIND_AB_SPLIT=0.2\n")
+    r2 = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
+                     "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
+    async def never(p): raise AssertionError("probes must not run during an A/B week")
+    return cfg, await release(cfg, r2, ask_factory=lambda m: never, local_run=local_run, week="W3")
+
+
+async def test_a_relabelled_ab_still_ends_at_max_weeks(tmp_path):
+    # N1 (Critical): `ab_inconclusive` is not a closing decision, so I2's guard on its own
+    # wedged the gate permanently -- another ab_inconclusive row every Sunday, no candidate
+    # discovery, no probes, no releases, the relay still splitting to an unjudgeable candidate,
+    # and `ab --check` exiting 0 every night. MAX_WEEKS must bind here as it does for a real
+    # inconclusive week. Mutation: drop the `state["weeks"] + 1 >= MAX_WEEKS` branch (always
+    # `ab_inconclusive`) -> week 2 stays open and the gate never recovers.
+    restarts = []
+    cfg, row = await _relabelled_ab_to_max_weeks(tmp_path, lambda c: restarts.append(c) or 0)
+    assert row["decision"] == "held"
+    assert row["reason"].startswith("incumbent label changed mid-A/B")
+    assert "A/B ended after 2 weeks" in row["reason"]
+    from grid.versions import Versions
+    vs = Versions(cfg.releases_dir / "versions.jsonl")
+    assert ab_state(vs) is None                          # the gate is unwedged
+    assert lost_tags(vs) == set()                        # an operator's mislabel is not a rejection
+    assert row["evals"]["colony_ab"]["short_arms"] == []  # nothing was measured
+    assert "MIND_LLM_CANDIDATE=kannaka-brain-v4" not in (tmp_path / "grid.env").read_text()
+    assert restarts                                      # end_ab restarted the relay
+
+
+async def test_a_relabelled_ab_that_cannot_restart_the_relay_is_flip_incomplete(tmp_path):
+    cfg, row = await _relabelled_ab_to_max_weeks(tmp_path, lambda c: 1)
+    assert row["decision"] == "flip_incomplete"
+    assert row["reason"].startswith("incumbent label changed mid-A/B")
+    assert "relay restart failed clearing the A/B" in row["reason"]
+
+
+def _reconcile_cfg(tmp_path, env_text):
+    cfg = _cfg(tmp_path)
+    (tmp_path / "grid.env").write_text(env_text)
+    return cfg
+
+
+def _ab_rows(tmp_path, *rows):
+    from grid.versions import Versions, release_row
+    vs = Versions(tmp_path / "releases" / "versions.jsonl")
+    kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0, evals={})
+    for week, decision, version, reason in rows:
+        vs.append(release_row(week=week, decision=decision, version=version, previous=None, reason=reason, **kw))
+    return vs
+
+
+def test_reconciler_repairs_a_standing_flip_incomplete(tmp_path):
+    # N4: a flip_incomplete row closes ab_state, so from the next night on `ab --check` said
+    # "no A/B running" and exited 0 forever while grid.env and the live relay disagreed. The
+    # reconciler checks the RESTING state, so the divergence is repaired (and re-announced)
+    # every night until it is actually gone. Mutation: drop the ab_reconcile call at the top
+    # of ab_check -> None, no restart, no row.
+    from grid.weekly import ab_check
+    cfg = _reconcile_cfg(tmp_path, "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_CANDIDATE=\n")
+    vs = _ab_rows(tmp_path, ("W1", "ab_started", "kannaka-brain-v4", ""),
+                  ("W2", "flip_incomplete", "kannaka-brain-v4", "colony A/B lost: 0.1 vs 0.3; relay restart failed clearing the A/B"))
+    restarts = []
+    row = ab_check(cfg, now_ms=1, local_run=lambda c: restarts.append(c) or 0)
+    assert row["decision"] == "held" and row["reason"].startswith("colony A/B reconciled")
+    assert "flip_incomplete" in row["reason"] and restarts
+    assert lost_tags(vs) == {"kannaka-brain-v4"}        # the original loss is still remembered
+    # ...and it does not fire again once the world is consistent
+    assert ab_check(cfg, now_ms=1, local_run=lambda c: restarts.append(c) or 0) is None
+
+
+def test_reconciler_reports_a_failed_repair_as_flip_incomplete(tmp_path):
+    from grid.weekly import ab_check
+    cfg = _reconcile_cfg(tmp_path, "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_CANDIDATE=\n")
+    _ab_rows(tmp_path, ("W1", "ab_started", "kannaka-brain-v4", ""),
+             ("W2", "flip_incomplete", "kannaka-brain-v4", "alias serves the candidate; relay restart failed twice"))
+    row = ab_check(cfg, now_ms=1, local_run=lambda c: 1)
+    assert row["decision"] == "flip_incomplete"          # -> `ab --check` exits 3, every night
+
+
+def test_reconciler_clears_a_candidate_whose_ab_the_ledger_closed(tmp_path):
+    # N4: env still splitting to a tag the ledger finished with.
+    from grid.weekly import ab_check
+    cfg = _reconcile_cfg(tmp_path, "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_CANDIDATE=kannaka-brain-v4\nMIND_AB_SPLIT=0.2\n")
+    _ab_rows(tmp_path, ("W1", "ab_started", "kannaka-brain-v4", ""),
+             ("W2", "held", "kannaka-brain-v4", "colony A/B lost: 0.100 vs 0.250"))
+    restarts = []
+    row = ab_check(cfg, now_ms=1, local_run=lambda c: restarts.append(c) or 0)
+    assert row["decision"] == "held" and "the ledger closed its A/B" in row["reason"]
+    assert restarts and "MIND_LLM_CANDIDATE=kannaka-brain-v4" not in (tmp_path / "grid.env").read_text()
+
+
+def test_reconciler_closes_an_ab_the_env_is_no_longer_running(tmp_path):
+    # N4: the ledger says an A/B is open but nothing is splitting -- the relay was never told,
+    # or someone cleared the line by hand. Close it so the Sunday gate is not stuck on a
+    # verdict it can never reach.
+    from grid.weekly import ab_check
+    cfg = _reconcile_cfg(tmp_path, "MIND_MODEL_ALIAS=kannaka-brain-v3\n")
+    vs = _ab_rows(tmp_path, ("W1", "ab_started", "kannaka-brain-v4", ""))
+    restarts = []
+    row = ab_check(cfg, now_ms=1, local_run=lambda c: restarts.append(c) or 0)
+    assert row["decision"] == "held" and "carries no candidate" in row["reason"]
+    assert ab_state(vs) is None and restarts
+    assert lost_tags(vs) == set()                        # not the candidate's rejection
+
+
+def test_reconciler_leaves_a_hand_started_ab_completely_alone(tmp_path, caplog):
+    # N4, the rule that matters most: spec §7's own smoke receipt hand-starts an A/B by editing
+    # grid.env. A reconciler that clears an operator's A/B is worse than the bug it fixes, so
+    # it keys on the LEDGER and never on absence. Mutation: drop the "never seen" guard ->
+    # ab_reconcile clears the operator's split and records a row.
+    import logging
+    from grid.weekly import ab_check
+    cfg = _reconcile_cfg(tmp_path, "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_CANDIDATE=kannaka-brain\nMIND_AB_SPLIT=0.2\n")
+    before = (tmp_path / "grid.env").read_text()
+    vs = _ab_rows(tmp_path, ("W1", "released", "kannaka-brain-v3", ""))
+    restarts = []
+    with caplog.at_level(logging.WARNING, logger="grid.weekly"):
+        assert ab_check(cfg, now_ms=1, local_run=lambda c: restarts.append(c) or 0) is None
+    assert "hand-started, leaving it alone" in caplog.text
+    assert not restarts                                  # nothing touched
+    assert (tmp_path / "grid.env").read_text() == before
+    assert len(vs.rows()) == 1                           # no row recorded
+
+
+def test_ab_check_cli_reconciles_even_when_the_ledger_shows_no_ab(tmp_path, monkeypatch, capsys):
+    # N4 at the CLI: `--check` short-circuited on `state is None` and printed "no A/B running".
+    # But a standing flip_incomplete IS state-is-None -- that is precisely why the divergence
+    # was announced once and never again. Mutation: restore the short-circuit -> "no A/B
+    # running", exit 0, while grid.env and the live relay still disagree.
+    import grid.weekly as weekly_mod
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 1)      # the repair restart fails
+    _ab_cli_env(tmp_path, monkeypatch, "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_CANDIDATE=\n")
+    _ab_rows(tmp_path, ("W1", "ab_started", "kannaka-brain-v4", ""),
+             ("W2", "flip_incomplete", "kannaka-brain-v4", "alias serves the candidate; relay restart failed twice"))
+    assert weekly_mod.main(["ab", "--check"]) == 3
+    out = capsys.readouterr().out
+    assert "no A/B running" not in out
+    assert json.loads(out)["reason"].startswith("colony A/B reconciled")
+
+
+def test_ab_abort_cli_exits_three_when_the_relay_restart_failed(tmp_path, monkeypatch, capsys):
+    # N6: `release` and `ab --check` exit 3 on flip_incomplete; --abort and rollback did not,
+    # so a script wrapping either could not see that env and the live relay disagree.
+    # Mutation: `return 0` in the --abort branch -> RED.
+    import grid.weekly as weekly_mod
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 1)
+    _ab_cli_env(tmp_path, monkeypatch,
+                "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_CANDIDATE=kannaka-brain\nMIND_AB_SPLIT=0.2\n")
+    assert weekly_mod.main(["ab", "--abort"]) == 3
+    assert json.loads(capsys.readouterr().out)["decision"] == "flip_incomplete"
+
+
+def test_rollback_cli_exits_three_when_the_relay_restart_failed(tmp_path, monkeypatch, capsys):
+    # N6, the rollback half. Mutation: `return 0` in the rollback branch -> RED.
+    import grid.weekly as weekly_mod
+    from grid.versions import Versions, release_row
+    key = tmp_path / "key"; key.write_text("k\n")
+    _ab_cli_env(tmp_path, monkeypatch, "MIND_MODEL_ALIAS=kannaka-brain-v4\nMIND_LLM_MODEL=kannaka-brain-current\n")
+    monkeypatch.setenv("MIND_LLM_KEY_FILE", str(key))
+    monkeypatch.setattr(weekly_mod, "Remote", lambda *a, **k: FakeRemote({}))
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 1)          # the restart fails
+    v = Versions(tmp_path / "releases" / "versions.jsonl")
+    kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={}, verdict_window={}, evals={}, spend_usd=0, rogue_ledger_ts=0, reason="")
+    v.append(release_row(week="W1", decision="released", version="kannaka-brain-v3", previous=None, **kw))
+    v.append(release_row(week="W2", decision="released", version="kannaka-brain-v4", previous="kannaka-brain-v3", **kw))
+    assert weekly_mod.main(["rollback"]) == 3
+    assert json.loads(capsys.readouterr().out)["decision"] == "flip_incomplete"
+
+
+def test_env_ab_view_does_not_credit_unattributed_rows_to_a_missing_incumbent(tmp_path, monkeypatch, capsys):
+    # N7: ab_arms keys on `str(row.get("model_alias", ""))`, so an empty incumbent collected
+    # every verdict row nobody authored and reported the total as the incumbent's -- in the one
+    # view an operator reads when they cannot tell what is running. Mutation: drop the
+    # `arms.pop("", None)` -> the "" arm is reported with 3 settled.
+    from grid.verdicts import Ledger
+    from grid.weekly import main
+    _ab_cli_env(tmp_path, monkeypatch, "MIND_LLM_CANDIDATE=kannaka-brain\n")   # no MIND_MODEL_ALIAS
+    v = tmp_path / "v"; v.mkdir(parents=True, exist_ok=True)
+    led = Ledger(v / "verdicts.jsonl"); rows = []
+    for i in range(3):
+        rid = f"u{i}"
+        rows.append({"ts": 10, "request_id": rid, "outcome": "proposed", "model_alias": "",
+                     "parent_genome": ["a"], "prompt_path": f"prompts/{rid}.txt", "proposal": ["a"]})
+        led.append({"request_id": rid, "model_alias": "", "tier": "reproduced", "births": 2, "fitness": 2})
+    (v / "proposals.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    assert main(["ab"]) == 0
+    ab = json.loads(capsys.readouterr().out)["ab"]
+    assert ab["source"] == "env" and ab["incumbent"] is None
+    assert set(ab["arms"]) == {"kannaka-brain"}          # the "" arm is not anyone's number

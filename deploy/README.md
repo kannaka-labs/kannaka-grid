@@ -195,7 +195,19 @@ throughput fault, not the candidate's, and is not remembered.)
 **Do not run `set-mind-model.sh` while an A/B is running**: it rewrites `MIND_MODEL_ALIAS`, and the
 incumbent's proposals then log under a label the gate does not count — the gate detects the mismatch
 and records `ab_inconclusive` with `incumbent label changed mid-A/B`, spending a week of the A/B's
-two-week budget for nothing. Run `grid.weekly ab --abort` first, or wait for the verdict Sunday.
+two-week budget for nothing. It spends at most two: at `MAX_WEEKS` the gate closes the A/B with
+`held: incumbent label changed mid-A/B …; A/B ended after 2 weeks`, clears the candidate and restarts
+the relay, and the candidate is *not* blacklisted — an operator's mislabel is not the colony's
+verdict, so the next Sunday starts a fresh A/B against the new label. Until then the nightly
+`ab --check` logs a warning and skips the stuck check. Run `grid.weekly ab --abort` first, or wait
+for the verdict Sunday.
+
+**Reconciliation.** `ab --check` first repairs the *resting* state, before any stuck logic: if the
+last decision was `flip_incomplete`, or `grid.env` still splits to a candidate whose A/B the ledger
+has closed, or the ledger has an A/B open that nothing is splitting to, it clears the candidate,
+restarts grid-odin, and records a `colony A/B reconciled: …` row (exit 3, and it retries every night,
+if that restart fails). It keys on the ledger, so an A/B you started by hand — one the ledger has
+never seen — is logged at WARNING and left completely alone.
 
 A release therefore takes two Sundays at minimum: the gate starts the A/B on the Sunday the promotion first passes its probes, and renders the colony's verdict on the following Sunday (continuing up to two weeks if the sample is short); the nightly `ab --check` only aborts a stuck A/B within that window.
 
@@ -210,20 +222,26 @@ clear the candidate and discard the A/B test, then restart `grid-odin.service`.
 Manual commands from `/srv/grid/kannaka-grid`:
 ```bash
 /srv/grid/venv/bin/python -m grid.weekly ab               # show both arms' identities and verdict counts
-/srv/grid/venv/bin/python -m grid.weekly ab --check       # nightly stuck check; see the exit codes below
+/srv/grid/venv/bin/python -m grid.weekly ab --check       # nightly reconcile + stuck check; exit codes below
 /srv/grid/venv/bin/python -m grid.weekly ab --abort       # discard an in-flight A/B test
 /srv/grid/venv/bin/python -m grid.weekly ab --forget <tag>  # append a row lifting the block on a tag
 ```
 `ab` also reports an A/B that exists only in `grid.env` with no ledger row (a hand-started one, as
 above) as `"source": "env"`; its arms then cover all recorded history, since there is no `since_ts`.
 
-`ab --check` exit codes — it runs as `grid-verdicts.service`'s `ExecStartPost`, so a non-zero exit
-marks that nightly unit failed:
-- `0` — no A/B running, or one is running and is not stuck.
-- `0` with a `held` row printed — the A/B was stuck and has been cleared; the relay restarted cleanly.
-- `3` — the A/B was cleared in `grid.env` but the relay restart failed twice. The live relay is still
-  splitting traffic to a candidate the ledger has closed: run
+Exit codes — `release`, `rollback`, `ab --check` and `ab --abort` share one contract, and `ab --check`
+runs as `grid-verdicts.service`'s `ExecStartPost`, so a non-zero exit marks that nightly unit failed:
+- `0` — nothing needed doing (no A/B running, or one running and not stuck), or the work was done
+  cleanly (a `held` row printed: the A/B was stuck, or reconciled, and the relay restarted).
+- `3` — the row is `flip_incomplete`: the candidate was cleared in `grid.env` but the relay restart
+  failed twice, so the live relay is still splitting to a candidate the ledger has closed. Run
   `sudo systemctl restart grid-odin.service` and check `journalctl -u grid-odin` for `A/B: none`.
+  The nightly reconciler retries this every night, so the unit stays failed until it is fixed.
+
+Never put a comment after a value in `grid.env` (`ODIN_RETRY_S=60   # 900 on a CPU model`): systemd's
+`EnvironmentFile` keeps it *in the value*, `float()` on it kills the relay at boot, and neither the
+gate nor the relay strips it — deliberately, so that both always read a value identically. Put the
+comment on its own line above.
 
 ## Known limits (v0.1)
 - Memories written by the bridge become visible to asks only after the 6 h dream+restart.

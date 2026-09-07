@@ -134,6 +134,11 @@ class Relay:
                                 reason="unparseable request")
             return "rejected"
         self._unparseable.pop(key, None)        # consecutive, so a good parse resets
+        if any(k != req.request_id for k in self._defers):
+            # N8: thegrid keeps one request slot, so a counter under any other id belongs to a
+            # request that was abandoned (replaced, consumed, or deleted by hand) and will
+            # never be seen again. Drop it rather than grow the dict for the relay's lifetime.
+            self._defers = {k: v for k, v in self._defers.items() if k == req.request_id}
         if self._clock() < self._retry_not_before.get(req.request_id, 0.0):
             return None
 

@@ -61,3 +61,20 @@ def test_weekly_release_timer_runs_sunday_morning_after_the_rogue_weekly():
 def test_verdicts_unit_runs_the_ab_stuck_check_after_settling():
     svc = unit("grid-verdicts.service")
     assert "ExecStartPost=/srv/grid/venv/bin/python -m grid.weekly ab --check" in svc
+
+
+def test_grid_env_example_has_no_inline_comments():
+    """N3: systemd's EnvironmentFile keeps everything after the `=`, so a value line such as
+    `ODIN_RETRY_S=60          # 900 with a CPU model` makes float() raise inside
+    RelayConfig.from_env -- grid-odin then crash-loops into its StartLimit and stays dead, the
+    exact C1 failure, shipped from the example file. Neither the gate nor the relay strips
+    comments (deliberately: they must read a value identically), so the file must never carry
+    one after a value. Commented-out keys are checked too -- they are templates for real lines.
+    Mutation: put the comment back on ODIN_RETRY_S -> RED.
+    """
+    import re
+    example = UNITS.parent / "grid.env.example"
+    for n, line in enumerate(example.read_text(encoding="utf-8").splitlines(), 1):
+        m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line.lstrip("#").lstrip())
+        if m:
+            assert " #" not in m.group(2), f"{example.name}:{n}: inline comment in {m.group(1)}'s value"

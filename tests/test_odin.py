@@ -421,6 +421,23 @@ async def test_a_successful_ask_resets_the_defer_count(tmp_path):
     assert request.exists()
 
 
+async def test_the_defer_counter_does_not_outlive_its_request(tmp_path):
+    # N8: thegrid keeps one request slot, so a counter under any other id belongs to a request
+    # that was abandoned and will never be seen again. Without the prune the dict grows by one
+    # entry per abandoned request for the relay's lifetime. Mutation: drop the prune in
+    # poll_once -> r1's counter is still there after r2 is answered.
+    write_request(tmp_path, "r1")
+    clock = Clock()
+    mind = FakeMind(answer='["harvest","fork"]', exc=BusTimeout("slow"))
+    r = relay(tmp_path, mind, clock=clock)
+    assert await r.poll_once() == "deferred"
+    assert set(r._defers) == {"r1"}
+    write_request(tmp_path, "r2")                # thegrid abandoned r1 and filed a new one
+    mind.exc = None
+    assert await r.poll_once() == "proposed"
+    assert r._defers == {}
+
+
 async def test_failed_candidate_ask_defers_and_never_reroutes(tmp_path):
     from grid.mind import MindError
     from grid.odin import arm_for
