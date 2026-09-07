@@ -168,6 +168,31 @@ Receipts:
 4. `python -m grid.weekly rollback` followed by `python -m grid.weekly release --week <the rolled-back week>`
    once by hand restores the prior version and then re-releases, both landing in `versions.jsonl`.
 
+### Colony A/B testing
+The release gate can A/B test a candidate model against the incumbent for up to two weeks. The decision
+log (versions.jsonl, column `colony_ab`) records each run's outcome: `ab_started` when the gate begins
+a test, `ab_inconclusive` if inconclusive after one week, `released` (A/B win), `held` (stuck, loss,
+or inconclusive after two weeks). Nightly, after verdicts settle, the gate's pre-release also runs
+`grid.weekly ab --check` to detect if an A/B test has stalled and cannot resolve (same stuck-detection
+logic as the release gate itself); other manual A/B sub-commands are `grid.weekly ab --abort` (discard
+an in-flight test) and `grid.weekly ab --forget <tag>` (clear the decision row for a tag to replay it).
+
+To run a hand-started A/B test: set `MIND_LLM_CANDIDATE=<model-tag>` and `MIND_AB_SPLIT=0.2` in
+`/srv/grid/grid.env` (the default split is 0.2 = 20% candidate, 80% incumbent), then restart
+`grid-odin.service` to begin routing requests. Monitor the relay's proposal log with `journalctl -u grid-odin`
+and check that both arms are represented: `grep -o 'model_alias":"[^"]*' <proposal-log>` shows both the
+incumbent and candidate labels. Run `python -m grid.weekly ab` from `/srv/grid/kannaka-grid` to print both
+arms' identities and their verdict counts so far. When done, run `python -m grid.weekly ab --abort` to
+clear the candidate and discard the A/B test, then restart `grid-odin.service`.
+
+Manual commands from `/srv/grid/kannaka-grid`:
+```bash
+/srv/grid/venv/bin/python -m grid.weekly ab               # show both arms' identities and verdict counts
+/srv/grid/venv/bin/python -m grid.weekly ab --check       # exit 0 if no A/B running; exit 1 and log if stuck
+/srv/grid/venv/bin/python -m grid.weekly ab --abort       # discard an in-flight A/B test
+/srv/grid/venv/bin/python -m grid.weekly ab --forget <tag>  # clear the decision row for a tag to replay
+```
+
 ## Known limits (v0.1)
 - Memories written by the bridge become visible to asks only after the 6 h dream+restart.
 - `GRID.*` is unsigned on the wire (spec §8).
