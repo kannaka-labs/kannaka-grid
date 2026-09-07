@@ -126,9 +126,21 @@ shape, kept.)
   is nil), the proposal log showing ≈ 20% `kannaka-brain` labels, `grid.weekly ab` printing both arms,
   then `ab --abort`; the first real A/B starts the Sunday a candidate first clears the identity gate.
 
-## 8. Open questions
+## 8. Stuck recovery (Nick, 2026-09-07: "definitely need to recover quickly if stuck")
 
-1. Should `MAX_WEEKS` be 2 or 3? (2 keeps a stuck candidate from occupying the slot; 3 tolerates a
-   slow week on debain2.) Default 2.
-2. When a candidate loses, should the gate remember the loss so a re-promotion of the same tag is not
-   re-tested? (Default: yes — a `held: colony A/B lost` row for that tag blocks a new A/B on it.)
+Both open questions are settled:
+
+1. **`MAX_WEEKS = 2`**, and a **daily stuck check** so a dead A/B does not wait for a Sunday.
+   `grid.weekly ab --check` runs from the existing nightly `grid-verdicts` timer (03:15, right after
+   verdicts settle). An A/B is **stuck** when, at least 48 h after `since_ts`, the candidate arm has
+   **zero** settled attributable verdicts while the incumbent arm has **≥ 50** — the relay is asking
+   the candidate and nothing comes back, or every candidate ask is deferring (gateway rejecting the
+   tag, model not loadable, key missing the tag). Stuck → `decision: held`, reason
+   `colony A/B stuck: candidate 0 settled in 48h (incumbent N)`, candidate cleared, relay restarted,
+   `current` untouched. Recovery is therefore ≤ 48 h + one nightly run, and the relay is back to
+   100% incumbent by the next morning. A stuck check that itself fails (ledger unreadable) does
+   nothing and logs; the Sunday gate remains the backstop.
+2. **A loss is remembered.** A `held` row whose reason starts `colony A/B lost` or `colony A/B stuck`
+   for tag T blocks a new A/B on T; rogue may re-promote it, the gate records `held: <tag> already
+   lost/stuck the colony A/B on <date>` and waits for a newer tag. `grid.weekly ab --forget <tag>`
+   lifts the block deliberately (a ledger row records it).
