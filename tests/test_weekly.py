@@ -233,3 +233,69 @@ async def test_dry_run_release_and_rollback_write_no_ledger_row(tmp_path):
     assert row2["decision"] == "rolled_back"
     assert len(Versions(cfg.releases_dir / "versions.jsonl").rows()) == 2   # unchanged: dry-run rollback appended nothing
     assert cfg.grid_env.read_text() == grid_env_before   # flip's env write must not happen under dry_run either
+
+
+def _seed_ab(vdir, *, since_ts, inc="kannaka-brain-v3", cand="kannaka-brain-v4", n_inc=120, n_cand=110, inc_rep=30, cand_rep=25, before=5):
+    """Proposals + verdicts for two arms; `before` extra candidate proposals stamped before since_ts (must be excluded)."""
+    from grid.verdicts import Ledger
+    (vdir / "prompts").mkdir(parents=True, exist_ok=True)
+    led = Ledger(vdir / "verdicts.jsonl"); rows = []
+    def add(i, alias, ts, tier, births):
+        rid = f"{alias}-{i}-{ts}"
+        rows.append({"ts": ts, "request_id": rid, "outcome": "proposed", "model_alias": alias, "parent_genome": ["a"], "prompt_path": f"prompts/{rid}.txt", "proposal": ["a", "nop"]})
+        led.append({"request_id": rid, "model_alias": alias, "tier": tier, "births": births, "fitness": births})
+    for i in range(n_inc): add(i, inc, since_ts + 1000 + i, "reproduced" if i < inc_rep else "new", 2 if i < inc_rep else 1)
+    for i in range(n_cand): add(i, cand, since_ts + 1000 + i, "reproduced" if i < cand_rep else "new", 2 if i < cand_rep else 1)
+    for i in range(before): add(i, cand, since_ts - 1000 - i, "reproduced", 5)                 # outside the window
+    add(999, cand, since_ts + 5000, "preexisting", 40)                                            # excluded tier
+    (vdir / "proposals.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def test_ab_arms_windows_on_proposal_ts_and_excludes_unattributable_tiers(tmp_path):
+    from grid.weekly import ab_arms
+    v = tmp_path / "v"; _seed_ab(v, since_ts=1_000_000)
+    arms = ab_arms(v, since_ts=1_000_000, incumbent="kannaka-brain-v3", candidate="kannaka-brain-v4")
+    assert arms["kannaka-brain-v3"] == {"settled": 120, "reproduced": 30, "rate": 0.25, "births_per_proposal": pytest.approx((30*2 + 90) / 120)}
+    assert arms["kannaka-brain-v4"]["settled"] == 110 and arms["kannaka-brain-v4"]["reproduced"] == 25   # not 110+5+1
+    arms2 = ab_arms(v, since_ts=1_000_000, incumbent="kannaka-brain-v3", candidate="kannaka-brain-v9")
+    assert arms2["kannaka-brain-v9"] == {"settled": 0, "reproduced": 0, "rate": 0.0, "births_per_proposal": 0.0}
+
+
+def test_ab_decide_boundaries():
+    from grid.weekly import MIN_SAMPLE, TOLERANCE, ab_decide
+    inc, cand = "v3", "v4"
+    arms = lambda ri, si, rc, sc: {inc: {"settled": si, "reproduced": int(ri*si), "rate": ri, "births_per_proposal": 0}, cand: {"settled": sc, "reproduced": int(rc*sc), "rate": rc, "births_per_proposal": 0}}
+    assert ab_decide(arms(0.25, 120, 0.225, 110), incumbent=inc, candidate=cand)[0] == "win"     # exactly rate_i*(1-0.10)
+    assert ab_decide(arms(0.25, 120, 0.224, 110), incumbent=inc, candidate=cand)[0] == "loss"
+    assert ab_decide(arms(0.25, 120, 0.9, 99), incumbent=inc, candidate=cand)[0] == "inconclusive"  # 99 < MIN_SAMPLE
+    assert ab_decide(arms(0.25, 99, 0.9, 200), incumbent=inc, candidate=cand)[0] == "inconclusive"
+    assert MIN_SAMPLE == 100 and TOLERANCE == 0.10
+
+
+def test_ab_state_and_lost_tags(tmp_path):
+    from grid.versions import Versions, release_row
+    from grid.weekly import ab_state, lost_tags
+    v = Versions(tmp_path / "versions.jsonl")
+    kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0)
+    assert ab_state(v) is None
+    v.append(release_row(week="W1", decision="released", version="v3", previous=None, evals={}, reason="", **kw))
+    v.append(release_row(week="W2", decision="ab_started", version="v4", previous="v3", ts=2_000_000.0, reason="",
+                         evals={"colony_ab": {"candidate": "v4", "incumbent": "v3", "split": 0.2, "since_ts": 2_000_000_000}}, **kw))
+    s = ab_state(v)
+    assert s["candidate"] == "v4" and s["incumbent"] == "v3" and s["since_ts"] == 2_000_000_000 and s["weeks"] == 0
+    v.append(release_row(week="W3", decision="ab_inconclusive", version="v4", previous="v3", evals={}, reason="", **kw))
+    assert ab_state(v)["weeks"] == 1
+    v.append(release_row(week="W4", decision="held", version="v4", previous="v3", evals={}, reason="colony A/B lost: 0.1 vs 0.25", **kw))
+    assert ab_state(v) is None and lost_tags(v) == {"v4"}
+    v.append(release_row(week="W5", decision="held", version="v5", previous="v3", evals={}, reason="colony A/B stuck: candidate 0 settled in 48h (incumbent 60)", **kw))
+    assert lost_tags(v) == {"v4", "v5"}
+
+
+def test_is_stuck_rule():
+    from grid.weekly import is_stuck
+    arms = lambda si, sc: {"v3": {"settled": si, "reproduced": 0, "rate": 0, "births_per_proposal": 0}, "v4": {"settled": sc, "reproduced": 0, "rate": 0, "births_per_proposal": 0}}
+    t0 = 1_000_000_000
+    assert is_stuck(arms(60, 0), since_ts=t0, now_ms=t0 + 49*3600*1000, incumbent="v3", candidate="v4") is True
+    assert is_stuck(arms(60, 0), since_ts=t0, now_ms=t0 + 40*3600*1000, incumbent="v3", candidate="v4") is False   # too early
+    assert is_stuck(arms(40, 0), since_ts=t0, now_ms=t0 + 49*3600*1000, incumbent="v3", candidate="v4") is False   # incumbent too thin to judge
+    assert is_stuck(arms(60, 1), since_ts=t0, now_ms=t0 + 49*3600*1000, incumbent="v3", candidate="v4") is False   # candidate alive

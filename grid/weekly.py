@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .proposal_log import ProposalLog
 from .remote import Remote, RemoteError
 from .verdicts import Ledger
 from .versions import Versions, decide, release_row
@@ -26,6 +27,15 @@ from .weekly_probe import chat, run_identity, run_validity
 
 log = logging.getLogger("grid.weekly")
 A100_USD_PER_H = 2.49        # run_qbraid's gpu-a100-sxm rate; the manifest records seconds, not dollars
+
+AB_SPLIT = 0.2
+MIN_SAMPLE = 100
+TOLERANCE = 0.10
+MAX_WEEKS = 2
+STUCK_AFTER_S = 48 * 3600
+STUCK_INCUMBENT_MIN = 50
+POSITIVE_TIERS = ("reproduced", "growing", "enduring", "established")
+EXCLUDED_TIERS = ("preexisting", "unknown", "rejected")
 
 
 @dataclass(frozen=True)
@@ -172,6 +182,68 @@ def colony_ab(verdicts_dir: Path) -> dict:
     return {"advisory": True, "by_alias": {
         k: {"proposals": v["proposals"], "births_per_proposal": v["births"] / v["proposals"],
             "reproduced_rate": v["reproduced"] / v["proposals"]} for k, v in by.items() if v["proposals"]}}
+
+
+def ab_arms(verdicts_dir: Path, *, since_ts: int, incumbent: str, candidate: str) -> dict:
+    """Per-arm colony outcome for proposals MADE since `since_ts` (the proposal's own ts,
+    joined by request_id), so only asks that ran under the split count."""
+    vdir = Path(verdicts_dir)
+    entries = {e["request_id"]: e for e in ProposalLog(vdir).read_all()}
+    acc = {t: {"settled": 0, "reproduced": 0, "births": 0} for t in (incumbent, candidate)}
+    for row in Ledger(vdir / "verdicts.jsonl").rows():
+        e = entries.get(row.get("request_id"))
+        if e is None or int(e.get("ts", 0)) < since_ts or row.get("tier") in EXCLUDED_TIERS:
+            continue
+        a = acc.get(str(row.get("model_alias", "")))
+        if a is None:
+            continue
+        a["settled"] += 1
+        a["reproduced"] += 1 if row.get("tier") in POSITIVE_TIERS else 0
+        a["births"] += int(row.get("births") or 0)
+    return {t: {"settled": v["settled"], "reproduced": v["reproduced"],
+                "rate": (v["reproduced"] / v["settled"]) if v["settled"] else 0.0,
+                "births_per_proposal": (v["births"] / v["settled"]) if v["settled"] else 0.0}
+            for t, v in acc.items()}
+
+
+def ab_decide(arms: dict, *, incumbent: str, candidate: str, min_sample: int = MIN_SAMPLE,
+              tolerance: float = TOLERANCE) -> tuple[str, str]:
+    i, c = arms[incumbent], arms[candidate]
+    if i["settled"] < min_sample or c["settled"] < min_sample:
+        return "inconclusive", f"sample {c['settled']}/{i['settled']} below {min_sample} per arm"
+    floor = i["rate"] * (1 - tolerance)
+    if c["rate"] >= floor - 1e-12:
+        return "win", f"candidate rate {c['rate']:.3f} >= {floor:.3f} (incumbent {i['rate']:.3f} x {1 - tolerance})"
+    return "loss", f"colony A/B lost: {c['rate']:.3f} vs {i['rate']:.3f}"
+
+
+def is_stuck(arms: dict, *, since_ts: int, now_ms: int, incumbent: str, candidate: str) -> bool:
+    return (now_ms - since_ts >= STUCK_AFTER_S * 1000 and arms[candidate]["settled"] == 0
+            and arms[incumbent]["settled"] >= STUCK_INCUMBENT_MIN)
+
+
+def ab_state(versions: Versions) -> dict | None:
+    """The running A/B: the last ab_started row not yet closed by a released/held/rolled_back row."""
+    started, weeks = None, 0
+    for r in versions.rows():
+        if r["decision"] == "ab_started":
+            started, weeks = r, 0
+        elif started is not None and r["decision"] == "ab_inconclusive":
+            weeks += 1
+        elif started is not None and r["decision"] in ("released", "held", "rolled_back", "flip_incomplete"):
+            started = None
+    if started is None:
+        return None
+    ab = (started.get("evals") or {}).get("colony_ab") or {}
+    return {"candidate": ab.get("candidate", started.get("version")), "incumbent": ab.get("incumbent", started.get("previous")),
+            "split": ab.get("split", AB_SPLIT), "since_ts": int(ab.get("since_ts") or started["ts"] * 1000),
+            "weeks": weeks, "started_row": started}
+
+
+def lost_tags(versions: Versions) -> set[str]:
+    return {r["version"] for r in versions.rows()
+            if r["decision"] == "held" and str(r.get("reason", "")).startswith(("colony A/B lost", "colony A/B stuck"))
+            and r.get("version")}
 
 
 def flip(cfg: WeeklyConfig, remote, version: str, *, local_run, dry_run: bool = False) -> str:

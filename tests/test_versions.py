@@ -45,3 +45,14 @@ def test_versions_ledger_chains_and_finds_previous(tmp_path):
     assert v.previous_released(before="v5")["version"] == "v3"
     assert v.previous_released(before="v3") is None
     assert v.verify() is True and len(v.rows()) == 3
+
+
+def test_ab_decisions_are_valid_and_not_release_state(tmp_path):
+    from grid.versions import DECISIONS, Versions, release_row
+    assert "ab_started" in DECISIONS and "ab_inconclusive" in DECISIONS
+    v = Versions(tmp_path / "v.jsonl")
+    kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={}, verdict_window={}, evals={}, spend_usd=0, rogue_ledger_ts=0, reason="")
+    v.append(release_row(week="W1", decision="released", version="v3", previous=None, **kw))
+    v.append(release_row(week="W2", decision="ab_started", version="v4", previous="v3", **kw))
+    v.append(release_row(week="W3", decision="ab_inconclusive", version="v4", previous="v3", **kw))
+    assert v.last_released()["version"] == "v3"
