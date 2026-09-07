@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from grid.weekly import WeeklyConfig, colony_ab, find_candidate, flip, release, rollback
+from grid.weekly import WeeklyConfig, ab_state, colony_ab, find_candidate, flip, lost_tags, release, rollback
 from grid.mind import MindError
 
 
@@ -106,7 +106,7 @@ def test_flip_order_and_revert_on_failed_tag_copy(tmp_path):
     assert local == [["sudo", "-n", "systemctl", "restart", "grid-odin.service"]]
 
 
-async def test_release_holds_on_probe_failure_and_releases_on_pass(tmp_path):
+async def test_release_holds_on_probe_failure_and_starts_ab_on_pass(tmp_path):
     cfg = _cfg(tmp_path); _seed_one_proposal(tmp_path / "v")
     r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
                     "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
@@ -116,12 +116,13 @@ async def test_release_holds_on_probe_failure_and_releases_on_pass(tmp_path):
     assert not any(c.startswith("ollama cp") for c in r.commands)
     async def her(prompt): return '["harvest", "nop", "fork"]' if "Instruction set" in prompt else "I am Kannaka."
     row = await release(cfg, r, ask_factory=lambda model: her, local_run=lambda cmd: 0, week="2026-W37")
-    assert row["decision"] == "released" and row["version"] == "kannaka-brain-v4" and row["previous"] is None
+    assert row["decision"] == "ab_started" and row["version"] == "kannaka-brain-v4" and row["previous"] is None
     assert row["adapter_sha256"] == "e" * 64 and row["spend_usd"] == pytest.approx(781 / 3600 * 2.49, rel=0.01)
     from grid.versions import Versions
     assert Versions(cfg.releases_dir / "versions.jsonl").verify() is True
+    # a colony A/B is now running: the next Sunday is a verdict day, not another probe
     row = await release(cfg, r, ask_factory=lambda model: her, local_run=lambda cmd: 0, week="2026-W37")
-    assert row["decision"] == "unchanged"
+    assert row["decision"] == "ab_inconclusive"
 
 
 async def test_release_uses_the_configured_identity_runs(tmp_path):
@@ -139,7 +140,7 @@ async def test_release_uses_the_configured_identity_runs(tmp_path):
         identity_asks.append(prompt)
         return "I am Kannaka."
     row = await release(cfg, r, ask_factory=lambda model: her, local_run=lambda cmd: 0, week="2026-W37")
-    assert row["decision"] == "released"
+    assert row["decision"] == "ab_started"
     assert len(identity_asks) == 3 * len(IDENTITY_QUESTIONS)   # 3 runs, not the old 10
     assert row["evals"]["identity"]["total"] == 3 * len(IDENTITY_QUESTIONS)
 
@@ -218,10 +219,10 @@ async def test_dry_run_release_and_rollback_write_no_ledger_row(tmp_path):
                     "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
     async def her(prompt): return '["harvest", "nop", "fork"]' if "Instruction set" in prompt else "I am Kannaka."
     row = await release(cfg, r, ask_factory=lambda model: her, local_run=lambda cmd: (_ for _ in ()).throw(AssertionError("local_run must not run for real under dry_run")), week="2026-W37", dry_run=True)
-    assert row["decision"] == "released"
+    assert row["decision"] == "ab_started"
     from grid.versions import Versions
     assert Versions(cfg.releases_dir / "versions.jsonl").rows() == []
-    assert cfg.grid_env.read_text() == grid_env_before   # flip's env write must not happen under dry_run either
+    assert cfg.grid_env.read_text() == grid_env_before   # start_ab's env write must not happen under dry_run either
 
     from grid.versions import release_row
     v = Versions(cfg.releases_dir / "versions.jsonl")
@@ -299,3 +300,111 @@ def test_is_stuck_rule():
     assert is_stuck(arms(60, 0), since_ts=t0, now_ms=t0 + 40*3600*1000, incumbent="v3", candidate="v4") is False   # too early
     assert is_stuck(arms(40, 0), since_ts=t0, now_ms=t0 + 49*3600*1000, incumbent="v3", candidate="v4") is False   # incumbent too thin to judge
     assert is_stuck(arms(60, 1), since_ts=t0, now_ms=t0 + 49*3600*1000, incumbent="v3", candidate="v4") is False   # candidate alive
+
+
+async def test_release_starts_an_ab_instead_of_flipping(tmp_path):
+    cfg = _cfg(tmp_path); _seed_one_proposal(tmp_path / "v")
+    r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
+                    "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
+    async def her(p): return '["harvest", "nop", "fork"]' if "Instruction set" in p else "I am Kannaka."
+    restarts = []
+    row = await release(cfg, r, ask_factory=lambda m: her, local_run=lambda c: restarts.append(c) or 0, week="W1")
+    assert row["decision"] == "ab_started" and row["version"] == "kannaka-brain-v4"
+    assert not any(c.startswith("ollama cp") for c in r.commands)                      # no flip
+    env = (tmp_path / "grid.env").read_text()
+    assert "MIND_LLM_CANDIDATE=kannaka-brain-v4" in env and "MIND_AB_SPLIT=0.2" in env and "MIND_MODEL_ALIAS=kannaka-brain-v3" in env
+    assert restarts and "grid-odin" in " ".join(restarts[0])                             # relay restarted
+    ab = row["evals"]["colony_ab"]
+    assert ab["candidate"] == "kannaka-brain-v4" and ab["incumbent"] == "kannaka-brain-v3" and ab["since_ts"] > 0
+
+
+async def _run_ab_week(tmp_path, *, inc_rep, cand_rep, n_cand=110):
+    cfg = _cfg(tmp_path); v = tmp_path / "v"
+    from grid.versions import Versions, release_row
+    since = 1_000_000_000
+    vs = Versions(cfg.releases_dir / "versions.jsonl")
+    kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0)
+    vs.append(release_row(week="W0", decision="released", version="kannaka-brain-v3", previous=None, evals={}, reason="", **kw))
+    vs.append(release_row(week="W1", decision="ab_started", version="kannaka-brain-v4", previous="kannaka-brain-v3", evals={"colony_ab": {"candidate": "kannaka-brain-v4", "incumbent": "kannaka-brain-v3", "split": 0.2, "since_ts": since}}, reason="", **kw))
+    _seed_ab(v, since_ts=since, inc_rep=inc_rep, cand_rep=cand_rep, n_cand=n_cand)
+    (tmp_path / "grid.env").write_text("MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_MODEL=kannaka-brain-current\nMIND_LLM_CANDIDATE=kannaka-brain-v4\nMIND_AB_SPLIT=0.2\n")
+    r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
+                    "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
+    restarts = []
+    async def never(p): raise AssertionError("probes must not run during an A/B week")
+    row = await release(cfg, r, ask_factory=lambda m: never, local_run=lambda c: restarts.append(c) or 0, week="W2")
+    return row, r, (tmp_path / "grid.env").read_text(), restarts
+
+
+async def test_ab_win_flips_and_clears_the_candidate(tmp_path):
+    row, r, env, restarts = await _run_ab_week(tmp_path, inc_rep=30, cand_rep=28)          # 0.255 >= 0.225
+    assert row["decision"] == "released" and row["evals"]["colony_ab"]["binding"] is True and row["evals"]["colony_ab"]["winner"] == "kannaka-brain-v4"
+    assert "ollama cp kannaka-brain-v4 kannaka-brain-current" in r.commands
+    assert "MIND_MODEL_ALIAS=kannaka-brain-v4" in env and "MIND_LLM_CANDIDATE=" not in env.replace("MIND_LLM_CANDIDATE=\n", "")  # cleared
+
+
+async def test_ab_loss_holds_and_never_releases(tmp_path):
+    row, r, env, restarts = await _run_ab_week(tmp_path, inc_rep=30, cand_rep=10)          # 0.09 < 0.225
+    assert row["decision"] == "held" and row["reason"].startswith("colony A/B lost")
+    assert not any(c.startswith("ollama cp") for c in r.commands)
+    assert "MIND_MODEL_ALIAS=kannaka-brain-v3" in env and "MIND_LLM_CANDIDATE=kannaka-brain-v4" not in env and restarts
+
+
+async def test_ab_inconclusive_continues_then_holds_at_max_weeks(tmp_path):
+    row, r, env, restarts = await _run_ab_week(tmp_path, inc_rep=30, cand_rep=20, n_cand=50)  # candidate < MIN_SAMPLE
+    assert row["decision"] == "ab_inconclusive" and "MIND_LLM_CANDIDATE=kannaka-brain-v4" in env and not restarts
+    # a second inconclusive week hits MAX_WEEKS -> held, candidate cleared
+    from grid.versions import Versions
+    cfg = _cfg(tmp_path)
+    (tmp_path / "grid.env").write_text("MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_MODEL=kannaka-brain-current\nMIND_LLM_CANDIDATE=kannaka-brain-v4\nMIND_AB_SPLIT=0.2\n")
+    r2 = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
+                     "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
+    async def never(p): raise AssertionError
+    row2 = await release(cfg, r2, ask_factory=lambda m: never, local_run=lambda c: 0, week="W3")
+    assert row2["decision"] == "held" and "inconclusive after 2 weeks" in row2["reason"]
+    assert "MIND_LLM_CANDIDATE=kannaka-brain-v4" not in (tmp_path / "grid.env").read_text()
+
+
+async def test_lost_tag_is_not_retested_until_forgotten(tmp_path):
+    cfg = _cfg(tmp_path); _seed_one_proposal(tmp_path / "v")
+    from grid.versions import Versions, release_row
+    vs = Versions(cfg.releases_dir / "versions.jsonl")
+    kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={}, verdict_window={}, evals={}, spend_usd=0, rogue_ledger_ts=0)
+    vs.append(release_row(week="W0", decision="released", version="kannaka-brain-v3", previous=None, reason="", **kw))
+    vs.append(release_row(week="W1", decision="held", version="kannaka-brain-v4", previous="kannaka-brain-v3", reason="colony A/B lost: 0.1 vs 0.3", **kw))
+    r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
+                    "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
+    async def never(p): raise AssertionError
+    row = await release(cfg, r, ask_factory=lambda m: never, local_run=lambda c: 0, week="W2")
+    assert row["decision"] == "held" and "already lost" in row["reason"]
+    from grid.weekly import ab_forget
+    ab_forget(cfg, "kannaka-brain-v4")
+    assert lost_tags(vs) == set()
+
+
+def test_ab_check_aborts_a_stuck_ab(tmp_path):
+    from grid.weekly import ab_check
+    from grid.versions import Versions, release_row
+    cfg = _cfg(tmp_path); v = tmp_path / "v"; since = 1_000_000_000
+    vs = Versions(cfg.releases_dir / "versions.jsonl")
+    kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0)
+    vs.append(release_row(week="W1", decision="ab_started", version="kannaka-brain-v4", previous="kannaka-brain-v3", evals={"colony_ab": {"candidate": "kannaka-brain-v4", "incumbent": "kannaka-brain-v3", "split": 0.2, "since_ts": since}}, reason="", **kw))
+    _seed_ab(v, since_ts=since, n_inc=60, n_cand=0, inc_rep=10, cand_rep=0, before=0)
+    (tmp_path / "grid.env").write_text("MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_CANDIDATE=kannaka-brain-v4\nMIND_AB_SPLIT=0.2\n")
+    restarts = []
+    assert ab_check(cfg, now_ms=since + 40*3600*1000, local_run=lambda c: restarts.append(c) or 0) is None      # too early
+    row = ab_check(cfg, now_ms=since + 49*3600*1000, local_run=lambda c: restarts.append(c) or 0)
+    assert row["decision"] == "held" and row["reason"].startswith("colony A/B stuck") and restarts
+    assert "MIND_LLM_CANDIDATE=kannaka-brain-v4" not in (tmp_path / "grid.env").read_text() and ab_state(vs) is None
+
+
+async def test_dry_run_ab_writes_nothing(tmp_path):
+    cfg = _cfg(tmp_path); _seed_one_proposal(tmp_path / "v")
+    r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
+                    "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
+    async def her(p): return '["harvest", "nop", "fork"]' if "Instruction set" in p else "I am Kannaka."
+    before = (tmp_path / "grid.env").read_text()
+    row = await release(cfg, r, ask_factory=lambda m: her, local_run=lambda c: (_ for _ in ()).throw(AssertionError()), week="W1", dry_run=True)
+    assert row["decision"] == "ab_started" and (tmp_path / "grid.env").read_text() == before
+    from grid.versions import Versions
+    assert Versions(cfg.releases_dir / "versions.jsonl").rows() == []

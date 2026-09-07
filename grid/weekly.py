@@ -241,9 +241,20 @@ def ab_state(versions: Versions) -> dict | None:
 
 
 def lost_tags(versions: Versions) -> set[str]:
-    return {r["version"] for r in versions.rows()
-            if r["decision"] == "held" and str(r.get("reason", "")).startswith(("colony A/B lost", "colony A/B stuck"))
-            and r.get("version")}
+    """A tag is lost iff its most recent lost/stuck `held` row comes after its most
+    recent operator-forget `unchanged` row (spec §8): forgetting makes it retestable
+    until it loses or gets stuck again."""
+    lost_at: dict[str, float] = {}
+    forgotten_at: dict[str, float] = {}
+    for r in versions.rows():
+        tag = r.get("version")
+        if not tag:
+            continue
+        if r["decision"] == "held" and str(r.get("reason", "")).startswith(("colony A/B lost", "colony A/B stuck")):
+            lost_at[tag] = r["ts"]
+        elif r["decision"] == "unchanged" and str(r.get("reason", "")).startswith("operator forgot"):
+            forgotten_at[tag] = r["ts"]
+    return {tag for tag, ts in lost_at.items() if ts > forgotten_at.get(tag, float("-inf"))}
 
 
 def flip(cfg: WeeklyConfig, remote, version: str, *, local_run, dry_run: bool = False) -> str:
@@ -259,6 +270,9 @@ def flip(cfg: WeeklyConfig, remote, version: str, *, local_run, dry_run: bool = 
         log.info("[dry-run] flip: would set MIND_MODEL_ALIAS=%s in %s", version, cfg.grid_env)
     else:
         _env_set(cfg.grid_env, "MIND_MODEL_ALIAS", version)
+        # A flip always ends any colony A/B in progress: the relay is about to serve
+        # `version` outright, so a stray candidate split would fight the new alias.
+        _env_set(cfg.grid_env, "MIND_LLM_CANDIDATE", "")
     r = remote.run(f"ollama cp {shlex.quote(version)} {shlex.quote(cfg.current_alias)}", timeout=600)
     if r.returncode != 0:
         if not dry_run and before is not None:
@@ -278,6 +292,30 @@ def flip(cfg: WeeklyConfig, remote, version: str, *, local_run, dry_run: bool = 
     return "flip_incomplete"
 
 
+def _restart_relay(local_run) -> int:
+    return local_run(["sudo", "systemctl", "restart", "grid-odin.service"])
+
+
+def start_ab(cfg: WeeklyConfig, *, candidate: str, incumbent: str, local_run, dry_run: bool = False,
+            now_ms: int | None = None) -> dict:
+    """Spec §8: probes passed, but a release is now a binding colony A/B, not a flip."""
+    since = now_ms if now_ms is not None else int(time.time() * 1000)
+    block = {"binding": True, "candidate": candidate, "incumbent": incumbent, "split": AB_SPLIT, "since_ts": since,
+             "min_sample": MIN_SAMPLE, "tolerance": TOLERANCE, "weeks": 0, "arms": {}, "winner": None}
+    if not dry_run:
+        _env_set(cfg.grid_env, "MIND_LLM_CANDIDATE", candidate)
+        _env_set(cfg.grid_env, "MIND_AB_SPLIT", str(AB_SPLIT))
+        _restart_relay(local_run)
+    return block
+
+
+def end_ab(cfg: WeeklyConfig, *, local_run, dry_run: bool = False) -> None:
+    """Clear the candidate split (win/loss/inconclusive-at-max/stuck/abort all land here)."""
+    if not dry_run:
+        _env_set(cfg.grid_env, "MIND_LLM_CANDIDATE", "")
+        _restart_relay(local_run)
+
+
 def _iso_week() -> str:
     return time.strftime("%G-W%V")
 
@@ -288,12 +326,50 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
     versions = Versions(cfg.releases_dir / "versions.jsonl")
     last = versions.last_released()
     released = last["version"] if last else None
+    state = ab_state(versions)
+    if state is not None:
+        # A colony A/B is running: this Sunday is the binding verdict, not a probe day
+        # (spec §8) — no candidate discovery, no key check, no probes.
+        arms = ab_arms(cfg.verdicts_dir, since_ts=state["since_ts"], incumbent=state["incumbent"], candidate=state["candidate"])
+        verdict, reason = ab_decide(arms, incumbent=state["incumbent"], candidate=state["candidate"])
+        block = {"binding": True, **state["started_row"]["evals"]["colony_ab"], "arms": arms, "weeks": state["weeks"] + 1, "winner": None}
+        common = dict(week=week, base="", run="", grid_examples={}, verdict_window=_window(cfg.verdicts_dir), rogue_ledger_ts=0.0,
+                      adapter_sha256="", gguf_sha256="", set_manifest_sha256="", spend_usd=0.0)
+        if verdict == "inconclusive" and state["weeks"] + 1 >= MAX_WEEKS:
+            end_ab(cfg, local_run=local_run, dry_run=dry_run)
+            row = release_row(decision="held", version=state["candidate"], previous=released, evals={"colony_ab": block},
+                              reason=f"colony A/B inconclusive after {MAX_WEEKS} weeks: {reason}", **common)
+        elif verdict == "inconclusive":
+            row = release_row(decision="ab_inconclusive", version=state["candidate"], previous=released,
+                              evals={"colony_ab": block}, reason=reason, **common)
+        elif verdict == "win":
+            block["winner"] = state["candidate"]
+            outcome = flip(cfg, remote, state["candidate"], local_run=local_run, dry_run=dry_run)
+            if outcome == "ok":
+                decision, why = "released", reason
+            elif outcome == "flip_failed":
+                decision, why = "held", "flip failed: tag copy"
+            else:
+                decision, why = "flip_incomplete", "alias serves the candidate; relay restart failed twice"
+            row = release_row(decision=decision, version=state["candidate"], previous=released,
+                              evals={"colony_ab": block}, reason=why, **common)
+        else:
+            end_ab(cfg, local_run=local_run, dry_run=dry_run)
+            row = release_row(decision="held", version=state["candidate"], previous=released,
+                              evals={"colony_ab": block}, reason=reason, **common)
+        return _ledger(versions, row, dry_run=dry_run)
     cand = find_candidate(remote, cfg)
     common = dict(week=week, base=(cand or {}).get("manifest", {}).get("base", ""), run=(cand or {}).get("run", ""),
                   grid_examples={}, verdict_window=_window(cfg.verdicts_dir), rogue_ledger_ts=(cand or {}).get("rogue_ts", 0.0))
     if cand is None or cand["tag"] == released:
         decision, reason = decide(candidate=(cand or {}).get("tag"), released=released, identity=True, validity=True)
         row = release_row(decision=decision, version=(cand or {}).get("tag"), previous=released, adapter_sha256="", gguf_sha256="",
+                          set_manifest_sha256="", evals={"colony_ab": colony_ab(cfg.verdicts_dir)}, spend_usd=0.0, reason=reason, **common)
+        return _ledger(versions, row, dry_run=dry_run)
+    if cand["tag"] in lost_tags(versions):
+        decision = "held"
+        reason = f"{cand['tag']} already lost/stuck the colony A/B; run `grid.weekly ab --forget {cand['tag']}` to retest"
+        row = release_row(decision=decision, version=cand["tag"], previous=released, adapter_sha256="", gguf_sha256="",
                           set_manifest_sha256="", evals={"colony_ab": colony_ab(cfg.verdicts_dir)}, spend_usd=0.0, reason=reason, **common)
         return _ledger(versions, row, dry_run=dry_run)
     # I1: the probes ask the concrete candidate tag; the colony key may not list it yet if it
@@ -324,11 +400,10 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
     h["gguf_sha256"] = gguf_hash(remote, cand["tag"])
     decision, reason = decide(candidate=cand["tag"], released=released, identity=identity["pass"], validity=validity["pass"])
     if decision == "released":
-        outcome = flip(cfg, remote, cand["tag"], local_run=local_run, dry_run=dry_run)
-        if outcome == "flip_failed":
-            decision, reason = "held", "flip failed: tag copy"
-        elif outcome == "flip_incomplete":
-            decision, reason = "flip_incomplete", "alias serves the candidate; relay restart failed twice"
+        # spec §8: probes passed, but a release is now a binding colony A/B, not a flip.
+        incumbent = _env_get(cfg.grid_env, "MIND_MODEL_ALIAS") or released
+        evals["colony_ab"] = start_ab(cfg, candidate=cand["tag"], incumbent=incumbent, local_run=local_run, dry_run=dry_run)
+        decision, reason = "ab_started", "probes passed; colony A/B started"
     row = release_row(decision=decision, version=cand["tag"], previous=released, evals=evals, spend_usd=spend, reason=reason, **h, **common)
     return _ledger(versions, row, dry_run=dry_run)
 
@@ -345,6 +420,36 @@ def _ledger(versions: Versions, row: dict, *, dry_run: bool = False) -> dict:
             versions.append(row)
     log.info("%s: %s (%s)", row["week"], row["decision"], row["reason"])
     return row
+
+
+def ab_check(cfg: WeeklyConfig, *, now_ms: int | None = None, local_run, dry_run: bool = False) -> dict | None:
+    """The daily stuck check (spec §8): abort a dead A/B within 48 h instead of waiting for
+    Sunday. Returns None when no A/B is running, or when it isn't (yet) stuck."""
+    versions = Versions(cfg.releases_dir / "versions.jsonl")
+    state = ab_state(versions)
+    if state is None:
+        return None
+    now = now_ms if now_ms is not None else int(time.time() * 1000)
+    arms = ab_arms(cfg.verdicts_dir, since_ts=state["since_ts"], incumbent=state["incumbent"], candidate=state["candidate"])
+    if not is_stuck(arms, since_ts=state["since_ts"], now_ms=now, incumbent=state["incumbent"], candidate=state["candidate"]):
+        return None
+    end_ab(cfg, local_run=local_run, dry_run=dry_run)
+    block = {"binding": True, **state["started_row"]["evals"]["colony_ab"], "arms": arms, "weeks": state["weeks"], "winner": None}
+    last = versions.last_released()
+    row = release_row(week=_iso_week(), decision="held", version=state["candidate"], previous=last["version"] if last else None,
+                      base="", run="", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={},
+                      verdict_window=_window(cfg.verdicts_dir), evals={"colony_ab": block}, spend_usd=0.0, rogue_ledger_ts=0.0,
+                      reason=f"colony A/B stuck: candidate 0 settled in 48h (incumbent {arms[state['incumbent']]['settled']})")
+    return _ledger(versions, row, dry_run=dry_run)
+
+
+def ab_forget(cfg: WeeklyConfig, tag: str, *, dry_run: bool = False) -> dict:
+    """Operator override: make a lost/stuck tag retestable again (spec §8)."""
+    versions = Versions(cfg.releases_dir / "versions.jsonl")
+    row = release_row(week=_iso_week(), decision="unchanged", version=tag, previous=None, base="", run="",
+                      adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={}, verdict_window={},
+                      evals={}, spend_usd=0.0, rogue_ledger_ts=0.0, reason=f"operator forgot the colony A/B loss of {tag}")
+    return _ledger(versions, row, dry_run=dry_run)
 
 
 def rollback(cfg: WeeklyConfig, remote, *, to: str | None = None, local_run, dry_run: bool = False) -> dict:
@@ -366,6 +471,7 @@ def rollback(cfg: WeeklyConfig, remote, *, to: str | None = None, local_run, dry
         target = next((r for r in versions.rows() if r["decision"] == "released" and r["version"] == to), None)
     if target is None:
         raise SystemExit(f"{to or 'the previous release'} was never released; refusing")
+    end_ab(cfg, local_run=local_run, dry_run=dry_run)
     outcome = flip(cfg, remote, target["version"], local_run=local_run, dry_run=dry_run)
     decision = "rolled_back" if outcome == "ok" else outcome
     row = release_row(week=_iso_week(), decision=decision if decision in ("rolled_back", "flip_incomplete") else "held",
@@ -383,10 +489,13 @@ def _local_run(cmd: list[str]) -> int:
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser(prog="grid.weekly")
-    ap.add_argument("verb", choices=("release", "rollback", "status"))
+    ap.add_argument("verb", choices=("release", "rollback", "status", "ab"))
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--week", default=None)
     ap.add_argument("--to", default=None)
+    ap.add_argument("--abort", action="store_true")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--forget", default=None, metavar="TAG")
     a = ap.parse_args(argv)
     cfg = WeeklyConfig.from_env()
     cfg.releases_dir.mkdir(parents=True, exist_ok=True)
@@ -394,10 +503,40 @@ def main(argv: list[str] | None = None) -> int:
     if a.verb == "status":
         v = Versions(cfg.releases_dir / "versions.jsonl")
         print(json.dumps({"released": (v.last_released() or {}).get("version"), "rows": len(v.rows()), "verify": v.verify(),
-                          "candidate": find_candidate(remote, cfg)}, indent=1, default=str))
+                          "candidate": find_candidate(remote, cfg), "ab": ab_state(v)}, indent=1, default=str))
+        return 0
+    local_run = (lambda cmd: (log.info("[dry-run] %s", " ".join(cmd)) or 0)) if a.dry_run else _local_run
+    if a.verb == "ab":
+        versions = Versions(cfg.releases_dir / "versions.jsonl")
+        if a.forget:
+            row = ab_forget(cfg, a.forget, dry_run=a.dry_run)
+            print(json.dumps(row, default=str)); return 0
+        if a.abort:
+            state = ab_state(versions)
+            candidate = state["candidate"] if state else None
+            end_ab(cfg, local_run=local_run, dry_run=a.dry_run)
+            last = versions.last_released()
+            row = release_row(week=_iso_week(), decision="held", version=candidate, previous=last["version"] if last else None,
+                              base="", run="", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={},
+                              verdict_window=_window(cfg.verdicts_dir), evals={}, spend_usd=0.0, rogue_ledger_ts=0.0,
+                              reason="colony A/B aborted by operator")
+            row = _ledger(versions, row, dry_run=a.dry_run)
+            print(json.dumps(row, default=str)); return 0
+        if a.check:
+            state = ab_state(versions)
+            if state is None:
+                print("no A/B running"); return 0
+            row = ab_check(cfg, local_run=local_run, dry_run=a.dry_run)
+            print("not stuck" if row is None else json.dumps(row, default=str))
+            return 0
+        state = ab_state(versions)
+        if state is None:
+            print(json.dumps({"ab": None}, default=str))
+        else:
+            arms = ab_arms(cfg.verdicts_dir, since_ts=state["since_ts"], incumbent=state["incumbent"], candidate=state["candidate"])
+            print(json.dumps({"ab": state, "arms": arms}, default=str))
         return 0
     key = cfg.key_file.read_text(encoding="utf-8").strip()
-    local_run = (lambda cmd: (log.info("[dry-run] %s", " ".join(cmd)) or 0)) if a.dry_run else _local_run
     if a.verb == "rollback":
         row = rollback(cfg, remote, to=a.to, local_run=local_run, dry_run=a.dry_run)
         print(json.dumps(row, default=str)); return 0
