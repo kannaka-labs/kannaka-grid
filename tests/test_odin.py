@@ -1,10 +1,13 @@
+import hashlib
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 
 from grid.natsio import BusClosed, BusTimeout
 from grid.odin import Relay
+from grid.variants import Variant
 
 ISA = [{"name": n, "cost": 0.1, "effect": n} for n in ("nop", "harvest", "copy", "fork")]
 
@@ -43,6 +46,7 @@ class FakeMind:
     def __init__(self, answer=None, exc=None):
         self.answer, self.exc, self.asked, self.recalled = answer, exc, [], []
         self.remembered: list[tuple[str, list[str]]] = []
+        self.sampling: list[tuple[float | None, int | None]] = []
 
     def remember(self, text, tags, *, category="grid"):
         self.remembered.append((text, tags))
@@ -52,11 +56,21 @@ class FakeMind:
         self.recalled.append(query)
         return ["last time fork-early won"]
 
-    async def ask(self, text, *, recall_query=None, timeout_s=180.0):
+    async def ask(self, text, *, recall_query=None, timeout_s=180.0,
+                  temperature=None, max_tokens=None):
         self.asked.append(text)
+        self.sampling.append((temperature, max_tokens))
         if self.exc:
             raise self.exc
         return self.answer
+
+
+def a_variant(vid, *, template="VARIANT {directive} / {genome_json} / {memory}",
+              temperature=0.7, max_tokens=400, recall=True) -> Variant:
+    """A registry entry built in memory: these tests are about which variant the relay
+    picks, not about the shipped templates, which tests/test_variants.py owns."""
+    return Variant(id=vid, template=template, sha256=hashlib.sha256(template.encode()).hexdigest(),
+                   temperature=temperature, max_tokens=max_tokens, recall=recall, note="test")
 
 
 class FakeBus:
@@ -482,3 +496,140 @@ def test_config_from_env_candidate(monkeypatch, tmp_path):
     c = RelayConfig.from_env()
     assert c.candidate_tag == "kannaka-brain-v4" and c.ab_split == 0.3
     assert c.candidate_llm == DirectLlm("http://gw/v1", "kannaka-brain-v4", "sk-x")
+
+
+def test_model_dimension_assignment_is_unchanged_and_prompt_is_independent():
+    from grid.odin import arm_for, assign
+    ids = [f"req-{i}" for i in range(2000)]
+    # The arms list is ORDERED and the candidate leads, so that the cumulative
+    # bucket boundary falls at the split exactly where arm_for's `h < split` does.
+    for rid in ids:
+        assert assign(rid, dimension="model", arms=["cand", "inc"], weights=[0.2, 0.8]) == (
+            "cand" if arm_for(rid, 0.2) == "candidate" else "inc")
+    # and the prompt dimension must not be correlated with the model one
+    both = sum(1 for rid in ids
+               if assign(rid, dimension="model", arms=["a", "b"], weights=[0.5, 0.5]) == "a"
+               and assign(rid, dimension="prompt", arms=["a", "b"], weights=[0.5, 0.5]) == "a")
+    assert 0.20 < both / len(ids) < 0.30      # independent halves meet near 0.25, not 0.5
+
+
+async def test_without_a_prompt_candidate_every_entry_logs_the_default_variant(tmp_path):
+    # Includes the deferred-bin rejection: the arm that could not answer is still the arm
+    # that was asked, and task 3 counts those rows per arm. Mutation: drop `variant=variant`
+    # from any one _log call in poll_once -> that entry's prompt_variant is "".
+    from grid.mind import MindError
+    from grid.odin import DEFER_LIMIT
+    from grid.proposal_log import ProposalLog
+    from grid.variants import get_variant
+    default = get_variant()
+    plog = ProposalLog(tmp_path / "verdicts")
+    clock = Clock()
+    mind = FakeMind(answer='["harvest","fork"]')
+    r = Relay(tmp_path, colony="c", agent_id="grid-c", mind=mind, bus=FakeBus(), clock=clock,
+              state_fetch=lambda: state_of(1, 10), proposal_log=plog, model_alias="v3")
+    write_request(tmp_path, "p1")
+    assert await r.poll_once() == "proposed"
+    (tmp_path / "proposal.json").unlink()               # thegrid consumed it
+    write_request(tmp_path, "j1")
+    mind.answer = '["teleport"]'
+    assert await r.poll_once() == "rejected"
+    write_request(tmp_path, "d1")
+    mind.exc = MindError("gateway 500")
+    for _ in range(DEFER_LIMIT - 1):
+        assert await r.poll_once() == "deferred"
+        clock.t += 61.0
+    assert await r.poll_once() == "rejected"
+    entries = plog.read_all()
+    assert [e["outcome"] for e in entries] == ["proposed", "rejected", "rejected"]
+    assert entries[-1]["reason"] == f"deferred {DEFER_LIMIT} times"
+    assert {e["prompt_variant"] for e in entries} == {default.id}
+    assert {e["prompt_variant_sha256"] for e in entries} == {default.sha256}
+    assert mind.sampling[0] == (default.temperature, default.max_tokens)
+
+
+async def test_a_prompt_candidate_splits_traffic_and_every_entry_matches_assign(tmp_path):
+    # The candidate is the MINORITY arm at split 0.2. Mutation: build the pair in
+    # Relay.__init__ as two_arm(incumbent.id, candidate.id, split) -> two_arm's own probe
+    # raises; delete that probe as well and the candidate silently takes 80% here.
+    from grid.odin import assign
+    from grid.proposal_log import ProposalLog
+    incumbent, candidate = a_variant("v1-inc"), a_variant("v2-cand", template="OTHER {genome_json}")
+    plog = ProposalLog(tmp_path / "verdicts")
+    mind = FakeMind(answer='["harvest","fork"]')
+    r = Relay(tmp_path, colony="c", agent_id="grid-c", mind=mind, bus=FakeBus(), clock=Clock(),
+              state_fetch=lambda: state_of(1, 10), proposal_log=plog, model_alias="v3",
+              prompt_variant=incumbent, prompt_candidate=candidate, prompt_split=0.2)
+    ids = [f"q{i}" for i in range(40)]
+    for rid in ids:
+        write_request(tmp_path, rid)
+        assert await r.poll_once() == "proposed"
+        (tmp_path / "proposal.json").unlink()
+    expected = [assign(rid, dimension="prompt", arms=["v2-cand", "v1-inc"], weights=[0.2, 0.8])
+                for rid in ids]
+    entries = plog.read_all()
+    assert [e["prompt_variant"] for e in entries] == expected
+    assert set(expected) == {"v1-inc", "v2-cand"}            # both arms really got traffic
+    assert 0 < expected.count("v2-cand") < len(ids) // 2     # and the candidate is the minority
+    by_id = {"v1-inc": incumbent.sha256, "v2-cand": candidate.sha256}
+    assert [e["prompt_variant_sha256"] for e in entries] == [by_id[v] for v in expected]
+
+
+async def test_a_variant_that_wants_no_recall_never_calls_recall(tmp_path):
+    # Mutation: make poll_once recall unconditionally -> the recall=False leg calls it once
+    # and "fork-early won" shows up in a prompt whose template has no memory placeholder.
+    for recall in (True, False):
+        queue = tmp_path / f"q-{recall}"
+        write_request(queue, "r1")
+        mind = FakeMind(answer='["harvest","fork"]')
+        r = Relay(queue, colony="c", agent_id="grid-c", mind=mind, bus=FakeBus(), clock=Clock(),
+                  state_fetch=lambda: state_of(1, 10),
+                  prompt_variant=a_variant("v", recall=recall))
+        assert await r.poll_once() == "proposed"
+        assert len(mind.recalled) == (1 if recall else 0)
+        assert ("fork-early won" in mind.asked[0]) is recall
+
+
+async def test_the_variants_sampling_parameters_reach_the_gateway(tmp_path):
+    # End to end through the real Mind: relay -> ask -> _ask_direct -> request body.
+    # Mutation: restore the hardcoded 0.7/400 in _ask_direct -> 0.7 != 0.11.
+    from grid.mind import DirectLlm, Mind
+    seen = {}
+
+    def handler(request):
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": '["harvest","fork"]'}}]})
+
+    write_request(tmp_path, "s1")
+    # recall=False, so the real Mind never reaches for the bus (FakeBus has no request()).
+    mind = Mind("grid-c", FakeBus(), llm=DirectLlm("http://gw/v1", "kb"),
+                http=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    r = Relay(tmp_path, colony="c", agent_id="grid-c", mind=mind, bus=FakeBus(), clock=Clock(),
+              state_fetch=lambda: state_of(1, 10),
+              prompt_variant=a_variant("hot", temperature=0.11, max_tokens=123, recall=False))
+    assert await r.poll_once() == "proposed"
+    assert seen["temperature"] == 0.11 and seen["max_tokens"] == 123
+
+
+def test_config_from_env_prompt_variant_and_candidate(monkeypatch):
+    from grid.odin import RelayConfig
+    monkeypatch.setenv("COLONY_SLUG", "colony-one")
+    for k in ("MIND_PROMPT_VARIANT", "MIND_PROMPT_CANDIDATE"):
+        monkeypatch.delenv(k, raising=False)
+    c = RelayConfig.from_env()
+    assert c.prompt_variant == "" and c.prompt_candidate == ""
+    for k in ("MIND_PROMPT_VARIANT", "MIND_PROMPT_CANDIDATE"):
+        monkeypatch.setenv(k, "")          # the gate reverts by blanking, never by deleting
+    c = RelayConfig.from_env()
+    assert c.prompt_variant == "" and c.prompt_candidate == ""
+    monkeypatch.setenv("MIND_PROMPT_VARIANT", "v1-sandbox")
+    monkeypatch.setenv("MIND_PROMPT_CANDIDATE", "v2-terse")
+    c = RelayConfig.from_env()
+    assert c.prompt_variant == "v1-sandbox" and c.prompt_candidate == "v2-terse"
+
+
+def test_a_prompt_ab_against_itself_is_refused(tmp_path):
+    # Both arms would render the same template, so the run could never separate them --
+    # but every log row and ledger row would claim an A/B was running.
+    with pytest.raises(ValueError, match="both"):
+        Relay(tmp_path, colony="c", agent_id="grid-c", mind=FakeMind(), bus=FakeBus(),
+              prompt_variant=a_variant("same"), prompt_candidate=a_variant("same"))

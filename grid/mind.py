@@ -96,11 +96,19 @@ class Mind:
         return result.returncode == 0
 
     async def ask(self, text: str, *, recall_query: str | None = None,
-                  timeout_s: float | None = None) -> str:
+                  timeout_s: float | None = None, temperature: float | None = None,
+                  max_tokens: int | None = None) -> str:
+        """None for either sampling parameter means the shipped default (0.7 / 400),
+        so a caller that does not care is unaffected."""
         if timeout_s is None:
             timeout_s = self.ask_timeout_s
         if self.llm is not None:
-            return await self._ask_direct(text, timeout_s)
+            return await self._ask_direct(text, timeout_s, temperature=temperature,
+                                          max_tokens=max_tokens)
+        # kannaka's NATS ask contract has no field for sampling parameters -- the serve
+        # daemon owns them -- so a prompt variant's temperature and max_tokens apply on
+        # the direct route only. Inventing a payload key the daemon would ignore is worse
+        # than dropping them here: it would read as if they had been honoured.
         payload = {"from": CALLER_ID, "text": text, "recall_query": recall_query,
                    "no_tools": True, "mode": "full_recall"}
         reply = await self.bus.request(f"KANNAKA.ask.{self.agent_id}", payload, timeout_s=timeout_s)
@@ -111,14 +119,16 @@ class Mind:
             raise MindError(f"{self.agent_id}: empty answer")
         return answer
 
-    async def _ask_direct(self, text: str, timeout_s: float) -> str:
+    async def _ask_direct(self, text: str, timeout_s: float, *, temperature: float | None = None,
+                          max_tokens: int | None = None) -> str:
         import httpx
         llm = self.llm
         headers = {"Content-Type": "application/json"}
         if llm.api_key:
             headers["Authorization"] = f"Bearer {llm.api_key}"
         body = {"model": llm.model, "messages": [{"role": "user", "content": text}],
-                "temperature": 0.7, "max_tokens": 400}
+                "temperature": 0.7 if temperature is None else temperature,
+                "max_tokens": 400 if max_tokens is None else max_tokens}
         factory = self._http or (lambda: httpx.AsyncClient(timeout=httpx.Timeout(10, read=timeout_s)))
         try:
             async with factory() as client:

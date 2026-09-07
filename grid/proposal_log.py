@@ -20,7 +20,10 @@ REPLY_CAP = 2000        # a rejected reply is a training negative, not a transcr
 
 def proposal_entry(*, req: Request, proposal: list[str] | None, outcome: str, reason: str | None,
                    epoch: int, tick: int, colony: str, mind: str, model_alias: str,
-                   prompt: str, ts_ms: int, reply: str | None = None) -> dict:
+                   prompt: str, ts_ms: int, reply: str | None = None,
+                   prompt_variant: str = "", prompt_variant_sha256: str = "") -> dict:
+    """`prompt_variant*` default to "" so entries written before the prompt registry
+    existed still parse; the readers treat "" as "the incumbent, unrecorded"."""
     isa = req.isa
     return {
         "ts": ts_ms, "colony": colony, "epoch": epoch, "tick": tick,
@@ -34,6 +37,13 @@ def proposal_entry(*, req: Request, proposal: list[str] | None, outcome: str, re
         "reply": reply[:REPLY_CAP] if reply is not None else None,
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
         "prompt_path": f"prompts/{req.request_id}.txt",
+        # Which prompt variant was asked. NOTE the two hashes are different things and
+        # are named apart on purpose: `prompt_sha256` above hashes the RENDERED prompt of
+        # this one request and pairs with `prompt_path`, while this one hashes the
+        # variant's TEMPLATE, so every row from the same arm shares it. Overloading the
+        # first name would have destroyed the input-side integrity check the corpus uses.
+        "prompt_variant": prompt_variant,
+        "prompt_variant_sha256": prompt_variant_sha256,
     }
 
 
