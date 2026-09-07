@@ -74,9 +74,12 @@ class WeeklyConfig:
 
 
 def _env_get(path: Path, key: str) -> str | None:
+    """The value, with any inline ` # comment` and surrounding blanks stripped -- systemd's
+    EnvironmentFile does not honour trailing comments, so a revert that copied one back into
+    the value would write a line the relay then reads literally."""
     for line in path.read_text(encoding="utf-8").splitlines():
         if line.startswith(key + "="):
-            return line.split("=", 1)[1]
+            return line.split("=", 1)[1].split(" #", 1)[0].strip()
     return None
 
 
@@ -90,6 +93,13 @@ def _env_set(path: Path, key: str, value: str) -> None:
     if not done:
         lines.append(f"{key}={value}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _env_unset(path: Path, key: str) -> None:
+    """Drop the line entirely. C1: `MIND_AB_SPLIT=` (present but empty) is NOT the same as
+    absent -- os.environ.get returns "" for it, and the relay's float() of that is fatal."""
+    lines = [l for l in path.read_text(encoding="utf-8").splitlines() if not l.startswith(key + "=")]
+    path.write_text("".join(l + "\n" for l in lines), encoding="utf-8")
 
 
 def _run_dir(cfg: WeeklyConfig, run: str) -> str:
@@ -188,7 +198,7 @@ def ab_arms(verdicts_dir: Path, *, since_ts: int, incumbent: str, candidate: str
     """Per-arm colony outcome for proposals MADE since `since_ts` (the proposal's own ts,
     joined by request_id), so only asks that ran under the split count."""
     vdir = Path(verdicts_dir)
-    entries = {e["request_id"]: e for e in ProposalLog(vdir).read_all()}
+    entries = {e["request_id"]: e for e in ProposalLog(vdir).read_all() if e.get("request_id")}
     acc = {t: {"settled": 0, "reproduced": 0, "births": 0} for t in (incumbent, candidate)}
     for row in Ledger(vdir / "verdicts.jsonl").rows():
         e = entries.get(row.get("request_id"))
@@ -217,13 +227,29 @@ def ab_decide(arms: dict, *, incumbent: str, candidate: str, min_sample: int = M
     return "loss", f"colony A/B lost: {c['rate']:.3f} vs {i['rate']:.3f}"
 
 
+def short_arms(arms: dict, *, incumbent: str, candidate: str, min_sample: int = MIN_SAMPLE) -> list[str]:
+    """Which arms are under sample. I3: only a CANDIDATE-alone shortfall is the candidate's
+    fault and worth remembering; both arms short is a colony throughput fault (the relay was
+    down, verdicts did not settle) and must not blacklist a model that never got its turn."""
+    return [t for t in (candidate, incumbent) if arms[t]["settled"] < min_sample]
+
+
 def is_stuck(arms: dict, *, since_ts: int, now_ms: int, incumbent: str, candidate: str) -> bool:
-    return (now_ms - since_ts >= STUCK_AFTER_S * 1000 and arms[candidate]["settled"] == 0
-            and arms[incumbent]["settled"] >= STUCK_INCUMBENT_MIN)
+    """Two ways an A/B dies (spec §8 plus C3).
+
+    The candidate arm alone is dead while the incumbent keeps settling — the original rule.
+    Or NOTHING settles at all: thegrid keeps one request slot, so a candidate ask that can
+    never answer holds it and starves the incumbent too. The incumbent can then never reach
+    STUCK_INCUMBENT_MIN, and the original rule would wait for a Sunday that never comes.
+    """
+    if now_ms - since_ts < STUCK_AFTER_S * 1000 or arms[candidate]["settled"]:
+        return False
+    return arms[incumbent]["settled"] >= STUCK_INCUMBENT_MIN or arms[incumbent]["settled"] == 0
 
 
 def ab_state(versions: Versions) -> dict | None:
-    """The running A/B: the last ab_started row not yet closed by a released/held/rolled_back row."""
+    """The running A/B: the last ab_started row not yet closed by a
+    released/held/rolled_back/flip_incomplete row."""
     started, weeks = None, 0
     for r in versions.rows():
         if r["decision"] == "ab_started":
@@ -253,6 +279,13 @@ def lost_tags(versions: Versions) -> set[str]:
     relay-restart retry fails, and that must be remembered exactly the same, or a failed
     restart after a loss erases the colony's rejection and the gate re-tests the same
     rejected model the very next Sunday.
+
+    I3: an inconclusive-at-max row is remembered only when the CANDIDATE arm alone was under
+    sample (`evals.colony_ab.short_arms`). Both arms short means the colony produced too few
+    settled verdicts for anyone -- a throughput fault, not the candidate's -- and blacklisting
+    on it would bury a good model the relay never got to run. A row with no `short_arms` at
+    all (written before this field existed, or hand-edited) is treated as candidate-short, the
+    conservative reading that keeps the livelock guard intact.
     """
     lost_at: dict[str, float] = {}
     forgotten_at: dict[str, float] = {}
@@ -260,9 +293,14 @@ def lost_tags(versions: Versions) -> set[str]:
         tag = r.get("version")
         if not tag:
             continue
-        if str(r.get("reason", "")).startswith(("colony A/B lost", "colony A/B stuck", "colony A/B inconclusive")):
+        reason = str(r.get("reason", ""))
+        if reason.startswith(("colony A/B lost", "colony A/B stuck")):
             lost_at[tag] = r["ts"]
-        elif r["decision"] == "unchanged" and str(r.get("reason", "")).startswith("operator forgot"):
+        elif reason.startswith("colony A/B inconclusive"):
+            short = ((r.get("evals") or {}).get("colony_ab") or {}).get("short_arms")
+            if short is None or list(short) == [tag]:
+                lost_at[tag] = r["ts"]
+        elif r["decision"] == "unchanged" and reason.startswith("operator forgot"):
             forgotten_at[tag] = r["ts"]
     return {tag for tag, ts in lost_at.items() if ts > forgotten_at.get(tag, float("-inf"))}
 
@@ -342,10 +380,15 @@ def start_ab(cfg: WeeklyConfig, *, candidate: str, incumbent: str, local_run, dr
         # N2 (mirrors C1): a failed restart here means the relay never picked up the
         # candidate, so the env must not go on claiming an A/B the ledger doesn't track
         # (untracked traffic split; ab_state() sees nothing running; `ab --abort` would
-        # otherwise refuse to touch it). Absent-before reverts to the empty idiom, same
-        # as end_ab -- writing nothing back would leave the new value in place.
+        # otherwise refuse to touch it). The candidate line keeps the empty idiom (the relay
+        # reads empty as "no A/B"); MIND_AB_SPLIT has no such idiom -- C1: an empty split line
+        # is a ValueError in RelayConfig.from_env, so an absent-before split is REMOVED, not
+        # blanked. Writing nothing back at all would leave the new values in place.
         _env_set(cfg.grid_env, "MIND_LLM_CANDIDATE", before_cand if before_cand is not None else "")
-        _env_set(cfg.grid_env, "MIND_AB_SPLIT", before_split if before_split is not None else "")
+        if before_split is None:
+            _env_unset(cfg.grid_env, "MIND_AB_SPLIT")
+        else:
+            _env_set(cfg.grid_env, "MIND_AB_SPLIT", before_split)
     return block, outcome
 
 
@@ -376,14 +419,27 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
     if state is not None:
         # A colony A/B is running: this Sunday is the binding verdict, not a probe day
         # (spec §8) — no candidate discovery, no key check, no probes.
-        arms = ab_arms(cfg.verdicts_dir, since_ts=state["since_ts"], incumbent=state["incumbent"], candidate=state["candidate"])
-        verdict, reason = ab_decide(arms, incumbent=state["incumbent"], candidate=state["candidate"])
+        common = dict(week=week, base="", run="", grid_examples={}, verdict_window=_window(cfg.verdicts_dir), rogue_ledger_ts=0.0,
+                      adapter_sha256="", gguf_sha256="", set_manifest_sha256="", spend_usd=0.0)
         # I3: an ab_started row with no evals (e.g. hand-edited, or a future writer that
         # omits it) must not KeyError here.
         started_ab = (state["started_row"].get("evals") or {}).get("colony_ab") or {}
-        block = {**started_ab, "binding": True, "arms": arms, "weeks": state["weeks"] + 1, "winner": None}
-        common = dict(week=week, base="", run="", grid_examples={}, verdict_window=_window(cfg.verdicts_dir), rogue_ledger_ts=0.0,
-                      adapter_sha256="", gguf_sha256="", set_manifest_sha256="", spend_usd=0.0)
+        env_incumbent = _env_get(cfg.grid_env, "MIND_MODEL_ALIAS")
+        if env_incumbent != state["incumbent"]:
+            # I2: `set-mind-model.sh --relay-only` rewrote MIND_MODEL_ALIAS mid-A/B, so the
+            # incumbent's proposals have been logged under a label ab_arms does not count.
+            # Its rate is a fiction and the week would read `inconclusive` (or worse, a win
+            # against a phantom zero); refuse to decide. The A/B keeps running and this week
+            # spends one of its MAX_WEEKS like any other inconclusive one.
+            block = {**started_ab, "binding": True, "arms": {}, "weeks": state["weeks"] + 1, "winner": None}
+            row = release_row(decision="ab_inconclusive", version=state["candidate"], previous=released,
+                              evals={"colony_ab": block}, **common,
+                              reason=f"incumbent label changed mid-A/B ({env_incumbent} != {state['incumbent']}); evaluation skipped")
+            return _ledger(versions, row, dry_run=dry_run)
+        arms = ab_arms(cfg.verdicts_dir, since_ts=state["since_ts"], incumbent=state["incumbent"], candidate=state["candidate"])
+        verdict, reason = ab_decide(arms, incumbent=state["incumbent"], candidate=state["candidate"])
+        block = {**started_ab, "binding": True, "arms": arms, "weeks": state["weeks"] + 1, "winner": None,
+                 "short_arms": short_arms(arms, incumbent=state["incumbent"], candidate=state["candidate"])}
         if verdict == "inconclusive" and state["weeks"] + 1 >= MAX_WEEKS:
             outcome = end_ab(cfg, local_run=local_run, dry_run=dry_run)
             base_reason = f"colony A/B inconclusive after {MAX_WEEKS} weeks: {reason}"
@@ -402,7 +458,20 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
             if outcome == "ok":
                 decision, why = "released", reason
             elif outcome == "flip_failed":
-                decision, why = "held", "flip failed: tag copy"
+                # C2: flip() restored MIND_LLM_CANDIDATE on its way out, so env and the live
+                # relay would keep splitting while this row closes the A/B in the ledger --
+                # the nightly check would then see "no A/B", and next Sunday would start a
+                # fresh one, discarding the week that already won. End it for real.
+                end = end_ab(cfg, local_run=local_run, dry_run=dry_run)
+                base_reason = (f"colony A/B won but the tag copy failed: {state['candidate']}; "
+                               "A/B ended, current unchanged")
+                # NOT a lost/stuck/inconclusive reason: a win that could not be applied is no
+                # rejection by the colony, so lost_tags must not remember it -- next Sunday
+                # re-probes the same tag and tries the copy again.
+                if end == "ok":
+                    decision, why = "held", base_reason
+                else:
+                    decision, why = "flip_incomplete", f"{base_reason}; relay restart failed clearing the A/B"
             else:
                 decision, why = "flip_incomplete", "alias serves the candidate; relay restart failed twice"
             row = release_row(decision=decision, version=state["candidate"], previous=released,
@@ -493,6 +562,13 @@ def ab_check(cfg: WeeklyConfig, *, now_ms: int | None = None, local_run, dry_run
     state = ab_state(versions)
     if state is None:
         return None
+    env_incumbent = _env_get(cfg.grid_env, "MIND_MODEL_ALIAS")
+    if env_incumbent != state["incumbent"]:
+        # I2: with the incumbent relabelled mid-A/B its arm reads 0 settled, which would make
+        # every A/B look stuck the moment 48 h passed. Do nothing and be loud instead.
+        log.warning("colony A/B: incumbent label changed mid-A/B (%s != %s); stuck check skipped",
+                    env_incumbent, state["incumbent"])
+        return None
     now = now_ms if now_ms is not None else int(time.time() * 1000)
     arms = ab_arms(cfg.verdicts_dir, since_ts=state["since_ts"], incumbent=state["incumbent"], candidate=state["candidate"])
     if not is_stuck(arms, since_ts=state["since_ts"], now_ms=now, incumbent=state["incumbent"], candidate=state["candidate"]):
@@ -501,7 +577,9 @@ def ab_check(cfg: WeeklyConfig, *, now_ms: int | None = None, local_run, dry_run
     started_ab = (state["started_row"].get("evals") or {}).get("colony_ab") or {}   # I3
     block = {**started_ab, "binding": True, "arms": arms, "weeks": state["weeks"], "winner": None}
     last = versions.last_released()
-    base_reason = f"colony A/B stuck: candidate 0 settled in 48h (incumbent {arms[state['incumbent']]['settled']})"
+    incumbent_settled = arms[state["incumbent"]]["settled"]
+    base_reason = ("colony A/B stuck: no proposals from either arm in 48h" if incumbent_settled == 0
+                   else f"colony A/B stuck: candidate 0 settled in 48h (incumbent {incumbent_settled})")
     if outcome == "ok":
         decision, reason = "held", base_reason
     else:
@@ -559,6 +637,33 @@ def _local_run(cmd: list[str]) -> int:
     return subprocess.run(cmd, check=False).returncode
 
 
+ENV_AB_NOTE = ("env-only A/B: no ab_started row, so the window start is unknown; "
+               "arms cover all recorded history")
+
+
+def _env_ab_view(cfg: WeeklyConfig, candidate: str) -> dict:
+    """I4: spec §7's receipt hand-starts an A/B by editing grid.env, so it has no ledger row
+    at all. Report it anyway rather than printing `null` at an operator who can see the split
+    running -- with arms over ALL history, since there is no since_ts to window on."""
+    incumbent = _env_get(cfg.grid_env, "MIND_MODEL_ALIAS") or ""
+    return {"source": "env", "candidate": candidate, "incumbent": incumbent,
+            "split": _env_get(cfg.grid_env, "MIND_AB_SPLIT") or str(AB_SPLIT),
+            "arms": ab_arms(cfg.verdicts_dir, since_ts=0, incumbent=incumbent, candidate=candidate),
+            "note": ENV_AB_NOTE}
+
+
+def _ab_snapshot(cfg: WeeklyConfig, state: dict | None, candidate: str) -> dict:
+    """The `colony_ab` block an abort records: what the arms actually showed when the operator
+    pulled the plug. Without it the row says only that someone aborted, and the week's numbers
+    -- the only reason to abort -- are gone."""
+    if state is None:
+        return {**_env_ab_view(cfg, candidate), "binding": False, "winner": None}
+    started_ab = (state["started_row"].get("evals") or {}).get("colony_ab") or {}
+    arms = ab_arms(cfg.verdicts_dir, since_ts=state["since_ts"],
+                   incumbent=state["incumbent"], candidate=state["candidate"])
+    return {**started_ab, "binding": True, "arms": arms, "weeks": state["weeks"], "winner": None}
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser(prog="grid.weekly")
@@ -585,8 +690,8 @@ def main(argv: list[str] | None = None) -> int:
         if a.forget:
             row = ab_forget(cfg, a.forget, dry_run=a.dry_run)
             print(json.dumps(row, default=str)); return 0
+        state = ab_state(versions)      # one read, shared by --abort, --check and the display
         if a.abort:
-            state = ab_state(versions)
             env_candidate = _env_get(cfg.grid_env, "MIND_LLM_CANDIDATE")
             # N2: act when EITHER the ledger shows a running A/B OR the env still carries
             # a stray candidate with no ledger backing it (e.g. left behind by a start-path
@@ -594,6 +699,7 @@ def main(argv: list[str] | None = None) -> int:
             if state is None and not env_candidate:
                 print("no A/B running"); return 0
             candidate = state["candidate"] if state is not None else env_candidate
+            block = _ab_snapshot(cfg, state, candidate)
             outcome = end_ab(cfg, local_run=local_run, dry_run=a.dry_run)
             last = versions.last_released()
             if outcome == "ok":
@@ -602,20 +708,23 @@ def main(argv: list[str] | None = None) -> int:
                 decision, reason = "flip_incomplete", "colony A/B abort requested but the relay restart failed"
             row = release_row(week=_iso_week(), decision=decision, version=candidate, previous=last["version"] if last else None,
                               base="", run="", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={},
-                              verdict_window=_window(cfg.verdicts_dir), evals={}, spend_usd=0.0, rogue_ledger_ts=0.0,
-                              reason=reason)
+                              verdict_window=_window(cfg.verdicts_dir), evals={"colony_ab": block}, spend_usd=0.0,
+                              rogue_ledger_ts=0.0, reason=reason)
             row = _ledger(versions, row, dry_run=a.dry_run)
             print(json.dumps(row, default=str)); return 0
         if a.check:
-            state = ab_state(versions)
             if state is None:
                 print("no A/B running"); return 0
             row = ab_check(cfg, local_run=local_run, dry_run=a.dry_run)
             print("not stuck" if row is None else json.dumps(row, default=str))
-            return 0
-        state = ab_state(versions)
+            # I1: this runs as grid-verdicts' ExecStartPost, where a non-zero exit marks the
+            # nightly unit failed -- which is exactly right for `flip_incomplete`: the env now
+            # says "no A/B" while the live relay is still splitting, and only an operator
+            # restarting grid-odin closes that gap. Every other outcome is routine, hence 0.
+            return 3 if row is not None and row["decision"] == "flip_incomplete" else 0
         if state is None:
-            print(json.dumps({"ab": None}, default=str))
+            env_candidate = _env_get(cfg.grid_env, "MIND_LLM_CANDIDATE")
+            print(json.dumps({"ab": _env_ab_view(cfg, env_candidate) if env_candidate else None}, default=str))
         else:
             arms = ab_arms(cfg.verdicts_dir, since_ts=state["since_ts"], incumbent=state["incumbent"], candidate=state["candidate"])
             print(json.dumps({"ab": state, "arms": arms}, default=str))

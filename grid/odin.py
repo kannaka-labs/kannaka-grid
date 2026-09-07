@@ -27,6 +27,11 @@ from .proposal_log import ProposalLog, proposal_entry
 log = logging.getLogger("grid.odin")
 
 UNPARSEABLE_LIMIT = 3       # consecutive failed parses before the file is binned
+# thegrid keeps ONE request slot, so a request that can never be answered (a candidate
+# arm whose tag the gateway rejects, say) starves the other arm too: nothing else is
+# ever filed. Bin it after this many consecutive defers so thegrid can file a fresh
+# request, which may hash to the other arm.
+DEFER_LIMIT = 4
 AB_SPLIT = 0.2
 
 
@@ -65,6 +70,7 @@ class Relay:
         self.split = split
         self.stale_count = 0
         self._retry_not_before: dict[str, float] = {}
+        self._defers: dict[str, int] = {}
         self._unparseable: dict[str, int] = {}
 
     async def _publish(self, kind: str, epoch: int, tick: int, **fields) -> None:
@@ -142,9 +148,25 @@ class Relay:
         except BusClosed:
             raise
         except (BusTimeout, BusError, MindError) as e:
-            log.warning("mind unavailable for %s: %s; retry in %.0fs", req.request_id, e, self.retry_after_s)
-            self._retry_not_before[req.request_id] = self._clock() + self.retry_after_s
-            return "deferred"
+            seen = self._defers[req.request_id] = self._defers.get(req.request_id, 0) + 1
+            log.warning("mind unavailable for %s (%d/%d): %s; retry in %.0fs",
+                        req.request_id, seen, DEFER_LIMIT, e, self.retry_after_s)
+            if seen < DEFER_LIMIT:
+                self._retry_not_before[req.request_id] = self._clock() + self.retry_after_s
+                return "deferred"
+            # Spec §8: one wedged arm must not hold thegrid's only request slot forever,
+            # or the incumbent gets no turns either and the stuck check never trips.
+            # The row is attributed to the arm that could not answer -- an EXCLUDED_TIERS
+            # verdict, so it counts as neither a win nor a loss for that arm.
+            request_path.unlink(missing_ok=True)
+            del self._defers[req.request_id]
+            self._retry_not_before.pop(req.request_id, None)
+            epoch, tick = await self._epoch_tick()
+            reason = f"deferred {DEFER_LIMIT} times"
+            self._log(req, prompt, None, "rejected", reason, epoch, tick, model_alias=alias)
+            await self._publish("rejected", epoch, tick, request_id=req.request_id, reason=reason)
+            return "rejected"
+        self._defers.pop(req.request_id, None)      # consecutive, so a good ask resets
 
         result = validate(reply, req)
         epoch, tick = await self._epoch_tick()
@@ -212,14 +234,18 @@ class RelayConfig:
             nats_password=env("NATS_PASSWORD") or None,
             mind_data_dir=env("MIND_DATA_DIR") or None,
             kannaka_bin=env("KANNAKA_BIN", "kannaka"),
-            poll_s=float(env("ODIN_POLL_S", "1")),
+            # `env(X) or default`, never `env(X, default)`: the gate writes and reverts these
+            # lines, and a present-but-empty `MIND_AB_SPLIT=` line makes os.environ.get return
+            # "" (not the default), which float() rejects -- the relay would then crash-loop
+            # straight into its StartLimit and stay dead.
+            poll_s=float(env("ODIN_POLL_S") or 1),
             verdicts_dir=env("VERDICTS_DIR", f"/srv/grid/{colony}/verdicts"),
             model_alias=env("MIND_MODEL_ALIAS", "agent-brain"),
-            ask_timeout_s=float(env("MIND_ASK_TIMEOUT_S", str(ASK_TIMEOUT_S))),
-            retry_after_s=float(env("ODIN_RETRY_S", "60")),
+            ask_timeout_s=float(env("MIND_ASK_TIMEOUT_S") or ASK_TIMEOUT_S),
+            retry_after_s=float(env("ODIN_RETRY_S") or 60),
             llm=DirectLlm.from_env(env),
             candidate_tag=env("MIND_LLM_CANDIDATE", "") or "",
-            ab_split=float(env("MIND_AB_SPLIT", str(AB_SPLIT))),
+            ab_split=float(env("MIND_AB_SPLIT") or AB_SPLIT),
             candidate_llm=_candidate_llm(env),
         )
 

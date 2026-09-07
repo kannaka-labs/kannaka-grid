@@ -267,6 +267,11 @@ def test_ab_arms_windows_on_proposal_ts_and_excludes_unattributable_tiers(tmp_pa
     assert arms["kannaka-brain-v4"]["settled"] == 110 and arms["kannaka-brain-v4"]["reproduced"] == 25   # not 110+5+1
     arms2 = ab_arms(v, since_ts=1_000_000, incumbent="kannaka-brain-v3", candidate="kannaka-brain-v9")
     assert arms2["kannaka-brain-v9"] == {"settled": 0, "reproduced": 0, "rate": 0.0, "births_per_proposal": 0.0}
+    # Minor: a proposal-log line with no request_id (a future writer, a hand-edit) must be
+    # skipped, not KeyError the whole gate. Mutation: `e["request_id"]` -> KeyError here.
+    with open(v / "proposals.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": 1_000_500, "outcome": "proposed", "model_alias": "kannaka-brain-v4"}) + "\n")
+    assert ab_arms(v, since_ts=1_000_000, incumbent="kannaka-brain-v3", candidate="kannaka-brain-v4") == arms
 
 
 def test_ab_decide_boundaries():
@@ -274,6 +279,12 @@ def test_ab_decide_boundaries():
     inc, cand = "v3", "v4"
     arms = lambda ri, si, rc, sc: {inc: {"settled": si, "reproduced": int(ri*si), "rate": ri, "births_per_proposal": 0}, cand: {"settled": sc, "reproduced": int(rc*sc), "rate": rc, "births_per_proposal": 0}}
     assert ab_decide(arms(0.25, 120, 0.225, 110), incumbent=inc, candidate=cand)[0] == "win"     # exactly rate_i*(1-0.10)
+    assert (0.25 * (1 - TOLERANCE)).hex() == (0.225).hex()   # ...and exactly, in binary too: no epsilon needed
+    # The epsilon IS needed for rates that come out of real counts. 42/108 x 0.9 lands one ulp
+    # ABOVE 35/100, so a candidate that is exactly on the tolerance line loses without it.
+    # Mutation: drop the `- 1e-12` in ab_decide -> this "win" becomes "loss".
+    assert (42 / 108 * (1 - TOLERANCE)).hex() != (35 / 100).hex() and 35 / 100 < 42 / 108 * (1 - TOLERANCE)
+    assert ab_decide(arms(42 / 108, 108, 35 / 100, 100), incumbent=inc, candidate=cand)[0] == "win"
     assert ab_decide(arms(0.25, 120, 0.224, 110), incumbent=inc, candidate=cand)[0] == "loss"
     assert ab_decide(arms(0.25, 120, 0.9, 99), incumbent=inc, candidate=cand)[0] == "inconclusive"  # 99 < MIN_SAMPLE
     assert ab_decide(arms(0.25, 99, 0.9, 200), incumbent=inc, candidate=cand)[0] == "inconclusive"
@@ -311,6 +322,12 @@ def test_is_stuck_rule():
     assert is_stuck(arms(60, 0), since_ts=t0, now_ms=t0 + 40*3600*1000, incumbent="v3", candidate="v4") is False   # too early
     assert is_stuck(arms(40, 0), since_ts=t0, now_ms=t0 + 49*3600*1000, incumbent="v3", candidate="v4") is False   # incumbent too thin to judge
     assert is_stuck(arms(60, 1), since_ts=t0, now_ms=t0 + 49*3600*1000, incumbent="v3", candidate="v4") is False   # candidate alive
+    # C3: a wedged relay (a candidate ask holding thegrid's only request slot) starves the
+    # incumbent too, so it can never reach STUCK_INCUMBENT_MIN -- both arms at zero after 48 h
+    # IS stuck. Mutation: drop the `or arms[incumbent]["settled"] == 0` -> this is False and
+    # nothing ever recovers the A/B.
+    assert is_stuck(arms(0, 0), since_ts=t0, now_ms=t0 + 49*3600*1000, incumbent="v3", candidate="v4") is True
+    assert is_stuck(arms(0, 0), since_ts=t0, now_ms=t0 + 40*3600*1000, incumbent="v3", candidate="v4") is False   # too early
 
 
 async def test_release_starts_an_ab_instead_of_flipping(tmp_path):
@@ -329,7 +346,8 @@ async def test_release_starts_an_ab_instead_of_flipping(tmp_path):
     assert ab["candidate"] == "kannaka-brain-v4" and ab["incumbent"] == "kannaka-brain-v3" and ab["since_ts"] > 0
 
 
-async def _run_ab_week(tmp_path, *, inc_rep, cand_rep, n_cand=110, local_run=None):
+async def _run_ab_week(tmp_path, *, inc_rep, cand_rep, n_cand=110, local_run=None,
+                       alias="kannaka-brain-v3", remote_fail=frozenset()):
     cfg = _cfg(tmp_path); v = tmp_path / "v"
     from grid.versions import Versions, release_row
     since = 1_000_000_000
@@ -338,9 +356,10 @@ async def _run_ab_week(tmp_path, *, inc_rep, cand_rep, n_cand=110, local_run=Non
     vs.append(release_row(week="W0", decision="released", version="kannaka-brain-v3", previous=None, evals={}, reason="", **kw))
     vs.append(release_row(week="W1", decision="ab_started", version="kannaka-brain-v4", previous="kannaka-brain-v3", evals={"colony_ab": {"candidate": "kannaka-brain-v4", "incumbent": "kannaka-brain-v3", "split": 0.2, "since_ts": since}}, reason="", **kw))
     _seed_ab(v, since_ts=since, inc_rep=inc_rep, cand_rep=cand_rep, n_cand=n_cand)
-    (tmp_path / "grid.env").write_text("MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_MODEL=kannaka-brain-current\nMIND_LLM_CANDIDATE=kannaka-brain-v4\nMIND_AB_SPLIT=0.2\n")
+    (tmp_path / "grid.env").write_text(f"MIND_MODEL_ALIAS={alias}\nMIND_LLM_MODEL=kannaka-brain-current\nMIND_LLM_CANDIDATE=kannaka-brain-v4\nMIND_AB_SPLIT=0.2\n")
     r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
-                    "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
+                    "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST},
+                   fail=remote_fail)
     restarts = []
     if local_run is None:
         local_run = lambda c: restarts.append(c) or 0
@@ -376,6 +395,9 @@ async def test_ab_inconclusive_continues_then_holds_at_max_weeks(tmp_path):
     row2 = await release(cfg, r2, ask_factory=lambda m: never, local_run=lambda c: 0, week="W3")
     assert row2["decision"] == "held" and "inconclusive after 2 weeks" in row2["reason"]
     assert "MIND_LLM_CANDIDATE=kannaka-brain-v4" not in (tmp_path / "grid.env").read_text()
+    # I3: the row must name WHICH arm was short, so lost_tags can tell a candidate that could
+    # not pull its weight from a week where the colony settled nothing for anyone.
+    assert row2["evals"]["colony_ab"]["short_arms"] == ["kannaka-brain-v4"]
 
 
 async def test_lost_tag_is_not_retested_until_forgotten(tmp_path):
@@ -451,7 +473,13 @@ async def test_release_start_ab_records_flip_incomplete_when_relay_restart_fails
     assert "relay restart failed" in row["reason"]
     env = (tmp_path / "grid.env").read_text()
     assert "MIND_LLM_CANDIDATE=kannaka-brain-v4" not in env   # N2: reverted, not left stray
-    assert env == grid_env_before + "MIND_LLM_CANDIDATE=\nMIND_AB_SPLIT=\n"   # both keys land empty (no prior value)
+    # C1: the candidate keeps the empty idiom (the relay reads empty as "no A/B"), but an
+    # absent-before MIND_AB_SPLIT must be REMOVED, not blanked: os.environ.get returns "" for
+    # a present-but-empty line and float("") kills the relay at boot. Mutation: revert the
+    # revert to `_env_set(..., before_split if before_split is not None else "")` -> the file
+    # ends with a `MIND_AB_SPLIT=` line and this assertion fails.
+    assert env == grid_env_before + "MIND_LLM_CANDIDATE=\n"
+    assert "MIND_AB_SPLIT=" not in env
     from grid.versions import Versions
     assert ab_state(Versions(cfg.releases_dir / "versions.jsonl")) is None   # not left "running"
 
@@ -614,3 +642,211 @@ def test_ab_abort_clears_a_stray_env_only_candidate(tmp_path, monkeypatch, capsy
     assert len(rows) == 1
     assert rows[0]["decision"] == "held" and rows[0]["version"] == "kannaka-brain-v4"
     assert rows[0]["reason"] == "colony A/B aborted by operator"
+
+
+# ---- Fix round 3: the final whole-branch review ----
+
+async def test_ab_win_whose_tag_copy_fails_ends_the_ab_and_is_not_remembered(tmp_path):
+    # C2: flip() restores MIND_LLM_CANDIDATE on a failed tag copy, so without end_ab the env
+    # and the live relay keep splitting while this row closes the A/B in the ledger. The
+    # nightly check would then see "no A/B" and the next Sunday would start a fresh one,
+    # discarding the week that already won. Mutation: revert the win branch's flip_failed case
+    # to `decision, why = "held", "flip failed: tag copy"` -> the candidate line survives in
+    # grid.env and no relay restart is recorded.
+    row, r, env, restarts = await _run_ab_week(tmp_path, inc_rep=30, cand_rep=28, remote_fail={"ollama cp"})
+    assert row["decision"] == "held"
+    assert row["reason"] == ("colony A/B won but the tag copy failed: kannaka-brain-v4; "
+                             "A/B ended, current unchanged")
+    assert "MIND_LLM_CANDIDATE=kannaka-brain-v4" not in env      # the split really stopped
+    assert "MIND_MODEL_ALIAS=kannaka-brain-v3" in env            # current untouched
+    assert restarts == [["sudo", "-n", "systemctl", "restart", "grid-odin.service"]]   # exactly end_ab's
+    from grid.versions import Versions
+    vs = Versions(tmp_path / "releases" / "versions.jsonl")
+    assert ab_state(vs) is None
+    # A win that could not be applied is not a rejection: next Sunday must retry the copy.
+    assert "kannaka-brain-v4" not in lost_tags(vs)
+
+
+async def test_ab_win_whose_tag_copy_and_restart_both_fail_is_flip_incomplete(tmp_path):
+    row, r, env, restarts = await _run_ab_week(tmp_path, inc_rep=30, cand_rep=28,
+                                               remote_fail={"ollama cp"}, local_run=lambda c: 1)
+    assert row["decision"] == "flip_incomplete"
+    assert row["reason"].startswith("colony A/B won but the tag copy failed")
+    assert "relay restart failed" in row["reason"]
+
+
+async def test_ab_week_refuses_to_judge_a_relabelled_incumbent(tmp_path):
+    # I2: `set-mind-model.sh --relay-only` rewrites MIND_MODEL_ALIAS. Mid-A/B that stops the
+    # incumbent arm accumulating under the label ab_arms counts, so its rate reads 0 and even
+    # a losing candidate clears the tolerance floor. Mutation: drop the env_incumbent guard in
+    # release()'s A/B branch -> this returns "released" on a candidate that actually lost.
+    row, r, env, restarts = await _run_ab_week(tmp_path, inc_rep=30, cand_rep=10,
+                                               alias="kannaka-brain-experimental")
+    assert row["decision"] == "ab_inconclusive"
+    assert row["reason"] == ("incumbent label changed mid-A/B (kannaka-brain-experimental != "
+                             "kannaka-brain-v3); evaluation skipped")
+    assert not any(c.startswith("ollama cp") for c in r.commands)   # nothing released
+    assert "MIND_LLM_CANDIDATE=kannaka-brain-v4" in env and not restarts   # the A/B keeps running
+    from grid.versions import Versions
+    vs = Versions(tmp_path / "releases" / "versions.jsonl")
+    assert ab_state(vs)["weeks"] == 1        # the skipped week still counts toward MAX_WEEKS
+
+
+def test_ab_check_skips_a_relabelled_incumbent(tmp_path, caplog):
+    # I2: with the incumbent relabelled, its arm reads 0 settled and EVERY A/B looks stuck
+    # 48 h in. Mutation: drop ab_check's env_incumbent guard -> this returns a `held` row and
+    # clears a perfectly healthy A/B.
+    import logging
+    from grid.weekly import ab_check
+    from grid.versions import Versions, release_row
+    cfg = _cfg(tmp_path); v = tmp_path / "v"; since = 1_000_000_000
+    vs = Versions(cfg.releases_dir / "versions.jsonl")
+    kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0)
+    vs.append(release_row(week="W1", decision="ab_started", version="kannaka-brain-v4", previous="kannaka-brain-v3",
+                          evals={"colony_ab": {"candidate": "kannaka-brain-v4", "incumbent": "kannaka-brain-v3", "split": 0.2, "since_ts": since}}, reason="", **kw))
+    _seed_ab(v, since_ts=since, n_inc=60, n_cand=0, inc_rep=10, cand_rep=0, before=0)
+    (tmp_path / "grid.env").write_text("MIND_MODEL_ALIAS=kannaka-brain-experimental\nMIND_LLM_CANDIDATE=kannaka-brain-v4\nMIND_AB_SPLIT=0.2\n")
+    restarts = []
+    with caplog.at_level(logging.WARNING, logger="grid.weekly"):
+        assert ab_check(cfg, now_ms=since + 49*3600*1000, local_run=lambda c: restarts.append(c) or 0) is None
+    assert "incumbent label changed mid-A/B" in caplog.text
+    assert not restarts and ab_state(vs) is not None                 # the A/B is left alone
+    assert "MIND_LLM_CANDIDATE=kannaka-brain-v4" in (tmp_path / "grid.env").read_text()
+
+
+def test_ab_check_aborts_a_wedged_relay_with_both_arms_at_zero(tmp_path):
+    # C3: a candidate ask holding thegrid's only request slot starves the incumbent too, so
+    # the incumbent >= 50 rule can never fire. Mutation: revert is_stuck to the incumbent-only
+    # rule -> ab_check returns None and the dead A/B is never recovered.
+    from grid.weekly import ab_check
+    from grid.versions import Versions, release_row
+    cfg = _cfg(tmp_path); v = tmp_path / "v"; since = 1_000_000_000
+    vs = Versions(cfg.releases_dir / "versions.jsonl")
+    kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0)
+    vs.append(release_row(week="W1", decision="ab_started", version="kannaka-brain-v4", previous="kannaka-brain-v3",
+                          evals={"colony_ab": {"candidate": "kannaka-brain-v4", "incumbent": "kannaka-brain-v3", "split": 0.2, "since_ts": since}}, reason="", **kw))
+    _seed_ab(v, since_ts=since, n_inc=0, n_cand=0, inc_rep=0, cand_rep=0, before=0)
+    (tmp_path / "grid.env").write_text("MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_CANDIDATE=kannaka-brain-v4\nMIND_AB_SPLIT=0.2\n")
+    restarts = []
+    assert ab_check(cfg, now_ms=since + 40*3600*1000, local_run=lambda c: restarts.append(c) or 0) is None   # too early
+    row = ab_check(cfg, now_ms=since + 49*3600*1000, local_run=lambda c: restarts.append(c) or 0)
+    assert row["decision"] == "held"
+    assert row["reason"] == "colony A/B stuck: no proposals from either arm in 48h"
+    assert restarts and ab_state(vs) is None
+    assert "MIND_LLM_CANDIDATE=kannaka-brain-v4" not in (tmp_path / "grid.env").read_text()
+
+
+def test_lost_tags_remembers_only_a_candidate_alone_shortfall(tmp_path):
+    # I3: both arms short is a colony throughput fault (the relay was down, nothing settled),
+    # not the candidate's -- blacklisting on it buries a model that never got its turn.
+    # Mutation: match the bare "colony A/B inconclusive" prefix again -> v5 is blocked too.
+    from grid.versions import Versions, release_row
+    v = Versions(tmp_path / "versions.jsonl")
+    kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0)
+    v.append(release_row(week="W1", decision="held", version="v4", previous="v3",
+                         evals={"colony_ab": {"short_arms": ["v4"]}},
+                         reason="colony A/B inconclusive after 2 weeks: sample 40/120 below 100 per arm", **kw))
+    assert lost_tags(v) == {"v4"}
+    v.append(release_row(week="W2", decision="held", version="v5", previous="v3",
+                         evals={"colony_ab": {"short_arms": ["v5", "v3"]}},
+                         reason="colony A/B inconclusive after 2 weeks: sample 40/40 below 100 per arm", **kw))
+    assert lost_tags(v) == {"v4"}
+    # A row written before short_arms existed reads as candidate-short: the conservative
+    # default that keeps the livelock guard (test_ab_state_and_lost_tags) intact.
+    v.append(release_row(week="W3", decision="held", version="v6", previous="v3", evals={},
+                         reason="colony A/B inconclusive after 2 weeks: sample 40/120 below 100 per arm", **kw))
+    assert lost_tags(v) == {"v4", "v6"}
+
+
+def test_env_get_strips_an_inline_comment(tmp_path):
+    # Minor: without this a revert copies " # ..." back into the value, and systemd's
+    # EnvironmentFile has no trailing-comment syntax -- the relay would read it literally.
+    from grid.weekly import _env_get
+    p = tmp_path / "grid.env"
+    p.write_text("MIND_MODEL_ALIAS=kannaka-brain-v3 # the incumbent's concrete label\nMIND_AB_SPLIT=0.2\n")
+    assert _env_get(p, "MIND_MODEL_ALIAS") == "kannaka-brain-v3"
+    assert _env_get(p, "MIND_AB_SPLIT") == "0.2"
+
+
+def _ab_cli_env(tmp_path, monkeypatch, grid_env_text):
+    grid_env = tmp_path / "grid.env"
+    grid_env.write_text(grid_env_text)
+    monkeypatch.setenv("RELEASES_DIR", str(tmp_path / "releases"))
+    monkeypatch.setenv("VERDICTS_DIR", str(tmp_path / "v"))
+    monkeypatch.setenv("GRID_ENV", str(grid_env))
+    monkeypatch.setenv("DEBAIN2_HOST", "debain2")
+    return grid_env
+
+
+def _seed_started_ab(tmp_path, since):
+    from grid.versions import Versions, release_row
+    vs = Versions(tmp_path / "releases" / "versions.jsonl")
+    kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0)
+    vs.append(release_row(week="W1", decision="ab_started", version="kannaka-brain-v4", previous="kannaka-brain-v3",
+                          evals={"colony_ab": {"candidate": "kannaka-brain-v4", "incumbent": "kannaka-brain-v3",
+                                               "split": 0.2, "since_ts": since}}, reason="", **kw))
+    return vs
+
+
+def test_ab_check_cli_exits_three_when_the_relay_restart_failed(tmp_path, monkeypatch, capsys):
+    # I1: `ab --check` is grid-verdicts' ExecStartPost, where a non-zero exit marks the
+    # nightly unit failed. flip_incomplete means grid.env says "no A/B" while the live relay
+    # is still splitting -- only an operator restarting grid-odin closes that. Mutation:
+    # `return 0` from the --check branch -> the wedge is announced to nobody.
+    import grid.weekly as weekly_mod
+    since = 1_000_000_000
+    _ab_cli_env(tmp_path, monkeypatch,
+                "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_CANDIDATE=kannaka-brain-v4\nMIND_AB_SPLIT=0.2\n")
+    _seed_started_ab(tmp_path, since)
+    _seed_ab(tmp_path / "v", since_ts=since, n_inc=60, n_cand=0, inc_rep=10, cand_rep=0, before=0)
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 1)          # the restart fails
+    monkeypatch.setattr(weekly_mod.time, "time", lambda: since / 1000 + 49 * 3600)
+    assert weekly_mod.main(["ab", "--check"]) == 3
+    assert json.loads(capsys.readouterr().out)["decision"] == "flip_incomplete"
+
+
+def test_ab_cli_shows_an_env_only_ab(tmp_path, monkeypatch, capsys):
+    # I4: spec §7's receipt hand-starts an A/B by editing grid.env, so there is no ledger row
+    # and `ab` printed `null` at an operator watching the split run. Mutation: restore the
+    # bare `{"ab": None}` -> "source" is missing here.
+    from grid.weekly import main
+    grid_env = _ab_cli_env(tmp_path, monkeypatch,
+                           "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_CANDIDATE=kannaka-brain\nMIND_AB_SPLIT=0.3\n")
+    _seed_ab(tmp_path / "v", since_ts=1_000, inc="kannaka-brain-v3", cand="kannaka-brain",
+             n_inc=4, n_cand=3, inc_rep=1, cand_rep=1, before=0)
+    assert main(["ab"]) == 0
+    ab = json.loads(capsys.readouterr().out)["ab"]
+    assert ab["source"] == "env" and ab["candidate"] == "kannaka-brain"
+    assert ab["incumbent"] == "kannaka-brain-v3" and ab["split"] == "0.3" and ab["note"]
+    assert ab["arms"]["kannaka-brain"]["settled"] == 3 and ab["arms"]["kannaka-brain-v3"]["settled"] == 4
+    grid_env.write_text("MIND_MODEL_ALIAS=kannaka-brain-v3\n")            # no candidate at all
+    assert main(["ab"]) == 0 and json.loads(capsys.readouterr().out) == {"ab": None}
+
+
+def test_ab_abort_records_the_arms_it_threw_away(tmp_path, monkeypatch, capsys):
+    # Minor: without the snapshot the abort row says only that someone aborted -- the week's
+    # numbers, the only reason to abort, are gone. Mutation: `evals={}` -> KeyError here.
+    import grid.weekly as weekly_mod
+    since = 1_000_000_000
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)
+    _ab_cli_env(tmp_path, monkeypatch,
+                "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_CANDIDATE=kannaka-brain-v4\nMIND_AB_SPLIT=0.2\n")
+    _seed_started_ab(tmp_path, since)
+    _seed_ab(tmp_path / "v", since_ts=since, n_inc=60, n_cand=20, inc_rep=10, cand_rep=4, before=0)
+    assert weekly_mod.main(["ab", "--abort"]) == 0
+    block = json.loads(capsys.readouterr().out)["evals"]["colony_ab"]
+    assert block["binding"] is True and block["candidate"] == "kannaka-brain-v4"
+    assert block["arms"]["kannaka-brain-v4"]["settled"] == 20 and block["arms"]["kannaka-brain-v3"]["settled"] == 60
+
+
+def test_ab_abort_of_a_stray_env_candidate_records_the_env_view(tmp_path, monkeypatch, capsys):
+    import grid.weekly as weekly_mod
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)
+    _ab_cli_env(tmp_path, monkeypatch,
+                "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_CANDIDATE=kannaka-brain\nMIND_AB_SPLIT=0.2\n")
+    _seed_ab(tmp_path / "v", since_ts=1_000, inc="kannaka-brain-v3", cand="kannaka-brain",
+             n_inc=4, n_cand=3, inc_rep=1, cand_rep=1, before=0)
+    assert weekly_mod.main(["ab", "--abort"]) == 0
+    block = json.loads(capsys.readouterr().out)["evals"]["colony_ab"]
+    assert block["source"] == "env" and block["binding"] is False and block["note"]
+    assert block["arms"]["kannaka-brain"]["settled"] == 3
