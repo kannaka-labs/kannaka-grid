@@ -177,6 +177,8 @@ or inconclusive after two weeks). Nightly, after verdicts settle, the gate's pre
 logic as the release gate itself); other manual A/B sub-commands are `grid.weekly ab --abort` (discard
 an in-flight test) and `grid.weekly ab --forget <tag>` (clear the decision row for a tag to replay it).
 
+A release therefore takes two Sundays at minimum: the gate starts the A/B on the Sunday the promotion first passes its probes, and renders the colony's verdict on the following Sunday (continuing up to two weeks if the sample is short); the nightly `ab --check` only aborts a stuck A/B within that window.
+
 To run a hand-started A/B test: set `MIND_LLM_CANDIDATE=<model-tag>` and `MIND_AB_SPLIT=0.2` in
 `/srv/grid/grid.env` (the default split is 0.2 = 20% candidate, 80% incumbent), then restart
 `grid-odin.service` to begin routing requests. Monitor the relay's proposal log with `journalctl -u grid-odin`

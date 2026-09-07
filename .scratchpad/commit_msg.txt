@@ -1,4 +1,0 @@
-deploy(skywave): nightly colony A/B stuck check; env and README for the A/B
-
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_016KGv3Yy4fbSTq9pWr1nQSN
