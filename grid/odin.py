@@ -7,6 +7,7 @@ and one fewer dependency is something.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import sys
@@ -26,6 +27,18 @@ from .proposal_log import ProposalLog, proposal_entry
 log = logging.getLogger("grid.odin")
 
 UNPARSEABLE_LIMIT = 3       # consecutive failed parses before the file is binned
+AB_SPLIT = 0.2
+
+
+def arm_for(request_id: str, split: float) -> str:
+    """Deterministic per request: a deferred and retried request lands on the same arm,
+    and the assignment is reproducible from the log alone (no RNG state)."""
+    if split <= 0:
+        return "incumbent"
+    if split >= 1:
+        return "candidate"
+    h = int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) / 2**32
+    return "candidate" if h < split else "incumbent"
 
 
 class Relay:
@@ -33,7 +46,8 @@ class Relay:
                  timeout_s: float = ASK_TIMEOUT_S, retry_after_s: float = 60.0,
                  clock=time.monotonic, throttle: Throttle | None = None,
                  state_fetch: Callable[[], Awaitable[dict]] | None = None,
-                 proposal_log: ProposalLog | None = None, model_alias: str = ""):
+                 proposal_log: ProposalLog | None = None, model_alias: str = "",
+                 candidate_mind=None, candidate_alias: str = "", split: float = AB_SPLIT):
         self.queue = Path(queue)
         self.colony = colony
         self.agent_id = agent_id
@@ -46,6 +60,9 @@ class Relay:
         self.throttle = throttle or Throttle(REMEMBER_MIN_INTERVAL_S, clock=clock)
         self.proposal_log = proposal_log
         self.model_alias = model_alias
+        self.candidate_mind = candidate_mind
+        self.candidate_alias = candidate_alias
+        self.split = split
         self.stale_count = 0
         self._retry_not_before: dict[str, float] = {}
         self._unparseable: dict[str, int] = {}
@@ -61,13 +78,13 @@ class Relay:
             log.error("odin.%s publish failed: %s", kind, e)
 
     def _log(self, req, prompt: str, proposal: list[str] | None, outcome: str, reason: str | None,
-             epoch: int, tick: int, reply: str | None = None) -> None:
+             epoch: int, tick: int, reply: str | None = None, model_alias: str | None = None) -> None:
         if self.proposal_log is None:
             return
         entry = proposal_entry(req=req, proposal=proposal, outcome=outcome, reason=reason,
                                epoch=epoch, tick=tick, colony=self.colony, mind=self.agent_id,
-                               model_alias=self.model_alias, prompt=prompt, ts_ms=now_ms(),
-                               reply=reply)
+                               model_alias=model_alias if model_alias is not None else self.model_alias,
+                               prompt=prompt, ts_ms=now_ms(), reply=reply)
         self.proposal_log.record(entry, prompt)
 
     async def _epoch_tick(self) -> tuple[int, int]:
@@ -114,10 +131,14 @@ class Relay:
         if self._clock() < self._retry_not_before.get(req.request_id, 0.0):
             return None
 
+        arm = "candidate" if self.candidate_mind is not None and arm_for(req.request_id, self.split) == "candidate" else "incumbent"
+        mind = self.candidate_mind if arm == "candidate" else self.mind
+        alias = self.candidate_alias if arm == "candidate" else self.model_alias
+
         recall = await self.mind.recall(f"colony {self.colony} genome lineage {' '.join(req.genome[:6])}")
         prompt = render_prompt(req, recall)
         try:
-            reply = await self.mind.ask(prompt, recall_query=f"colony {self.colony}", timeout_s=self.timeout_s)
+            reply = await mind.ask(prompt, recall_query=f"colony {self.colony}", timeout_s=self.timeout_s)
         except BusClosed:
             raise
         except (BusTimeout, BusError, MindError) as e:
@@ -132,7 +153,7 @@ class Relay:
             request_path.unlink(missing_ok=True)   # let thegrid file a fresh request
             # Log before publishing: a dead bus raises BusClosed out of poll_once, and
             # the training record must survive that. The reply is the negative example.
-            self._log(req, prompt, None, "rejected", result.reason, epoch, tick, reply=reply)
+            self._log(req, prompt, None, "rejected", result.reason, epoch, tick, reply=reply, model_alias=alias)
             await self._publish("rejected", epoch, tick, request_id=req.request_id, reason=result.reason)
             if self.throttle.allow("odin.rejected"):
                 # Spec 6: the mind learns what does not work, not only what does.
@@ -146,7 +167,7 @@ class Relay:
             log.info("request %s vanished before the proposal landed", req.request_id)
             return None
         # The proposal itself is the training text, so no reply is kept here.
-        self._log(req, prompt, result, "proposed", None, epoch, tick)
+        self._log(req, prompt, result, "proposed", None, epoch, tick, model_alias=alias)
         await self._publish("proposed", epoch, tick, request_id=req.request_id,
                             genome_len=len(result), mind=self.agent_id)
         return "proposed"
@@ -171,6 +192,9 @@ class RelayConfig:
     # sooner than the deadline queues the retry behind it and times out again.
     retry_after_s: float = 60.0
     llm: DirectLlm | None = None    # MIND_LLM_URL / MIND_LLM_MODEL / MIND_LLM_KEY_FILE
+    candidate_tag: str = ""         # MIND_LLM_CANDIDATE
+    ab_split: float = AB_SPLIT      # MIND_AB_SPLIT
+    candidate_llm: DirectLlm | None = None
 
     @classmethod
     def from_env(cls) -> "RelayConfig":
@@ -194,7 +218,18 @@ class RelayConfig:
             ask_timeout_s=float(env("MIND_ASK_TIMEOUT_S", str(ASK_TIMEOUT_S))),
             retry_after_s=float(env("ODIN_RETRY_S", "60")),
             llm=DirectLlm.from_env(env),
+            candidate_tag=env("MIND_LLM_CANDIDATE", "") or "",
+            ab_split=float(env("MIND_AB_SPLIT", str(AB_SPLIT))),
+            candidate_llm=_candidate_llm(env),
         )
+
+
+def _candidate_llm(env) -> DirectLlm | None:
+    tag = env("MIND_LLM_CANDIDATE", "") or ""
+    base = DirectLlm.from_env(env)
+    if not tag or base is None:
+        return None
+    return DirectLlm(base.base_url, tag, base.api_key)
 
 
 async def run(cfg: RelayConfig) -> None:
@@ -211,6 +246,13 @@ async def run(cfg: RelayConfig) -> None:
     mind = Mind(cfg.agent_id, bus, kannaka_bin=cfg.kannaka_bin,
                 data_dir=Path(cfg.mind_data_dir) if cfg.mind_data_dir else None,
                 ask_timeout_s=cfg.ask_timeout_s, llm=cfg.llm)
+    candidate_mind = Mind(cfg.agent_id, bus, kannaka_bin=cfg.kannaka_bin,
+                          data_dir=Path(cfg.mind_data_dir) if cfg.mind_data_dir else None,
+                          ask_timeout_s=cfg.ask_timeout_s, llm=cfg.candidate_llm) if cfg.candidate_llm else None
+    if candidate_mind is not None:
+        log.info("A/B: candidate %s at split %.2f", cfg.candidate_tag, cfg.ab_split)
+    else:
+        log.info("A/B: none")
     async with httpx.AsyncClient(timeout=2) as client:
         async def fetch_state() -> dict:
             r = await client.get(f"{cfg.colony_url}/api/state")
@@ -220,7 +262,8 @@ async def run(cfg: RelayConfig) -> None:
         relay = Relay(cfg.queue, colony=cfg.colony, agent_id=cfg.agent_id, mind=mind, bus=bus,
                       state_fetch=fetch_state, proposal_log=ProposalLog(Path(cfg.verdicts_dir)),
                       model_alias=cfg.model_alias, timeout_s=cfg.ask_timeout_s,
-                      retry_after_s=cfg.retry_after_s)
+                      retry_after_s=cfg.retry_after_s,
+                      candidate_mind=candidate_mind, candidate_alias=cfg.candidate_tag, split=cfg.ab_split)
         log.info("watching %s for %s", cfg.queue, cfg.agent_id)
         while True:
             try:

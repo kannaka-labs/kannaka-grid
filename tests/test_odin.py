@@ -331,3 +331,72 @@ def test_config_from_env_ask_timeout(monkeypatch):
     assert RelayConfig.from_env().retry_after_s == 60.0
     monkeypatch.setenv("ODIN_RETRY_S", "420")
     assert RelayConfig.from_env().retry_after_s == 420.0
+
+
+def test_arm_for_is_deterministic_and_respects_the_split():
+    from grid.odin import arm_for
+    assert arm_for("r1", 0.2) == arm_for("r1", 0.2)
+    assert arm_for("anything", 0.0) == "incumbent" and arm_for("anything", 1.0) == "candidate"
+    ids = [f"req-{i}" for i in range(2000)]
+    share = sum(arm_for(i, 0.2) == "candidate" for i in ids) / len(ids)
+    assert 0.15 < share < 0.25                       # ~20%, deterministic per id
+
+
+async def test_relay_asks_the_candidate_arm_and_labels_it(tmp_path):
+    # Build a request whose id hashes to the candidate arm at split 0.2, and one that does not.
+    from grid.odin import arm_for
+    from grid.proposal_log import ProposalLog
+    cand_id = next(i for i in (f"c{i}" for i in range(500)) if arm_for(i, 0.2) == "candidate")
+    inc_id = next(i for i in (f"i{i}" for i in range(500)) if arm_for(i, 0.2) == "incumbent")
+    incumbent = FakeMind(answer='["nop"]')
+    candidate = FakeMind(answer='["nop"]')
+    for rid, expect_arm, expect_alias in ((cand_id, "candidate", "kannaka-brain-v4"), (inc_id, "incumbent", "kannaka-brain-v3")):
+        queue = tmp_path / rid
+        write_request(queue, request_id=rid)
+        log = ProposalLog(tmp_path / f"v-{rid}")
+        r = Relay(queue, colony="c", agent_id="grid-c", mind=incumbent, bus=FakeBus(), clock=Clock(),
+                  state_fetch=lambda: state_of(1, 10), proposal_log=log, model_alias="kannaka-brain-v3",
+                  candidate_mind=candidate, candidate_alias="kannaka-brain-v4", split=0.2)
+        assert await r.poll_once() == "proposed"
+        assert log.read_all()[-1]["model_alias"] == expect_alias
+    assert len(candidate.asked) == 1 and len(incumbent.asked) == 1
+
+
+async def test_relay_without_a_candidate_is_unchanged(tmp_path):
+    from grid.proposal_log import ProposalLog
+    write_request(tmp_path, "x1")
+    log = ProposalLog(tmp_path / "verdicts")
+    r = Relay(tmp_path, colony="c", agent_id="grid-c", mind=FakeMind(answer='["nop"]'), bus=FakeBus(), clock=Clock(),
+              state_fetch=lambda: state_of(1, 10), proposal_log=log, model_alias="kannaka-brain-v3")
+    assert await r.poll_once() == "proposed" and log.read_all()[-1]["model_alias"] == "kannaka-brain-v3"
+
+
+async def test_failed_candidate_ask_defers_and_never_reroutes(tmp_path):
+    from grid.mind import MindError
+    from grid.odin import arm_for
+    from grid.proposal_log import ProposalLog
+    cand_id = next(i for i in (f"c{i}" for i in range(500)) if arm_for(i, 0.2) == "candidate")
+    write_request(tmp_path, request_id=cand_id)
+    incumbent = FakeMind(answer='["nop"]')
+    log = ProposalLog(tmp_path / "verdicts")
+    r = Relay(tmp_path, colony="c", agent_id="grid-c", mind=incumbent, bus=FakeBus(), clock=Clock(),
+              state_fetch=lambda: state_of(1, 10), proposal_log=log, model_alias="v3",
+              candidate_mind=FakeMind(exc=MindError("gateway 500")), candidate_alias="v4", split=0.2)
+    assert await r.poll_once() == "deferred"
+    assert incumbent.asked == []                                             # the incumbent was NOT asked instead
+
+
+def test_config_from_env_candidate(monkeypatch, tmp_path):
+    from grid.mind import DirectLlm
+    from grid.odin import RelayConfig
+    monkeypatch.setenv("COLONY_SLUG", "colony-one")
+    for k in ("MIND_LLM_CANDIDATE", "MIND_AB_SPLIT", "MIND_LLM_URL", "MIND_LLM_MODEL", "MIND_LLM_KEY_FILE"):
+        monkeypatch.delenv(k, raising=False)
+    c = RelayConfig.from_env()
+    assert c.candidate_tag == "" and c.ab_split == 0.2 and c.candidate_llm is None
+    kf = tmp_path / "k"; kf.write_text("sk-x\n")
+    monkeypatch.setenv("MIND_LLM_URL", "http://gw/v1"); monkeypatch.setenv("MIND_LLM_MODEL", "kannaka-brain-current")
+    monkeypatch.setenv("MIND_LLM_KEY_FILE", str(kf)); monkeypatch.setenv("MIND_LLM_CANDIDATE", "kannaka-brain-v4"); monkeypatch.setenv("MIND_AB_SPLIT", "0.3")
+    c = RelayConfig.from_env()
+    assert c.candidate_tag == "kannaka-brain-v4" and c.ab_split == 0.3
+    assert c.candidate_llm == DirectLlm("http://gw/v1", "kannaka-brain-v4", "sk-x")
