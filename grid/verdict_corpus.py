@@ -115,7 +115,9 @@ def export(verdicts_dir: Path, out_dir: Path, *, min_tier: str = "reproduced",
            since_ts: int | None = None, dream: DreamSource | None = None) -> dict:
     vdir, out = Path(verdicts_dir), Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    entries = {e["request_id"]: e for e in ProposalLog(vdir).read_all()}
+    # N5: the same guard ab_arms has -- a proposal-log line without a request_id (a future
+    # writer, a hand-edit) must be skipped, not KeyError the whole export.
+    entries = {e["request_id"]: e for e in ProposalLog(vdir).read_all() if e.get("request_id")}
     ledger = Ledger(vdir / "verdicts.jsonl")
     threshold = TIER_RANK[min_tier]
     records, negatives, by_tier = [], [], {}

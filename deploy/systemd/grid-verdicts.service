@@ -11,3 +11,4 @@ WorkingDirectory=/srv/grid/kannaka-grid
 EnvironmentFile=/srv/grid/grid.env
 EnvironmentFile=/home/nick/.kannaka-nats.env
 ExecStart=/srv/grid/venv/bin/python -m grid.verdicts
+ExecStartPost=/srv/grid/venv/bin/python -m grid.weekly ab --check

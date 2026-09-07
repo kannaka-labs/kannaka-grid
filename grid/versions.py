@@ -7,7 +7,7 @@ from pathlib import Path
 from .verdicts import Ledger
 
 WEEKLY_USD = 5.0
-DECISIONS = ("released", "held", "rolled_back", "unchanged", "flip_incomplete")
+DECISIONS = ("released", "held", "rolled_back", "unchanged", "flip_incomplete", "ab_started", "ab_inconclusive")
 ROW_KEYS = ("ts", "week", "decision", "version", "previous", "base", "run", "adapter_sha256", "gguf_sha256",
             "set_manifest_sha256", "grid_examples", "verdict_window", "evals", "spend_usd", "over_budget",
             "rogue_ledger_ts", "reason")

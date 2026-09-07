@@ -331,3 +331,154 @@ def test_config_from_env_ask_timeout(monkeypatch):
     assert RelayConfig.from_env().retry_after_s == 60.0
     monkeypatch.setenv("ODIN_RETRY_S", "420")
     assert RelayConfig.from_env().retry_after_s == 420.0
+
+
+def test_arm_for_is_deterministic_and_respects_the_split():
+    from grid.odin import arm_for
+    assert arm_for("r1", 0.2) == arm_for("r1", 0.2)
+    assert arm_for("anything", 0.0) == "incumbent" and arm_for("anything", 1.0) == "candidate"
+    ids = [f"req-{i}" for i in range(2000)]
+    share = sum(arm_for(i, 0.2) == "candidate" for i in ids) / len(ids)
+    assert 0.15 < share < 0.25                       # ~20%, deterministic per id
+
+
+async def test_relay_asks_the_candidate_arm_and_labels_it(tmp_path):
+    # Build a request whose id hashes to the candidate arm at split 0.2, and one that does not.
+    from grid.odin import arm_for
+    from grid.proposal_log import ProposalLog
+    cand_id = next(i for i in (f"c{i}" for i in range(500)) if arm_for(i, 0.2) == "candidate")
+    inc_id = next(i for i in (f"i{i}" for i in range(500)) if arm_for(i, 0.2) == "incumbent")
+    incumbent = FakeMind(answer='["nop"]')
+    candidate = FakeMind(answer='["nop"]')
+    for rid, expect_arm, expect_alias in ((cand_id, "candidate", "kannaka-brain-v4"), (inc_id, "incumbent", "kannaka-brain-v3")):
+        queue = tmp_path / rid
+        write_request(queue, request_id=rid)
+        log = ProposalLog(tmp_path / f"v-{rid}")
+        r = Relay(queue, colony="c", agent_id="grid-c", mind=incumbent, bus=FakeBus(), clock=Clock(),
+                  state_fetch=lambda: state_of(1, 10), proposal_log=log, model_alias="kannaka-brain-v3",
+                  candidate_mind=candidate, candidate_alias="kannaka-brain-v4", split=0.2)
+        assert await r.poll_once() == "proposed"
+        assert log.read_all()[-1]["model_alias"] == expect_alias
+    assert len(candidate.asked) == 1 and len(incumbent.asked) == 1
+
+
+async def test_relay_without_a_candidate_is_unchanged(tmp_path):
+    from grid.proposal_log import ProposalLog
+    write_request(tmp_path, "x1")
+    log = ProposalLog(tmp_path / "verdicts")
+    r = Relay(tmp_path, colony="c", agent_id="grid-c", mind=FakeMind(answer='["nop"]'), bus=FakeBus(), clock=Clock(),
+              state_fetch=lambda: state_of(1, 10), proposal_log=log, model_alias="kannaka-brain-v3")
+    assert await r.poll_once() == "proposed" and log.read_all()[-1]["model_alias"] == "kannaka-brain-v3"
+
+
+async def test_a_wedged_candidate_ask_is_binned_after_the_defer_limit(tmp_path):
+    # C3: thegrid keeps ONE request slot, so a candidate ask that can never answer defers
+    # forever and the incumbent gets no turns either -- is_stuck (incumbent >= 50) can then
+    # never trip and §8 recovery cannot fire. Bin the request instead; thegrid files a fresh
+    # one that may hash to the other arm. Mutation: drop the `seen >= DEFER_LIMIT` branch in
+    # grid/odin.py poll_once -> the fourth poll returns "deferred" and request.json survives.
+    from grid.mind import MindError
+    from grid.odin import DEFER_LIMIT, arm_for
+    from grid.proposal_log import ProposalLog
+    cand_id = next(i for i in (f"c{i}" for i in range(500)) if arm_for(i, 0.2) == "candidate")
+    request = write_request(tmp_path, request_id=cand_id)
+    clock = Clock()
+    incumbent = FakeMind(answer='["nop"]')
+    plog = ProposalLog(tmp_path / "verdicts")
+    bus = FakeBus()
+    r = Relay(tmp_path, colony="c", agent_id="grid-c", mind=incumbent, bus=bus, clock=clock,
+              state_fetch=lambda: state_of(1, 10), proposal_log=plog, model_alias="v3",
+              candidate_mind=FakeMind(exc=MindError("gateway 500")), candidate_alias="v4", split=0.2)
+    for _ in range(DEFER_LIMIT - 1):
+        assert await r.poll_once() == "deferred"
+        assert request.exists()
+        clock.t += 61.0
+    assert await r.poll_once() == "rejected"
+    assert not request.exists()                      # thegrid's only slot is free again
+    [e] = plog.read_all()
+    assert e["outcome"] == "rejected" and e["reason"] == f"deferred {DEFER_LIMIT} times"
+    assert e["model_alias"] == "v4"                  # the arm that could not answer owns the row
+    assert bus.published[-1][1]["reason"] == f"deferred {DEFER_LIMIT} times"
+    assert incumbent.asked == []                     # still never re-routed
+
+
+async def test_a_successful_ask_resets_the_defer_count(tmp_path):
+    from grid.odin import DEFER_LIMIT
+    request = write_request(tmp_path)
+    clock = Clock()
+    mind = FakeMind(answer='["harvest","fork"]', exc=BusTimeout("slow"))
+    r = relay(tmp_path, mind, clock=clock)
+    for _ in range(DEFER_LIMIT - 1):
+        assert await r.poll_once() == "deferred"
+        clock.t += 61.0
+    mind.exc = None
+    assert await r.poll_once() == "proposed"
+    (tmp_path / "proposal.json").unlink()            # thegrid consumed it
+    mind.exc = BusTimeout("slow")
+    for _ in range(DEFER_LIMIT - 1):
+        assert await r.poll_once() == "deferred"     # back to strike one, not binned
+        clock.t += 61.0
+    assert request.exists()
+
+
+async def test_the_defer_counter_does_not_outlive_its_request(tmp_path):
+    # N8: thegrid keeps one request slot, so a counter under any other id belongs to a request
+    # that was abandoned and will never be seen again. Without the prune the dict grows by one
+    # entry per abandoned request for the relay's lifetime. Mutation: drop the prune in
+    # poll_once -> r1's counter is still there after r2 is answered.
+    write_request(tmp_path, "r1")
+    clock = Clock()
+    mind = FakeMind(answer='["harvest","fork"]', exc=BusTimeout("slow"))
+    r = relay(tmp_path, mind, clock=clock)
+    assert await r.poll_once() == "deferred"
+    assert set(r._defers) == {"r1"}
+    write_request(tmp_path, "r2")                # thegrid abandoned r1 and filed a new one
+    mind.exc = None
+    assert await r.poll_once() == "proposed"
+    assert r._defers == {}
+
+
+async def test_failed_candidate_ask_defers_and_never_reroutes(tmp_path):
+    from grid.mind import MindError
+    from grid.odin import arm_for
+    from grid.proposal_log import ProposalLog
+    cand_id = next(i for i in (f"c{i}" for i in range(500)) if arm_for(i, 0.2) == "candidate")
+    write_request(tmp_path, request_id=cand_id)
+    incumbent = FakeMind(answer='["nop"]')
+    log = ProposalLog(tmp_path / "verdicts")
+    r = Relay(tmp_path, colony="c", agent_id="grid-c", mind=incumbent, bus=FakeBus(), clock=Clock(),
+              state_fetch=lambda: state_of(1, 10), proposal_log=log, model_alias="v3",
+              candidate_mind=FakeMind(exc=MindError("gateway 500")), candidate_alias="v4", split=0.2)
+    assert await r.poll_once() == "deferred"
+    assert incumbent.asked == []                                             # the incumbent was NOT asked instead
+
+
+def test_config_from_env_tolerates_blank_numeric_lines(monkeypatch):
+    # C1: the gate writes AND reverts these lines, and a present-but-empty `MIND_AB_SPLIT=`
+    # makes os.environ.get return "" -- not the default -- so float() raises at boot, the
+    # relay crash-loops into its StartLimit and stays dead. Mutation: restore
+    # `float(env("MIND_AB_SPLIT", str(AB_SPLIT)))` -> ValueError instead of 0.2.
+    from grid.mind import ASK_TIMEOUT_S
+    from grid.odin import AB_SPLIT, RelayConfig
+    monkeypatch.setenv("COLONY_SLUG", "colony-one")
+    for k in ("MIND_AB_SPLIT", "MIND_ASK_TIMEOUT_S", "ODIN_RETRY_S", "ODIN_POLL_S"):
+        monkeypatch.setenv(k, "")
+    c = RelayConfig.from_env()
+    assert c.ab_split == AB_SPLIT and c.ask_timeout_s == ASK_TIMEOUT_S
+    assert c.retry_after_s == 60.0 and c.poll_s == 1.0
+
+
+def test_config_from_env_candidate(monkeypatch, tmp_path):
+    from grid.mind import DirectLlm
+    from grid.odin import RelayConfig
+    monkeypatch.setenv("COLONY_SLUG", "colony-one")
+    for k in ("MIND_LLM_CANDIDATE", "MIND_AB_SPLIT", "MIND_LLM_URL", "MIND_LLM_MODEL", "MIND_LLM_KEY_FILE"):
+        monkeypatch.delenv(k, raising=False)
+    c = RelayConfig.from_env()
+    assert c.candidate_tag == "" and c.ab_split == 0.2 and c.candidate_llm is None
+    kf = tmp_path / "k"; kf.write_text("sk-x\n")
+    monkeypatch.setenv("MIND_LLM_URL", "http://gw/v1"); monkeypatch.setenv("MIND_LLM_MODEL", "kannaka-brain-current")
+    monkeypatch.setenv("MIND_LLM_KEY_FILE", str(kf)); monkeypatch.setenv("MIND_LLM_CANDIDATE", "kannaka-brain-v4"); monkeypatch.setenv("MIND_AB_SPLIT", "0.3")
+    c = RelayConfig.from_env()
+    assert c.candidate_tag == "kannaka-brain-v4" and c.ab_split == 0.3
+    assert c.candidate_llm == DirectLlm("http://gw/v1", "kannaka-brain-v4", "sk-x")

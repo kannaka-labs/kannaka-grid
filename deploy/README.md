@@ -24,7 +24,14 @@ KANNAKA_DATA_DIR=/srv/grid/colony-one/memory kannaka remember "grid-colony-one m
 sudo cp deploy/systemd/grid-mind*.{service,timer} /etc/systemd/system/ && sudo systemctl daemon-reload
 sudo systemctl enable --now grid-mind.service grid-mind-dream.timer
 ```
-Sudoers line for the dream restart: `nick ALL=(root) NOPASSWD: /usr/bin/systemctl restart grid-mind.service`.
+Sudoers lines, one per unit the gate restarts without a password:
+```
+nick ALL=(root) NOPASSWD: /usr/bin/systemctl restart grid-mind.service
+nick ALL=(root) NOPASSWD: /usr/bin/systemctl restart grid-odin.service
+```
+The first is the dream restart; the second is every relay restart the release gate does
+(`flip`, `start_ab`, `end_ab`, `ab --check`, `ab --abort`) — without it the gate's `sudo -n`
+fails and an A/B is recorded `flip_incomplete` instead of running.
 Receipt: `kannaka swarm peers` lists `grid-colony-one` with `ask` in capabilities.
 
 ### 1a. Which model answers the mind
@@ -167,6 +174,79 @@ Receipts:
    (`journalctl -u grid-odin` or a bus capture on `GRID.>`).
 4. `python -m grid.weekly rollback` followed by `python -m grid.weekly release --week <the rolled-back week>`
    once by hand restores the prior version and then re-releases, both landing in `versions.jsonl`.
+
+### Colony A/B testing
+The release gate can A/B test a candidate model against the incumbent for up to two weeks. The decision
+log (versions.jsonl, column `colony_ab`) records each run's outcome: `ab_started` when the gate begins
+a test, `ab_inconclusive` if inconclusive after one week, `released` (A/B win), `held` (stuck, loss,
+inconclusive after two weeks, or a win whose `ollama cp` failed), and `flip_incomplete` when the
+env was changed but the relay restart failed twice — grid.env then says one thing and the running
+relay another, so an operator must `sudo systemctl restart grid-odin.service` by hand.
+Nightly, after verdicts settle, the gate's pre-release also runs
+`grid.weekly ab --check` to detect if an A/B test has stalled and cannot resolve (same stuck-detection
+logic as the release gate itself); other manual A/B sub-commands are `grid.weekly ab --abort` (discard
+an in-flight test) and `grid.weekly ab --forget <tag>` (append a row lifting the block on a tag so it
+can be retested). An operator's `ab --abort` is not remembered -- the same candidate tag is free to
+start a new A/B the next Sunday it is promoted -- whereas a loss, a stuck abort, or an
+inconclusive-after-two-weeks hold in which only the candidate arm was under sample blocks that tag
+from retesting until an operator runs `ab --forget <tag>`. (Both arms under sample is a colony
+throughput fault, not the candidate's, and is not remembered.)
+
+**Do not run `set-mind-model.sh` while an A/B is running**: it rewrites `MIND_MODEL_ALIAS`, and the
+incumbent's proposals then log under a label the gate does not count — the gate detects the mismatch
+and records `ab_inconclusive` with `incumbent label changed mid-A/B`, spending a week of the A/B's
+two-week budget for nothing. It spends at most two: at `MAX_WEEKS` the gate closes the A/B with
+`held: incumbent label changed mid-A/B …; A/B ended after 2 weeks`, clears the candidate and restarts
+the relay, and the candidate is *not* blacklisted — an operator's mislabel is not the colony's
+verdict, so the next Sunday starts a fresh A/B against the new label. Until then the nightly
+`ab --check` logs a warning and skips the stuck check. Run `grid.weekly ab --abort` first, or wait
+for the verdict Sunday.
+
+**Reconciliation.** `ab --check` first repairs the *resting* state, before any stuck logic: if the
+last decision was `flip_incomplete`, or `grid.env` still splits to a candidate whose A/B the ledger
+has closed, or the ledger has an A/B open that nothing is splitting to, it clears the candidate,
+restarts grid-odin, and records a `colony A/B reconciled: …` row (exit 3, and it retries every night,
+if that restart fails). It keys on `ab_started` rows, i.e. on "did the *gate* start this?", so an A/B
+you started by hand is logged at WARNING and left completely alone — and stays exempt across as many
+runs of the hand-start receipt as you like, because `ab --abort` writes a `held` row, never an
+`ab_started` one. While a hand-started split is in `grid.env` the reconciler does nothing else
+either, so it suspends the repairs above for its duration.
+
+A release therefore takes two Sundays at minimum: the gate starts the A/B on the Sunday the promotion first passes its probes, and renders the colony's verdict on the following Sunday (continuing up to two weeks if the sample is short); the nightly `ab --check` only aborts a stuck A/B within that window.
+
+To run a hand-started A/B test: set `MIND_LLM_CANDIDATE=<model-tag>` and `MIND_AB_SPLIT=0.2` in
+`/srv/grid/grid.env` (the default split is 0.2 = 20% candidate, 80% incumbent), then restart
+`grid-odin.service` to begin routing requests. Monitor the relay's proposal log with `journalctl -u grid-odin`
+and check that both arms are represented: `grep -o 'model_alias":"[^"]*' <proposal-log>` shows both the
+incumbent and candidate labels. Run `python -m grid.weekly ab` from `/srv/grid/kannaka-grid` to print both
+arms' identities and their verdict counts so far. When done, run `python -m grid.weekly ab --abort` to
+clear the candidate and discard the A/B test, then restart `grid-odin.service`.
+
+Manual commands from `/srv/grid/kannaka-grid`:
+```bash
+/srv/grid/venv/bin/python -m grid.weekly ab               # show both arms' identities and verdict counts
+/srv/grid/venv/bin/python -m grid.weekly ab --check       # nightly reconcile + stuck check; exit codes below
+/srv/grid/venv/bin/python -m grid.weekly ab --abort       # discard an in-flight A/B test
+/srv/grid/venv/bin/python -m grid.weekly ab --forget <tag>  # append a row lifting the block on a tag
+```
+`ab` also reports an A/B that exists only in `grid.env` with no ledger row (a hand-started one, as
+above) as `"source": "env"`; its arms then cover all recorded history, since there is no `since_ts`.
+
+Exit codes — `release`, `rollback`, `ab --check` and `ab --abort` share one contract, and `ab --check`
+runs as `grid-verdicts.service`'s `ExecStartPost`, so a non-zero exit marks that nightly unit failed:
+- `0` — nothing needed doing (no A/B running, or one running and not stuck), or the work was done
+  cleanly (a `held` row printed: the A/B was stuck, or reconciled, and the relay restarted).
+- `3` — the verb did not do what it says. Either the row is `flip_incomplete` (the candidate was
+  cleared in `grid.env` but the relay restart failed twice, so the live relay is still splitting to a
+  candidate the ledger has closed): run `sudo systemctl restart grid-odin.service` and check
+  `journalctl -u grid-odin` for `A/B: none` — the nightly reconciler retries this, so the unit stays
+  failed until it is fixed. Or the reason ends `: flip_failed` (a `rollback` whose `ollama cp` failed,
+  so the alias was never moved): check debain2's ollama and re-run it.
+
+Never put a comment after a value in `grid.env` (`ODIN_RETRY_S=60   # 900 on a CPU model`): systemd's
+`EnvironmentFile` keeps it *in the value*, `float()` on it kills the relay at boot, and neither the
+gate nor the relay strips it — deliberately, so that both always read a value identically. Put the
+comment on its own line above.
 
 ## Known limits (v0.1)
 - Memories written by the bridge become visible to asks only after the 6 h dream+restart.
