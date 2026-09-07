@@ -243,8 +243,16 @@ async def test_dry_run_release_and_rollback_write_no_ledger_row(tmp_path):
     assert cfg.grid_env.read_text() == grid_env_before   # flip's env write must not happen under dry_run either
 
 
-def _seed_ab(vdir, *, since_ts, inc="kannaka-brain-v3", cand="kannaka-brain-v4", n_inc=120, n_cand=110, inc_rep=30, cand_rep=25, before=5):
-    """Proposals + verdicts for two arms; `before` extra candidate proposals stamped before since_ts (must be excluded)."""
+def _seed_ab(vdir, *, since_ts, inc="kannaka-brain-v3", cand="kannaka-brain-v4", n_inc=120, n_cand=110, inc_rep=30, cand_rep=25, before=5,
+             inc_rejected=(0, 0), cand_rejected=(0, 0), excluded=1):
+    """Proposals + verdicts for two arms; `before` extra candidate proposals stamped before since_ts (must be excluded).
+
+    `*_rejected` is `(invalid, deferred)`: replies that arrived and failed validation, and asks
+    the relay binned because no reply ever arrived. Both write a proposal-log row and NO verdict
+    row -- that asymmetry is the whole reason the validity counts exist. `excluded` is the count
+    of extra in-window candidate proposals carrying an EXCLUDED_TIERS verdict.
+    """
+    from grid.odin import DEFER_LIMIT
     from grid.verdicts import Ledger
     (vdir / "prompts").mkdir(parents=True, exist_ok=True)
     led = Ledger(vdir / "verdicts.jsonl"); rows = []
@@ -252,21 +260,101 @@ def _seed_ab(vdir, *, since_ts, inc="kannaka-brain-v3", cand="kannaka-brain-v4",
         rid = f"{alias}-{i}-{ts}"
         rows.append({"ts": ts, "request_id": rid, "outcome": "proposed", "model_alias": alias, "parent_genome": ["a"], "prompt_path": f"prompts/{rid}.txt", "proposal": ["a", "nop"]})
         led.append({"request_id": rid, "model_alias": alias, "tier": tier, "births": births, "fitness": births})
+    def reject(i, alias, ts, reason):
+        rid = f"{alias}-rej-{i}-{ts}"
+        rows.append({"ts": ts, "request_id": rid, "outcome": "rejected", "reason": reason, "model_alias": alias,
+                     "parent_genome": ["a"], "prompt_path": f"prompts/{rid}.txt", "proposal": None})
     for i in range(n_inc): add(i, inc, since_ts + 1000 + i, "reproduced" if i < inc_rep else "new", 2 if i < inc_rep else 1)
     for i in range(n_cand): add(i, cand, since_ts + 1000 + i, "reproduced" if i < cand_rep else "new", 2 if i < cand_rep else 1)
+    for alias, (invalid, deferred) in ((inc, inc_rejected), (cand, cand_rejected)):
+        for i in range(invalid): reject(i, alias, since_ts + 2000 + i, "unknown opcode 'blorp'")
+        # The exact string grid/odin.py writes when it gives up on an ask: f"deferred {DEFER_LIMIT} times".
+        for i in range(deferred): reject(1000 + i, alias, since_ts + 3000 + i, f"deferred {DEFER_LIMIT} times")
     for i in range(before): add(i, cand, since_ts - 1000 - i, "reproduced", 5)                 # outside the window
-    add(999, cand, since_ts + 5000, "preexisting", 40)                                            # excluded tier
+    for i in range(excluded): add(999 + i, cand, since_ts + 5000 + i, "preexisting", 40)          # excluded tier
     (vdir / "proposals.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def _seed_validity(tmp_path, *, candidate, incumbent, cand_defer=0, inc_defer=0):
+    """Arms from a seeded log, for the validity floor: `(valid, invalid)` asks per arm.
+
+    Goes through the real `ab_arms` rather than hand-building a dict, so the counting and the
+    floor are proved together. `before=5` keeps the out-of-window rows in play: they are
+    proposals too, so a count that forgets `since_ts` shows up here as a shifted ratio.
+    """
+    from grid.weekly import ab_arms
+    v = tmp_path / "v"
+    n_cand, cand_invalid = candidate
+    n_inc, inc_invalid = incumbent
+    _seed_ab(v, since_ts=1_000_000, inc="inc", cand="cand", n_inc=n_inc, n_cand=n_cand,
+             inc_rep=0, cand_rep=0, before=5, excluded=0,
+             inc_rejected=(inc_invalid, inc_defer), cand_rejected=(cand_invalid, cand_defer))
+    return ab_arms(v, since_ts=1_000_000, incumbent="inc", candidate="cand")
+
+
+def test_a_candidate_that_cannot_answer_loses_instead_of_reading_short(tmp_path):
+    # 40 asks on the candidate: 8 valid, 32 rejected. No verdict rows for the rejects, so on
+    # settled counts alone the candidate reads `inconclusive` (8 < MIN_SAMPLE) and survives to
+    # the two-week cap blaming sample size. Mutation: delete the floor block in ab_decide.
+    from grid.weekly import ab_decide
+    arms = _seed_validity(tmp_path, candidate=(8, 32), incumbent=(120, 0))
+    assert arms["cand"] == {"settled": 8, "reproduced": 0, "rate": 0.0, "births_per_proposal": 1.0,
+                            "answered": 40, "valid": 8, "unanswered": 0, "validity": pytest.approx(0.2)}
+    assert arms["inc"]["answered"] == 120 and arms["inc"]["validity"] == 1.0
+    verdict, reason = ab_decide(arms, incumbent="inc", candidate="cand")
+    assert verdict == "loss"
+    assert "validity" in reason and "0.20" in reason
+    # Mutation: drop the `since_ts` guard on the count -> the 5 out-of-window candidate
+    # proposals join in, validity reads 13/45 = "0.29", and the assertion above goes RED.
+    assert reason == "colony A/B lost: cand validity 0.20 below 0.5 over 40 answered"
+
+
+def test_an_arm_that_was_never_answered_is_not_scored_as_bad_wording(tmp_path):
+    # An outage is an availability failure of the colony, not a wording failure of the arm:
+    # defer-binned asks are excluded from BOTH sides of the ratio and reported on their own.
+    # Mutation: count the defer bins as `answered` -> validity reads 0.75, not 1.0, and the
+    # candidate is one bad week away from losing for a gateway that was down.
+    from grid.weekly import ab_decide
+    arms = _seed_validity(tmp_path, candidate=(120, 0), incumbent=(120, 0), cand_defer=40)
+    assert arms["cand"]["answered"] == 120 and arms["cand"]["valid"] == 120
+    assert arms["cand"]["unanswered"] == 40 and arms["cand"]["validity"] == 1.0
+    assert arms["inc"]["unanswered"] == 0
+    assert ab_decide(arms, incumbent="inc", candidate="cand")[0] == "win"
+
+
+def test_the_validity_floor_is_silent_below_its_minimum_and_for_the_incumbent(tmp_path):
+    # 19 answered is too thin to call wording on, however bad it looks.
+    from grid.weekly import VALIDITY_MIN, VALIDITY_MIN_ANSWERED, ab_decide
+    thin = _seed_validity(tmp_path / "thin", candidate=(1, 18), incumbent=(120, 0))
+    assert thin["cand"]["answered"] == 19 and thin["cand"]["validity"] < VALIDITY_MIN
+    assert ab_decide(thin, incumbent="inc", candidate="cand")[0] == "inconclusive"
+    # One more answered ask and the floor speaks. Mutation: `>=` -> `>` in ab_decide, RED here.
+    at_bar = _seed_validity(tmp_path / "at_bar", candidate=(1, 19), incumbent=(120, 0))
+    assert at_bar["cand"]["answered"] == VALIDITY_MIN_ANSWERED
+    assert ab_decide(at_bar, incumbent="inc", candidate="cand")[0] == "loss"
+    assert VALIDITY_MIN == 0.5 and VALIDITY_MIN_ANSWERED == 20
+    # And silent for the INCUMBENT, whatever its validity: a running model that stops parsing is
+    # a colony-wide fault the `ab_check` stuck rule owns, and a floor branch here would report it
+    # as a verdict on the candidate -- which answered everything. Mutation: add an incumbent
+    # branch mirroring the candidate one -> this reads "loss" and blames the wrong arm.
+    sick_inc = _seed_validity(tmp_path / "sick", candidate=(120, 0), incumbent=(8, 32))
+    assert sick_inc["inc"]["validity"] == pytest.approx(0.2) and sick_inc["cand"]["validity"] == 1.0
+    verdict, reason = ab_decide(sick_inc, incumbent="inc", candidate="cand")
+    assert verdict == "inconclusive" and "validity" not in reason
 
 
 def test_ab_arms_windows_on_proposal_ts_and_excludes_unattributable_tiers(tmp_path):
     from grid.weekly import ab_arms
     v = tmp_path / "v"; _seed_ab(v, since_ts=1_000_000)
     arms = ab_arms(v, since_ts=1_000_000, incumbent="kannaka-brain-v3", candidate="kannaka-brain-v4")
-    assert arms["kannaka-brain-v3"] == {"settled": 120, "reproduced": 30, "rate": 0.25, "births_per_proposal": pytest.approx((30*2 + 90) / 120)}
+    assert arms["kannaka-brain-v3"] == {"settled": 120, "reproduced": 30, "rate": 0.25, "births_per_proposal": pytest.approx((30*2 + 90) / 120),
+                                        "answered": 120, "valid": 120, "unanswered": 0, "validity": 1.0}
     assert arms["kannaka-brain-v4"]["settled"] == 110 and arms["kannaka-brain-v4"]["reproduced"] == 25   # not 110+5+1
+    # The attempt count windows on the same `since_ts`: 110 + the excluded-tier ask, not the 5 before it.
+    assert arms["kannaka-brain-v4"]["answered"] == 111 and arms["kannaka-brain-v4"]["valid"] == 111
     arms2 = ab_arms(v, since_ts=1_000_000, incumbent="kannaka-brain-v3", candidate="kannaka-brain-v9")
-    assert arms2["kannaka-brain-v9"] == {"settled": 0, "reproduced": 0, "rate": 0.0, "births_per_proposal": 0.0}
+    assert arms2["kannaka-brain-v9"] == {"settled": 0, "reproduced": 0, "rate": 0.0, "births_per_proposal": 0.0,
+                                         "answered": 0, "valid": 0, "unanswered": 0, "validity": 0.0}
     # Minor: a proposal-log line with no request_id (a future writer, a hand-edit) must be
     # skipped, not KeyError the whole gate. Mutation: `e["request_id"]` -> KeyError here.
     with open(v / "proposals.jsonl", "a", encoding="utf-8") as f:
@@ -277,7 +365,10 @@ def test_ab_arms_windows_on_proposal_ts_and_excludes_unattributable_tiers(tmp_pa
 def test_ab_decide_boundaries():
     from grid.weekly import MIN_SAMPLE, TOLERANCE, ab_decide
     inc, cand = "v3", "v4"
-    arms = lambda ri, si, rc, sc: {inc: {"settled": si, "reproduced": int(ri*si), "rate": ri, "births_per_proposal": 0}, cand: {"settled": sc, "reproduced": int(rc*sc), "rate": rc, "births_per_proposal": 0}}
+    # Every ask answered and valid, so the validity floor stays out of the rate boundaries below.
+    arm = lambda r, s: {"settled": s, "reproduced": int(r*s), "rate": r, "births_per_proposal": 0,
+                        "answered": s, "valid": s, "unanswered": 0, "validity": 1.0}
+    arms = lambda ri, si, rc, sc: {inc: arm(ri, si), cand: arm(rc, sc)}
     assert ab_decide(arms(0.25, 120, 0.225, 110), incumbent=inc, candidate=cand)[0] == "win"     # exactly rate_i*(1-0.10)
     assert (0.25 * (1 - TOLERANCE)).hex() == (0.225).hex()   # ...and exactly, in binary too: no epsilon needed
     # The epsilon IS needed for rates that come out of real counts. 42/108 x 0.9 lands one ulp

@@ -34,6 +34,8 @@ TOLERANCE = 0.10
 MAX_WEEKS = 2
 STUCK_AFTER_S = 48 * 3600
 STUCK_INCUMBENT_MIN = 50
+VALIDITY_MIN = 0.5
+VALIDITY_MIN_ANSWERED = 20
 POSITIVE_TIERS = ("reproduced", "growing", "enduring", "established")
 EXCLUDED_TIERS = ("preexisting", "unknown", "rejected")
 
@@ -202,10 +204,46 @@ def colony_ab(verdicts_dir: Path) -> dict:
 
 def ab_arms(verdicts_dir: Path, *, since_ts: int, incumbent: str, candidate: str) -> dict:
     """Per-arm colony outcome for proposals MADE since `since_ts` (the proposal's own ts,
-    joined by request_id), so only asks that ran under the split count."""
+    joined by request_id), so only asks that ran under the split count.
+
+    Two tallies, from two sources, because a bad answer leaves no trace in the first one.
+    The verdict rows say what the colony did with the genomes an arm produced. The proposal
+    log says how many asks the arm could answer AT ALL: a reply that fails validation never
+    becomes a genome, so it never settles, so on verdicts alone an arm that cannot answer
+    merely looks slow and reads `inconclusive` on sample size until the two-week cap.
+
+    Attempts partition three ways, and the split matters:
+      - `valid`: the reply parsed and became a proposal;
+      - `answered`: the model replied at all, valid or not -- the denominator of `validity`;
+      - `unanswered`: the ask was binned after repeated defers, so no reply ever arrived.
+    Unanswered asks sit OUTSIDE both sides of the ratio. A gateway outage is an availability
+    failure of the colony, and folding it in would report it as a wording failure of the arm.
+    """
     vdir = Path(verdicts_dir)
-    entries = {e["request_id"]: e for e in ProposalLog(vdir).read_all() if e.get("request_id")}
-    acc = {t: {"settled": 0, "reproduced": 0, "births": 0} for t in (incumbent, candidate)}
+    acc = {t: {"settled": 0, "reproduced": 0, "births": 0, "answered": 0, "valid": 0, "unanswered": 0}
+           for t in (incumbent, candidate)}
+    entries = {}
+    for e in ProposalLog(vdir).read_all():        # one pass: the join index AND the attempt counts
+        rid = e.get("request_id")
+        if not rid:
+            continue
+        entries[rid] = e
+        if int(e.get("ts", 0)) < since_ts:        # the same window the verdict join applies below
+            continue
+        a = acc.get(str(e.get("model_alias", "")))
+        if a is None:
+            continue
+        outcome = e.get("outcome")
+        if outcome == "proposed":
+            a["answered"] += 1
+            a["valid"] += 1
+        elif outcome == "rejected":
+            # `deferred N times` is the reason grid/odin.py bins an ask under when the mind
+            # never answered; every other rejection reason means she answered badly.
+            if str(e.get("reason") or "").startswith("deferred "):
+                a["unanswered"] += 1
+            else:
+                a["answered"] += 1
     for row in Ledger(vdir / "verdicts.jsonl").rows():
         e = entries.get(row.get("request_id"))
         if e is None or int(e.get("ts", 0)) < since_ts or row.get("tier") in EXCLUDED_TIERS:
@@ -218,13 +256,26 @@ def ab_arms(verdicts_dir: Path, *, since_ts: int, incumbent: str, candidate: str
         a["births"] += int(row.get("births") or 0)
     return {t: {"settled": v["settled"], "reproduced": v["reproduced"],
                 "rate": (v["reproduced"] / v["settled"]) if v["settled"] else 0.0,
-                "births_per_proposal": (v["births"] / v["settled"]) if v["settled"] else 0.0}
+                "births_per_proposal": (v["births"] / v["settled"]) if v["settled"] else 0.0,
+                "answered": v["answered"], "valid": v["valid"], "unanswered": v["unanswered"],
+                "validity": (v["valid"] / v["answered"]) if v["answered"] else 0.0}
             for t, v in acc.items()}
 
 
 def ab_decide(arms: dict, *, incumbent: str, candidate: str, min_sample: int = MIN_SAMPLE,
               tolerance: float = TOLERANCE) -> tuple[str, str]:
     i, c = arms[incumbent], arms[candidate]
+    # Before the sample check, because a candidate that cannot answer is exactly the case the
+    # sample check gets wrong: its rejects produce no verdict rows, so it never reaches
+    # `min_sample`, reads `inconclusive` week after week, and is finally held at MAX_WEEKS
+    # with a reason that blames sample size instead of the wording.
+    #
+    # The floor is the CANDIDATE's alone. An incumbent below it is not a candidate failure at
+    # all but a colony-wide fault (the shared gateway, the ISA, the corpus), and the stuck
+    # rule in `ab_check` already owns that case; a branch here would only double-report it.
+    if c["answered"] >= VALIDITY_MIN_ANSWERED and c["validity"] < VALIDITY_MIN:
+        return "loss", (f"colony A/B lost: {candidate} validity {c['validity']:.2f} below "
+                        f"{VALIDITY_MIN} over {c['answered']} answered")
     if i["settled"] < min_sample or c["settled"] < min_sample:
         return "inconclusive", f"sample {c['settled']}/{i['settled']} below {min_sample} per arm"
     floor = i["rate"] * (1 - tolerance)
