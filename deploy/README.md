@@ -176,6 +176,9 @@ or inconclusive after two weeks). Nightly, after verdicts settle, the gate's pre
 `grid.weekly ab --check` to detect if an A/B test has stalled and cannot resolve (same stuck-detection
 logic as the release gate itself); other manual A/B sub-commands are `grid.weekly ab --abort` (discard
 an in-flight test) and `grid.weekly ab --forget <tag>` (clear the decision row for a tag to replay it).
+An operator's `ab --abort` is not remembered -- the same candidate tag is free to start a new A/B the
+next Sunday it is promoted -- whereas a loss, a stuck abort, or an inconclusive-after-two-weeks hold
+blocks that tag from retesting until an operator runs `ab --forget <tag>`.
 
 A release therefore takes two Sundays at minimum: the gate starts the A/B on the Sunday the promotion first passes its probes, and renders the colony's verdict on the following Sunday (continuing up to two weeks if the sample is short); the nightly `ab --check` only aborts a stuck A/B within that window.
 

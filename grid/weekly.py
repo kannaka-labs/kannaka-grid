@@ -241,16 +241,20 @@ def ab_state(versions: Versions) -> dict | None:
 
 
 def lost_tags(versions: Versions) -> set[str]:
-    """A tag is lost iff its most recent lost/stuck `held` row comes after its most
-    recent operator-forget `unchanged` row (spec §8): forgetting makes it retestable
-    until it loses or gets stuck again."""
+    """A tag is lost iff its most recent lost/stuck/inconclusive-at-max `held` row comes
+    after its most recent operator-forget `unchanged` row (spec §8): forgetting makes it
+    retestable until it loses, gets stuck, or exhausts MAX_WEEKS inconclusive again.
+    (Controller ruling: a tag that could never reach sample size in MAX_WEEKS is not
+    auto-retried either — that would livelock the gate re-running the same undersampled
+    candidate every week.)"""
     lost_at: dict[str, float] = {}
     forgotten_at: dict[str, float] = {}
     for r in versions.rows():
         tag = r.get("version")
         if not tag:
             continue
-        if r["decision"] == "held" and str(r.get("reason", "")).startswith(("colony A/B lost", "colony A/B stuck")):
+        if r["decision"] == "held" and str(r.get("reason", "")).startswith(
+                ("colony A/B lost", "colony A/B stuck", "colony A/B inconclusive")):
             lost_at[tag] = r["ts"]
         elif r["decision"] == "unchanged" and str(r.get("reason", "")).startswith("operator forgot"):
             forgotten_at[tag] = r["ts"]
@@ -266,6 +270,7 @@ def flip(cfg: WeeklyConfig, remote, version: str, *, local_run, dry_run: bool = 
     real here, so both are skipped (and logged) when `dry_run` is true.
     """
     before = _env_get(cfg.grid_env, "MIND_MODEL_ALIAS")
+    before_cand = _env_get(cfg.grid_env, "MIND_LLM_CANDIDATE")
     if dry_run:
         log.info("[dry-run] flip: would set MIND_MODEL_ALIAS=%s in %s", version, cfg.grid_env)
     else:
@@ -275,8 +280,14 @@ def flip(cfg: WeeklyConfig, remote, version: str, *, local_run, dry_run: bool = 
         _env_set(cfg.grid_env, "MIND_LLM_CANDIDATE", "")
     r = remote.run(f"ollama cp {shlex.quote(version)} {shlex.quote(cfg.current_alias)}", timeout=600)
     if r.returncode != 0:
-        if not dry_run and before is not None:
-            _env_set(cfg.grid_env, "MIND_MODEL_ALIAS", before)
+        # C1: the relay is never restarted on a failed tag copy, so it keeps running
+        # whatever it last loaded -- both env lines must revert together, or the file
+        # would claim "no A/B" while the live relay keeps splitting to the candidate.
+        if not dry_run:
+            if before is not None:
+                _env_set(cfg.grid_env, "MIND_MODEL_ALIAS", before)
+            if before_cand is not None:
+                _env_set(cfg.grid_env, "MIND_LLM_CANDIDATE", before_cand)
         log.error("tag copy failed: %s", r.stderr.strip())
         return "flip_failed"
     # The relay already asks cfg.current_alias (one-time install); a release only changes
@@ -292,28 +303,46 @@ def flip(cfg: WeeklyConfig, remote, version: str, *, local_run, dry_run: bool = 
     return "flip_incomplete"
 
 
-def _restart_relay(local_run) -> int:
-    return local_run(["sudo", "systemctl", "restart", "grid-odin.service"])
+def _restart_relay(local_run) -> str:
+    """C2/I2: mirror flip()'s own restart retry (same -n sudoers line, same two attempts)
+    so a failed restart is reported, not silently swallowed."""
+    cmd = ["sudo", "-n", "systemctl", "restart", "grid-odin.service"]
+    for attempt in (1, 2):
+        if local_run(cmd) == 0:
+            return "ok"
+        log.error("relay restart attempt %d failed", attempt)
+    return "flip_incomplete"
 
 
 def start_ab(cfg: WeeklyConfig, *, candidate: str, incumbent: str, local_run, dry_run: bool = False,
-            now_ms: int | None = None) -> dict:
-    """Spec §8: probes passed, but a release is now a binding colony A/B, not a flip."""
+            now_ms: int | None = None) -> tuple[dict, str]:
+    """Spec §8: probes passed, but a release is now a binding colony A/B, not a flip.
+
+    Returns `(block, outcome)`: `outcome` is "ok" or "flip_incomplete" (C2) -- a caller
+    that ignores it would otherwise record `ab_started` even when the relay never picked
+    up the candidate, silently blocking that arm from ever running.
+    """
     since = now_ms if now_ms is not None else int(time.time() * 1000)
     block = {"binding": True, "candidate": candidate, "incumbent": incumbent, "split": AB_SPLIT, "since_ts": since,
              "min_sample": MIN_SAMPLE, "tolerance": TOLERANCE, "weeks": 0, "arms": {}, "winner": None}
-    if not dry_run:
-        _env_set(cfg.grid_env, "MIND_LLM_CANDIDATE", candidate)
-        _env_set(cfg.grid_env, "MIND_AB_SPLIT", str(AB_SPLIT))
-        _restart_relay(local_run)
-    return block
+    if dry_run:
+        return block, "ok"
+    _env_set(cfg.grid_env, "MIND_LLM_CANDIDATE", candidate)
+    _env_set(cfg.grid_env, "MIND_AB_SPLIT", str(AB_SPLIT))
+    return block, _restart_relay(local_run)
 
 
-def end_ab(cfg: WeeklyConfig, *, local_run, dry_run: bool = False) -> None:
-    """Clear the candidate split (win/loss/inconclusive-at-max/stuck/abort all land here)."""
-    if not dry_run:
-        _env_set(cfg.grid_env, "MIND_LLM_CANDIDATE", "")
-        _restart_relay(local_run)
+def end_ab(cfg: WeeklyConfig, *, local_run, dry_run: bool = False) -> str:
+    """Clear the candidate split (win/loss/inconclusive-at-max/stuck/abort all land here).
+
+    Returns the same "ok" / "flip_incomplete" outcome as `start_ab` (C2): a caller that
+    ignores it would record the A/B as closed even while the losing candidate keeps its
+    share of live traffic because the relay was never restarted.
+    """
+    if dry_run:
+        return "ok"
+    _env_set(cfg.grid_env, "MIND_LLM_CANDIDATE", "")
+    return _restart_relay(local_run)
 
 
 def _iso_week() -> str:
@@ -332,13 +361,21 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
         # (spec §8) — no candidate discovery, no key check, no probes.
         arms = ab_arms(cfg.verdicts_dir, since_ts=state["since_ts"], incumbent=state["incumbent"], candidate=state["candidate"])
         verdict, reason = ab_decide(arms, incumbent=state["incumbent"], candidate=state["candidate"])
-        block = {"binding": True, **state["started_row"]["evals"]["colony_ab"], "arms": arms, "weeks": state["weeks"] + 1, "winner": None}
+        # I3: an ab_started row with no evals (e.g. hand-edited, or a future writer that
+        # omits it) must not KeyError here.
+        started_ab = (state["started_row"].get("evals") or {}).get("colony_ab") or {}
+        block = {**started_ab, "binding": True, "arms": arms, "weeks": state["weeks"] + 1, "winner": None}
         common = dict(week=week, base="", run="", grid_examples={}, verdict_window=_window(cfg.verdicts_dir), rogue_ledger_ts=0.0,
                       adapter_sha256="", gguf_sha256="", set_manifest_sha256="", spend_usd=0.0)
         if verdict == "inconclusive" and state["weeks"] + 1 >= MAX_WEEKS:
-            end_ab(cfg, local_run=local_run, dry_run=dry_run)
-            row = release_row(decision="held", version=state["candidate"], previous=released, evals={"colony_ab": block},
-                              reason=f"colony A/B inconclusive after {MAX_WEEKS} weeks: {reason}", **common)
+            outcome = end_ab(cfg, local_run=local_run, dry_run=dry_run)
+            base_reason = f"colony A/B inconclusive after {MAX_WEEKS} weeks: {reason}"
+            if outcome == "ok":
+                decision, why = "held", base_reason
+            else:
+                decision, why = "flip_incomplete", f"{base_reason}; relay restart failed clearing the A/B"
+            row = release_row(decision=decision, version=state["candidate"], previous=released, evals={"colony_ab": block},
+                              reason=why, **common)
         elif verdict == "inconclusive":
             row = release_row(decision="ab_inconclusive", version=state["candidate"], previous=released,
                               evals={"colony_ab": block}, reason=reason, **common)
@@ -354,9 +391,13 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
             row = release_row(decision=decision, version=state["candidate"], previous=released,
                               evals={"colony_ab": block}, reason=why, **common)
         else:
-            end_ab(cfg, local_run=local_run, dry_run=dry_run)
-            row = release_row(decision="held", version=state["candidate"], previous=released,
-                              evals={"colony_ab": block}, reason=reason, **common)
+            outcome = end_ab(cfg, local_run=local_run, dry_run=dry_run)
+            if outcome == "ok":
+                decision, why = "held", reason
+            else:
+                decision, why = "flip_incomplete", f"{reason}; relay restart failed clearing the A/B"
+            row = release_row(decision=decision, version=state["candidate"], previous=released,
+                              evals={"colony_ab": block}, reason=why, **common)
         return _ledger(versions, row, dry_run=dry_run)
     cand = find_candidate(remote, cfg)
     common = dict(week=week, base=(cand or {}).get("manifest", {}).get("base", ""), run=(cand or {}).get("run", ""),
@@ -402,8 +443,14 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
     if decision == "released":
         # spec §8: probes passed, but a release is now a binding colony A/B, not a flip.
         incumbent = _env_get(cfg.grid_env, "MIND_MODEL_ALIAS") or released
-        evals["colony_ab"] = start_ab(cfg, candidate=cand["tag"], incumbent=incumbent, local_run=local_run, dry_run=dry_run)
-        decision, reason = "ab_started", "probes passed; colony A/B started"
+        block, outcome = start_ab(cfg, candidate=cand["tag"], incumbent=incumbent, local_run=local_run, dry_run=dry_run)
+        evals["colony_ab"] = block
+        if outcome == "ok":
+            decision, reason = "ab_started", "probes passed; colony A/B started"
+        else:
+            # C2: the candidate's arm never ran, so it must not be recorded as started --
+            # otherwise ab_check would falsely declare it stuck 48h later and block it.
+            decision, reason = "flip_incomplete", "probes passed but the relay restart failed twice starting the colony A/B"
     row = release_row(decision=decision, version=cand["tag"], previous=released, evals=evals, spend_usd=spend, reason=reason, **h, **common)
     return _ledger(versions, row, dry_run=dry_run)
 
@@ -433,13 +480,19 @@ def ab_check(cfg: WeeklyConfig, *, now_ms: int | None = None, local_run, dry_run
     arms = ab_arms(cfg.verdicts_dir, since_ts=state["since_ts"], incumbent=state["incumbent"], candidate=state["candidate"])
     if not is_stuck(arms, since_ts=state["since_ts"], now_ms=now, incumbent=state["incumbent"], candidate=state["candidate"]):
         return None
-    end_ab(cfg, local_run=local_run, dry_run=dry_run)
-    block = {"binding": True, **state["started_row"]["evals"]["colony_ab"], "arms": arms, "weeks": state["weeks"], "winner": None}
+    outcome = end_ab(cfg, local_run=local_run, dry_run=dry_run)
+    started_ab = (state["started_row"].get("evals") or {}).get("colony_ab") or {}   # I3
+    block = {**started_ab, "binding": True, "arms": arms, "weeks": state["weeks"], "winner": None}
     last = versions.last_released()
-    row = release_row(week=_iso_week(), decision="held", version=state["candidate"], previous=last["version"] if last else None,
+    base_reason = f"colony A/B stuck: candidate 0 settled in 48h (incumbent {arms[state['incumbent']]['settled']})"
+    if outcome == "ok":
+        decision, reason = "held", base_reason
+    else:
+        decision, reason = "flip_incomplete", f"{base_reason}; relay restart failed clearing the A/B"
+    row = release_row(week=_iso_week(), decision=decision, version=state["candidate"], previous=last["version"] if last else None,
                       base="", run="", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={},
                       verdict_window=_window(cfg.verdicts_dir), evals={"colony_ab": block}, spend_usd=0.0, rogue_ledger_ts=0.0,
-                      reason=f"colony A/B stuck: candidate 0 settled in 48h (incumbent {arms[state['incumbent']]['settled']})")
+                      reason=reason)
     return _ledger(versions, row, dry_run=dry_run)
 
 
@@ -471,7 +524,10 @@ def rollback(cfg: WeeklyConfig, remote, *, to: str | None = None, local_run, dry
         target = next((r for r in versions.rows() if r["decision"] == "released" and r["version"] == to), None)
     if target is None:
         raise SystemExit(f"{to or 'the previous release'} was never released; refusing")
-    end_ab(cfg, local_run=local_run, dry_run=dry_run)
+    # I1: only a running A/B needs ending -- otherwise this doubles the relay restart
+    # and appends a spurious empty MIND_LLM_CANDIDATE= line on every rollback.
+    if _env_get(cfg.grid_env, "MIND_LLM_CANDIDATE"):
+        end_ab(cfg, local_run=local_run, dry_run=dry_run)
     outcome = flip(cfg, remote, target["version"], local_run=local_run, dry_run=dry_run)
     decision = "rolled_back" if outcome == "ok" else outcome
     row = release_row(week=_iso_week(), decision=decision if decision in ("rolled_back", "flip_incomplete") else "held",
@@ -493,9 +549,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--week", default=None)
     ap.add_argument("--to", default=None)
-    ap.add_argument("--abort", action="store_true")
-    ap.add_argument("--check", action="store_true")
-    ap.add_argument("--forget", default=None, metavar="TAG")
+    ab_mode = ap.add_mutually_exclusive_group()
+    ab_mode.add_argument("--abort", action="store_true")
+    ab_mode.add_argument("--check", action="store_true")
+    ab_mode.add_argument("--forget", default=None, metavar="TAG")
     a = ap.parse_args(argv)
     cfg = WeeklyConfig.from_env()
     cfg.releases_dir.mkdir(parents=True, exist_ok=True)
@@ -513,13 +570,18 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(row, default=str)); return 0
         if a.abort:
             state = ab_state(versions)
-            candidate = state["candidate"] if state else None
-            end_ab(cfg, local_run=local_run, dry_run=a.dry_run)
+            if state is None:                                    # I4: mirror --check's guard
+                print("no A/B running"); return 0
+            outcome = end_ab(cfg, local_run=local_run, dry_run=a.dry_run)
             last = versions.last_released()
-            row = release_row(week=_iso_week(), decision="held", version=candidate, previous=last["version"] if last else None,
+            if outcome == "ok":
+                decision, reason = "held", "colony A/B aborted by operator"
+            else:
+                decision, reason = "flip_incomplete", "colony A/B abort requested but the relay restart failed"
+            row = release_row(week=_iso_week(), decision=decision, version=state["candidate"], previous=last["version"] if last else None,
                               base="", run="", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={},
                               verdict_window=_window(cfg.verdicts_dir), evals={}, spend_usd=0.0, rogue_ledger_ts=0.0,
-                              reason="colony A/B aborted by operator")
+                              reason=reason)
             row = _ledger(versions, row, dry_run=a.dry_run)
             print(json.dumps(row, default=str)); return 0
         if a.check:

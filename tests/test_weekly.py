@@ -95,14 +95,21 @@ def test_colony_ab_reports_births_per_proposal_by_alias(tmp_path):
 
 def test_flip_order_and_revert_on_failed_tag_copy(tmp_path):
     cfg = _cfg(tmp_path); local = []
+    # C1: a stray candidate must survive a failed flip (the relay is never restarted, so
+    # it keeps running whatever it last loaded) rather than being cleared with no way back.
+    (tmp_path / "grid.env").write_text("MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_MODEL=kannaka-brain-current\nMIND_LLM_CANDIDATE=kannaka-brain-v9\n")
     r = FakeRemote({}, fail={"ollama cp"})
     assert flip(cfg, r, "kannaka-brain-v4", local_run=lambda cmd: local.append(cmd) or 0) == "flip_failed"
-    assert "MIND_MODEL_ALIAS=kannaka-brain-v3" in (tmp_path / "grid.env").read_text()   # reverted
+    env = (tmp_path / "grid.env").read_text()
+    assert "MIND_MODEL_ALIAS=kannaka-brain-v3" in env   # reverted
+    assert "MIND_LLM_CANDIDATE=kannaka-brain-v9" in env   # C1: restored, not left cleared
     assert local == []                                                                   # relay never restarted
     r = FakeRemote({})
     assert flip(cfg, r, "kannaka-brain-v4", local_run=lambda cmd: local.append(cmd) or 0) == "ok"
     assert r.commands == ["ollama cp kannaka-brain-v4 kannaka-brain-current"]
-    assert "MIND_MODEL_ALIAS=kannaka-brain-v4" in (tmp_path / "grid.env").read_text()
+    env = (tmp_path / "grid.env").read_text()
+    assert "MIND_MODEL_ALIAS=kannaka-brain-v4" in env
+    assert "MIND_LLM_CANDIDATE=kannaka-brain-v9" not in env   # a successful flip still clears it
     assert local == [["sudo", "-n", "systemctl", "restart", "grid-odin.service"]]
 
 
@@ -290,6 +297,10 @@ def test_ab_state_and_lost_tags(tmp_path):
     assert ab_state(v) is None and lost_tags(v) == {"v4"}
     v.append(release_row(week="W5", decision="held", version="v5", previous="v3", evals={}, reason="colony A/B stuck: candidate 0 settled in 48h (incumbent 60)", **kw))
     assert lost_tags(v) == {"v4", "v5"}
+    # Controller ruling (livelock): a tag that never reached sample size in MAX_WEEKS is
+    # blocked too, or the gate would re-run the same undersampled candidate every week.
+    v.append(release_row(week="W6", decision="held", version="v6", previous="v3", evals={}, reason="colony A/B inconclusive after 2 weeks: sample 40/120 below 100 per arm", **kw))
+    assert lost_tags(v) == {"v4", "v5", "v6"}
 
 
 def test_is_stuck_rule():
@@ -318,7 +329,7 @@ async def test_release_starts_an_ab_instead_of_flipping(tmp_path):
     assert ab["candidate"] == "kannaka-brain-v4" and ab["incumbent"] == "kannaka-brain-v3" and ab["since_ts"] > 0
 
 
-async def _run_ab_week(tmp_path, *, inc_rep, cand_rep, n_cand=110):
+async def _run_ab_week(tmp_path, *, inc_rep, cand_rep, n_cand=110, local_run=None):
     cfg = _cfg(tmp_path); v = tmp_path / "v"
     from grid.versions import Versions, release_row
     since = 1_000_000_000
@@ -331,8 +342,10 @@ async def _run_ab_week(tmp_path, *, inc_rep, cand_rep, n_cand=110):
     r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
                     "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
     restarts = []
+    if local_run is None:
+        local_run = lambda c: restarts.append(c) or 0
     async def never(p): raise AssertionError("probes must not run during an A/B week")
-    row = await release(cfg, r, ask_factory=lambda m: never, local_run=lambda c: restarts.append(c) or 0, week="W2")
+    row = await release(cfg, r, ask_factory=lambda m: never, local_run=local_run, week="W2")
     return row, r, (tmp_path / "grid.env").read_text(), restarts
 
 
@@ -408,3 +421,142 @@ async def test_dry_run_ab_writes_nothing(tmp_path):
     assert row["decision"] == "ab_started" and (tmp_path / "grid.env").read_text() == before
     from grid.versions import Versions
     assert Versions(cfg.releases_dir / "versions.jsonl").rows() == []
+
+
+# ---- Fix round 1: reviewer findings on the two-stage gate ----
+
+def test_restart_relay_retries_once_with_noninteractive_sudo():
+    from grid.weekly import _restart_relay
+    calls = []
+    assert _restart_relay(lambda c: calls.append(c) or 0) == "ok"
+    assert calls == [["sudo", "-n", "systemctl", "restart", "grid-odin.service"]]
+    calls.clear()
+    assert _restart_relay(lambda c: calls.append(c) or 1) == "flip_incomplete"
+    assert calls == [["sudo", "-n", "systemctl", "restart", "grid-odin.service"]] * 2   # I2/C2: retried once, like flip()
+
+
+async def test_release_start_ab_records_flip_incomplete_when_relay_restart_fails(tmp_path):
+    # C2: if the restart fails after a START, the candidate arm never runs and must not
+    # be recorded as `ab_started` -- otherwise ab_check would falsely call it stuck 48h
+    # later and permanently block it via lost_tags.
+    cfg = _cfg(tmp_path); _seed_one_proposal(tmp_path / "v")
+    r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
+                    "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
+    async def her(p): return '["harvest", "nop", "fork"]' if "Instruction set" in p else "I am Kannaka."
+    row = await release(cfg, r, ask_factory=lambda m: her, local_run=lambda c: 1, week="W1")
+    assert row["decision"] == "flip_incomplete"
+    assert "relay restart failed" in row["reason"]
+    env = (tmp_path / "grid.env").read_text()
+    assert "MIND_LLM_CANDIDATE=kannaka-brain-v4" in env   # the env write happened; only the restart failed
+    from grid.versions import Versions
+    assert ab_state(Versions(cfg.releases_dir / "versions.jsonl")) is None   # not left "running"
+
+
+async def test_ab_loss_records_flip_incomplete_when_relay_restart_fails(tmp_path):
+    # C2: if the restart fails after a LOSS, the losing candidate must not be reported as
+    # cleanly `held` -- the relay may still be splitting traffic to it.
+    row, r, env, restarts = await _run_ab_week(tmp_path, inc_rep=30, cand_rep=10, local_run=lambda c: 1)
+    assert row["decision"] == "flip_incomplete"
+    assert "colony A/B lost" in row["reason"] and "relay restart failed" in row["reason"]
+    assert "MIND_LLM_CANDIDATE=kannaka-brain-v4" not in env   # the candidate line is still cleared...
+    assert "MIND_MODEL_ALIAS=kannaka-brain-v3" in env         # ...but the row says the restart failed
+
+
+async def test_rollback_with_no_candidate_restarts_relay_once(tmp_path):
+    # I1: rollback must not call end_ab when no A/B is running -- that would double the
+    # relay restart and append a second, duplicate MIND_LLM_CANDIDATE= line every time.
+    cfg = _cfg(tmp_path)
+    from grid.versions import Versions, release_row
+    v = Versions(cfg.releases_dir / "versions.jsonl")
+    kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={}, verdict_window={}, evals={}, spend_usd=0, rogue_ledger_ts=0, reason="")
+    v.append(release_row(week="W1", decision="released", version="kannaka-brain-v3", previous=None, **kw))
+    v.append(release_row(week="W2", decision="released", version="kannaka-brain-v4", previous="kannaka-brain-v3", **kw))
+    restarts = []
+    row = rollback(cfg, FakeRemote({}), local_run=lambda cmd: restarts.append(cmd) or 0)
+    assert row["decision"] == "rolled_back"
+    assert restarts == [["sudo", "-n", "systemctl", "restart", "grid-odin.service"]]   # exactly one: the flip's
+    # flip() itself always clears the candidate line as part of its own write (C1); I1 is
+    # only about *rollback* not separately calling end_ab (which would double the restart
+    # and append a second, duplicate line) when no A/B was running.
+    env = (tmp_path / "grid.env").read_text()
+    assert env.count("MIND_LLM_CANDIDATE=") == 1
+
+
+async def test_release_guards_empty_evals_on_ab_started_row(tmp_path):
+    # I3: an ab_started row written with no evals (hand-edited, or a future writer that
+    # omits it) must not KeyError release() out of existence.
+    cfg = _cfg(tmp_path); v = tmp_path / "v"
+    from grid.versions import Versions, release_row
+    vs = Versions(cfg.releases_dir / "versions.jsonl")
+    kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0)
+    vs.append(release_row(week="W1", decision="ab_started", version="kannaka-brain-v4", previous="kannaka-brain-v3", evals={}, reason="", **kw))
+    vs.append(release_row(week="W2", decision="ab_inconclusive", version="kannaka-brain-v4", previous="kannaka-brain-v3", evals={}, reason="", **kw))
+    r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
+                    "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
+    async def never(p): raise AssertionError
+    row = await release(cfg, r, ask_factory=lambda m: never, local_run=lambda c: 0, week="W3")
+    assert row["decision"] == "held"   # MAX_WEEKS reached, not a KeyError
+
+
+async def test_ab_verdict_block_always_binding_true_even_if_seed_says_otherwise(tmp_path):
+    # Minor: the merge order must let `binding: True` win over anything inherited from the
+    # started row's own colony_ab dict, not the other way around.
+    cfg = _cfg(tmp_path); v = tmp_path / "v"; since = 1_000_000_000
+    from grid.versions import Versions, release_row
+    vs = Versions(cfg.releases_dir / "versions.jsonl")
+    kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0)
+    vs.append(release_row(week="W1", decision="ab_started", version="kannaka-brain-v4", previous="kannaka-brain-v3",
+                          evals={"colony_ab": {"candidate": "kannaka-brain-v4", "incumbent": "kannaka-brain-v3", "split": 0.2,
+                                               "since_ts": since, "binding": False}},
+                          reason="", **kw))
+    _seed_ab(v, since_ts=since, inc_rep=30, cand_rep=20, n_cand=50)   # undersampled -> inconclusive, A/B stays open
+    r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
+                    "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
+    async def never(p): raise AssertionError
+    row = await release(cfg, r, ask_factory=lambda m: never, local_run=lambda c: 0, week="W2")
+    assert row["decision"] == "ab_inconclusive"
+    assert row["evals"]["colony_ab"]["binding"] is True
+
+
+async def test_release_is_unchanged_when_candidate_already_released_and_no_ab(tmp_path):
+    # I5: end-to-end `unchanged` coverage -- lost when the old probe-then-flip test's
+    # third call was rewritten to hit the new A/B-verdict branch instead.
+    cfg = _cfg(tmp_path)
+    from grid.versions import Versions, release_row
+    v = Versions(cfg.releases_dir / "versions.jsonl")
+    kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={}, verdict_window={}, evals={}, spend_usd=0, rogue_ledger_ts=0, reason="")
+    v.append(release_row(week="W1", decision="released", version="kannaka-brain-v4", previous=None, **kw))
+    r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
+                    "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
+    async def never(p): raise AssertionError("no probes for an already-released candidate")
+    row = await release(cfg, r, ask_factory=lambda m: never, local_run=lambda c: 0, week="W2")
+    assert row["decision"] == "unchanged"
+
+
+def test_ab_cli_no_ab_running_guards(tmp_path, monkeypatch, capsys):
+    # I4: `ab --abort` with nothing running must mirror `--check`'s guard exactly -- print,
+    # exit 0, and touch nothing (no env write, no restart, no ledger row).
+    from grid.weekly import main
+    grid_env = tmp_path / "grid.env"
+    grid_env.write_text("MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_MODEL=kannaka-brain-current\n")
+    monkeypatch.setenv("RELEASES_DIR", str(tmp_path / "releases"))
+    monkeypatch.setenv("VERDICTS_DIR", str(tmp_path / "v"))
+    monkeypatch.setenv("GRID_ENV", str(grid_env))
+    monkeypatch.setenv("DEBAIN2_HOST", "debain2")
+    before = grid_env.read_text()
+
+    assert main(["ab", "--check"]) == 0
+    assert "no A/B running" in capsys.readouterr().out
+    assert main(["ab", "--abort"]) == 0
+    assert "no A/B running" in capsys.readouterr().out
+
+    assert grid_env.read_text() == before
+    from grid.versions import Versions
+    assert Versions(tmp_path / "releases" / "versions.jsonl").rows() == []
+
+
+def test_ab_cli_rejects_combined_flags():
+    # Minor: --abort/--check/--forget are mutually exclusive.
+    from grid.weekly import main
+    with pytest.raises(SystemExit):
+        main(["ab", "--abort", "--check"])
