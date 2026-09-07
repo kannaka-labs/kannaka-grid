@@ -4,3 +4,10 @@
 deploy/systemd/* text eol=lf
 deploy/*.example text eol=lf
 *.ps1 text eol=crlf
+
+# Prompt-variant templates are integrity-checked against a sha256 recorded in
+# grid/data/prompt_variants.json; a Windows checkout with core.autocrlf=true
+# would otherwise rewrite them to CRLF and make the fail-closed loader raise
+# VariantError for a line-ending change instead of a real edit.
+grid/data/prompts/*.md text eol=lf
+grid/data/prompt_variants.json text eol=lf
