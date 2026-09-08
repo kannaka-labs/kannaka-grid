@@ -67,6 +67,36 @@ def _dimension_env(dimension: str) -> dict[str, str]:
     return _DIMENSION_ENV[dimension]
 
 
+def _validate_candidate(dimension: str, name: str) -> None:
+    """Refuse a candidate name this dimension cannot serve, before anything writes it.
+
+    This is a production hazard, not tidiness. The gate writes the candidate into grid.env and
+    restarts grid-odin; odin's variant loader fails CLOSED, so a name the registry does not hold
+    takes the relay down at boot and keeps it down -- systemd restarts it into the same refusal
+    until it hits the start limit and gives up. The colony's mind is then off for a week over a
+    typed character, and the revert paths in `start_ab` cannot argue it back up, because the file
+    they restore is not what the failing process is reading.
+
+    Deliberately NOT the same guard as `candidate == incumbent`: that one refuses a name the
+    registry holds perfectly well, and this one refuses a name it has never heard of. Each is
+    silent about the other's case, so both are checked.
+
+    `model` is exempt and not by omission. A model tag is not in any registry the gate can read
+    -- it lives on debain2, in ollama -- and `find_candidate` reads a tag Rogue actually promoted
+    rather than one somebody typed. A dimension in the allowlist with no rule here is refused
+    outright, the same fail-closed direction `_dimension_env` takes: an unverified name written
+    into grid.env is exactly the failure this function exists to prevent.
+    """
+    _dimension_env(dimension)                 # unknown dimension first, same refusal as everywhere
+    if dimension == UNSALTED_DIMENSION:
+        return
+    if dimension == "prompt":
+        get_variant(name)                     # VariantError (a ValueError) names the offending id
+        return
+    raise ValueError(f"grid.weekly has no candidate check for dimension {dimension!r}; refusing "
+                     "to write a name the relay may refuse at boot")
+
+
 @dataclass(frozen=True)
 class WeeklyConfig:
     debain2_host: str
@@ -690,6 +720,11 @@ def start_ab(cfg: WeeklyConfig, *, candidate: str, incumbent: str, dimension: st
     if candidate == incumbent:
         raise ValueError(f"{dimension} A/B candidate and incumbent are both {candidate!r}; "
                          "odin refuses that at boot, so starting it would leave the relay down")
+    # ...and the other half of the same fatality: a name the registry does not hold at all. The
+    # CLI checks this too, before it accepts the argument, because the CLI is not the only caller
+    # -- but the check belongs HERE as well, at the last statement before the write, since this is
+    # the function that puts the name in grid.env and restarts the relay onto it.
+    _validate_candidate(dimension, candidate)
     since = now_ms if now_ms is not None else int(time.time() * 1000)
     block = {"binding": True, "candidate": candidate, "incumbent": incumbent, "split": AB_SPLIT, "since_ts": since,
              "min_sample": MIN_SAMPLE, "tolerance": TOLERANCE, "weeks": 0, "arms": {}, "winner": None}
@@ -1190,12 +1225,25 @@ ENV_AB_NOTE = ("env-only A/B: no ab_started row, so the window start is unknown;
                "arms cover all recorded history")
 
 
-def _env_ab_view(cfg: WeeklyConfig, candidate: str) -> dict:
+def _env_ab_view(cfg: WeeklyConfig, candidate: str, *, dimension: str = UNSALTED_DIMENSION) -> dict:
     """I4: spec §7's receipt hand-starts an A/B by editing grid.env, so it has no ledger row
     at all. Report it anyway rather than printing `null` at an operator who can see the split
-    running -- with arms over ALL history, since there is no since_ts to window on."""
-    incumbent = _env_get(cfg.grid_env, "MIND_MODEL_ALIAS") or ""
-    arms = ab_arms(cfg.verdicts_dir, since_ts=0, incumbent=incumbent, candidate=candidate)
+    running -- with arms over ALL history, since there is no since_ts to window on.
+
+    Dimensioned throughout: the split line it quotes, the incumbent it names and the arms it
+    counts. Read undimensioned, a hand-started PROMPT split would be reported with the model
+    alias as its incumbent and the model's per-alias tallies as its arms -- the wrong
+    dimension's numbers, in the one view an operator reads when they cannot tell what is
+    running, which is precisely when they cannot check them.
+
+    The incumbent comes from `_live_arm`, not from the raw line: for `prompt` an absent
+    MIND_PROMPT_VARIANT means the registry default, and that is the label the proposal log
+    files rows under, so the raw (empty) line would name an arm that counts nothing.
+    """
+    keys = _dimension_env(dimension)
+    incumbent = _live_arm(cfg, dimension) or ""
+    arms = ab_arms(cfg.verdicts_dir, since_ts=0, incumbent=incumbent, candidate=candidate,
+                   dimension=dimension)
     # N7: ab_arms keys on `str(row.get("model_alias", ""))`, so an empty incumbent would collect
     # every unattributed verdict row and report the total as the incumbent's. Drop that arm
     # instead of publishing a number that is not a model's, in the one view an operator reads
@@ -1203,20 +1251,58 @@ def _env_ab_view(cfg: WeeklyConfig, candidate: str) -> dict:
     if not incumbent:
         arms.pop("", None)
     return {"source": "env", "candidate": candidate, "incumbent": incumbent or None,
-            "split": _env_get(cfg.grid_env, "MIND_AB_SPLIT") or str(AB_SPLIT),
+            "split": _env_get(cfg.grid_env, keys["split"]) or str(AB_SPLIT),
             "arms": arms, "note": ENV_AB_NOTE}
 
 
-def _ab_snapshot(cfg: WeeklyConfig, state: dict | None, candidate: str) -> dict:
+def _ab_snapshot(cfg: WeeklyConfig, state: dict | None, candidate: str, *,
+                 dimension: str = UNSALTED_DIMENSION) -> dict:
     """The `colony_ab` block an abort records: what the arms actually showed when the operator
     pulled the plug. Without it the row says only that someone aborted, and the week's numbers
     -- the only reason to abort -- are gone."""
     if state is None:
-        return {**_env_ab_view(cfg, candidate), "binding": False, "winner": None}
+        return {**_env_ab_view(cfg, candidate, dimension=dimension), "binding": False, "winner": None}
     started_ab = (state["started_row"].get("evals") or {}).get("colony_ab") or {}
-    arms = ab_arms(cfg.verdicts_dir, since_ts=state["since_ts"],
-                   incumbent=state["incumbent"], candidate=state["candidate"])
+    arms = ab_arms(cfg.verdicts_dir, since_ts=state["since_ts"], incumbent=state["incumbent"],
+                   candidate=state["candidate"], dimension=dimension)
     return {**started_ab, "binding": True, "arms": arms, "weeks": state["weeks"], "winner": None}
+
+
+def _ab_view(cfg: WeeklyConfig, versions: Versions, dimension: str) -> dict | None:
+    """What `ab` prints for ONE dimension: the ledger's A/B with its arms, the env-only view
+    when the ledger has none, or None when nothing is running in this dimension at all.
+
+    Self-contained -- the arms sit inside the entry rather than beside it -- because with no
+    `--dimension` the command prints one of these per dimension, and a sibling `arms` key could
+    then only belong to one of them.
+    """
+    state = ab_state(versions, dimension=dimension)
+    if state is None:
+        env_candidate = _env_get(cfg.grid_env, _dimension_env(dimension)["candidate"])
+        return _env_ab_view(cfg, env_candidate, dimension=dimension) if env_candidate else None
+    arms = ab_arms(cfg.verdicts_dir, since_ts=state["since_ts"], incumbent=state["incumbent"],
+                   candidate=state["candidate"], dimension=dimension)
+    return {**state, "arms": arms}
+
+
+def _blocking_experiments(versions: Versions, dimension: str) -> list[tuple[str, str]]:
+    """Every OTHER dimension with an A/B open right now, as (dimension, candidate).
+
+    The interlock's evidence. Two experiments splitting live traffic at once do not merely
+    crowd each other: a model verdict collected while a prompt A/B is running was measured
+    across two different wordings, and a prompt verdict collected during a model A/B across
+    two different sets of weights. Either is recorded as BINDING -- it flips the alias, or
+    blacklists the loser for good -- so a confounded week is not a slow week, it is a
+    confident wrong answer written into an append-only file.
+    """
+    open_elsewhere = []
+    for other in sorted(DIMENSIONS):
+        if other == dimension:
+            continue
+        state = ab_state(versions, dimension=other)
+        if state is not None:
+            open_elsewhere.append((other, str(state["candidate"])))
+    return open_elsewhere
 
 
 def _exit_code(row: dict) -> int:
@@ -1240,11 +1326,25 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--week", default=None)
     ap.add_argument("--to", default=None)
+    # ONE allowlist, odin's, for the relay's arm assignment, the ledger's rows and this parser
+    # alike: `choices` is DIMENSIONS itself, so a name odin does not know cannot be typed here
+    # and a dimension it gains needs no edit in this file.
+    #
+    # The default is None rather than "model" because omitting the flag means two different
+    # things. `release` and `rollback` act on exactly one experiment, and default to `model` --
+    # which is what the systemd unit's bare `grid.weekly release` has always meant. `ab --check`
+    # and `ab`'s display are OBSERVERS: a dead prompt A/B and a healthy model one are independent
+    # facts and the nightly must see both, so omitting the flag there means every dimension.
+    ap.add_argument("--dimension", choices=sorted(DIMENSIONS), default=None)
+    # The challenger, for a dimension that has no discovery of its own. `model` reads Rogue's
+    # promotion state and refuses one; `prompt` has nothing to read and requires one.
+    ap.add_argument("--candidate", default=None, metavar="NAME")
     ab_mode = ap.add_mutually_exclusive_group()
     ab_mode.add_argument("--abort", action="store_true")
     ab_mode.add_argument("--check", action="store_true")
     ab_mode.add_argument("--forget", default=None, metavar="TAG")
     a = ap.parse_args(argv)
+    dimension = a.dimension or UNSALTED_DIMENSION
     cfg = WeeklyConfig.from_env()
     cfg.releases_dir.mkdir(parents=True, exist_ok=True)
     remote = Remote(cfg.debain2_host, dry_run=a.dry_run, log=lambda s: log.info("%s", s))
@@ -1262,64 +1362,123 @@ def main(argv: list[str] | None = None) -> int:
     if a.verb == "ab":
         versions = Versions(cfg.releases_dir / "versions.jsonl")
         if a.forget:
-            row = ab_forget(cfg, a.forget, dry_run=a.dry_run)
+            # One dimension, defaulting to model: a forget is an operator UNDOING one recorded
+            # loss, and `lost_tags` reads it through the same dimension filter as the loss it
+            # undoes. "Forget everything, everywhere" is not a thing anyone means to type.
+            row = ab_forget(cfg, a.forget, dimension=dimension, dry_run=a.dry_run)
             print(json.dumps(row, default=str)); return 0
-        state = ab_state(versions)      # one read, shared by --abort, --check and the display
         if a.abort:
-            env_candidate = _env_get(cfg.grid_env, "MIND_LLM_CANDIDATE")
+            state = ab_state(versions, dimension=dimension)
+            env_candidate = _env_get(cfg.grid_env, _dimension_env(dimension)["candidate"])
             # N2: act when EITHER the ledger shows a running A/B OR the env still carries
             # a stray candidate with no ledger backing it (e.g. left behind by a start-path
             # restart failure before this fix) -- only "no A/B running" when both are absent.
             if state is None and not env_candidate:
                 print("no A/B running"); return 0
             candidate = state["candidate"] if state is not None else env_candidate
-            block = _ab_snapshot(cfg, state, candidate)
-            outcome = end_ab(cfg, local_run=local_run, dry_run=a.dry_run)
-            # C1: this row is written with the default dimension, so its `previous` must name a
-            # model release. Unfiltered, an abort after any prompt release stamps a prompt
-            # variant id onto a model row -- a falsehood in a file that can never be corrected.
-            last = _last_released(versions, dimension=UNSALTED_DIMENSION)
+            block = _ab_snapshot(cfg, state, candidate, dimension=dimension)
+            outcome = end_ab(cfg, dimension=dimension, local_run=local_run, dry_run=a.dry_run)
+            # C1: `previous` must name a release IN THE DIMENSION THIS ROW CLAIMS. Unfiltered,
+            # an abort after any prompt release stamps a prompt variant id onto a model row --
+            # a falsehood in a file that can never be corrected.
+            last = _last_released(versions, dimension=dimension)
             if outcome == "ok":
                 decision, reason = "held", "colony A/B aborted by operator"
             else:
                 decision, reason = "flip_incomplete", "colony A/B abort requested but the relay restart failed"
-            row = release_row(week=_iso_week(), decision=decision, version=candidate, previous=last["version"] if last else None,
+            row = release_row(week=_iso_week(), decision=decision, dimension=dimension, version=candidate,
+                              previous=last["version"] if last else None,
                               base="", run="", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={},
                               verdict_window=_window(cfg.verdicts_dir), evals={"colony_ab": block}, spend_usd=0.0,
                               rogue_ledger_ts=0.0, reason=reason)
             row = _ledger(versions, row, dry_run=a.dry_run)
             print(json.dumps(row, default=str))
             return _exit_code(row)          # N6: same contract as release and --check
+        dimensions = [a.dimension] if a.dimension else sorted(DIMENSIONS)
         if a.check:
             # N4: no `state is None` short-circuit -- ab_check's reconciler must run even when
             # the ledger shows no A/B, since that is exactly the state a standing
             # flip_incomplete leaves behind.
-            row = ab_check(cfg, local_run=local_run, dry_run=a.dry_run)
-            if row is None:
-                print("no A/B running" if state is None else "not stuck"); return 0
-            print(json.dumps(row, default=str))
+            #
+            # D: every open dimension, one at a time, and the LOUDEST exit code any of them
+            # produced. Run on `model` alone -- which is all this did before the flag existed --
+            # a wedged prompt experiment has no nightly at all: nothing reconciles it, nothing
+            # calls it stuck, and the unit goes on exiting 0 while a share of live traffic goes
+            # to a candidate the ledger closed. And a failure MUST NOT be masked: 0 from the
+            # dimension that was fine would say the night was fine.
+            rows, code = [], 0
+            for d in dimensions:
+                row = ab_check(cfg, dimension=d, local_run=local_run, dry_run=a.dry_run)
+                if row is not None:
+                    rows.append(row)
+                    code = max(code, _exit_code(row))
+            if not rows:
+                running = any(ab_state(versions, dimension=d) is not None for d in dimensions)
+                print("not stuck" if running else "no A/B running"); return 0
+            for row in rows:                # one JSON object per line: two dimensions can both act
+                print(json.dumps(row, default=str))
             # I1: this runs as grid-verdicts' ExecStartPost, where a non-zero exit marks the
             # nightly unit failed -- which is exactly right for `flip_incomplete`: the env now
             # says "no A/B" while the live relay is still splitting, and only an operator
             # restarting grid-odin closes that gap. Every other outcome is routine, hence 0.
-            return _exit_code(row)
-        if state is None:
-            env_candidate = _env_get(cfg.grid_env, "MIND_LLM_CANDIDATE")
-            print(json.dumps({"ab": _env_ab_view(cfg, env_candidate) if env_candidate else None}, default=str))
+            return code
+        if a.dimension:
+            print(json.dumps({"ab": _ab_view(cfg, versions, a.dimension)}, default=str))
         else:
-            arms = ab_arms(cfg.verdicts_dir, since_ts=state["since_ts"], incumbent=state["incumbent"], candidate=state["candidate"])
-            print(json.dumps({"ab": state, "arms": arms}, default=str))
+            print(json.dumps({"ab": {d: _ab_view(cfg, versions, d) for d in dimensions}}, default=str))
         return 0
-    key = cfg.key_file.read_text(encoding="utf-8").strip()
     if a.verb == "rollback":
+        if dimension != UNSALTED_DIMENSION:
+            # Nothing rolls back a prompt, and inventing it here would be worse than refusing:
+            # `rollback` copies a tag onto kannaka-brain-current on debain2 and writes the model
+            # alias, so run under another dimension it would point the live relay at a model that
+            # does not exist. The operator route is the forget plus an edit of the one env line.
+            raise SystemExit(f"there is no {dimension} rollback: that flip is a single grid.env "
+                             f"line, so set {_dimension_env(dimension)['live']} by hand and run "
+                             f"`grid.weekly ab --forget <name> --dimension {dimension}` to make "
+                             "the old value testable again")
         row = rollback(cfg, remote, to=a.to, local_run=local_run, dry_run=a.dry_run)
         print(json.dumps(row, default=str))
         return _exit_code(row)          # N6: same contract as release and --check
-    ask_factory = lambda model: (lambda prompt: chat(cfg.gateway_url, key, model, prompt, timeout_s=cfg.probe_timeout_s))
-    if a.dry_run:
-        async def fake(prompt): return "I am Kannaka. []"
-        ask_factory = lambda model: fake
-    row = asyncio.run(release(cfg, remote, ask_factory=ask_factory, local_run=local_run, week=a.week, dry_run=a.dry_run))
+    versions = Versions(cfg.releases_dir / "versions.jsonl")
+    # The interlock, and only on a Sunday that would START one: a dimension with its own A/B
+    # already open is being JUDGED today, and refusing that would leave both experiments running
+    # forever with nothing able to close either.
+    blocking = (_blocking_experiments(versions, dimension)
+                if ab_state(versions, dimension=dimension) is None else [])
+    if blocking:
+        # A RECORDED row, not a printed message. `unchanged` is the ledger's word for "the gate
+        # ran and moved nothing", and without the row a Sunday that did nothing is indistinguishable
+        # from a Sunday the timer never fired -- which is exactly the question an operator asks
+        # when they come back to an experiment that never started.
+        why = ("; ".join(f"{d} A/B already running ({c})" for d, c in blocking)
+               + f"; refusing to start a {dimension} experiment whose verdict it would confound")
+        last = _last_released(versions, dimension=dimension)
+        row = _ledger(versions, release_row(
+            week=a.week or _iso_week(), decision="unchanged", dimension=dimension, version=a.candidate,
+            previous=last["version"] if last else None, base="", run="", adapter_sha256="", gguf_sha256="",
+            set_manifest_sha256="", grid_examples={}, verdict_window=_window(cfg.verdicts_dir),
+            evals=_advisory_evals(cfg, dimension), spend_usd=0.0, rogue_ledger_ts=0.0, reason=why),
+            dry_run=a.dry_run)
+    else:
+        if dimension != UNSALTED_DIMENSION:
+            if not a.candidate:
+                ap.error(f"a {dimension} release needs --candidate; nothing discovers one")
+            try:
+                # Before the argument is accepted, and again in start_ab before it is written.
+                _validate_candidate(dimension, a.candidate)
+            except ValueError as e:
+                ap.error(str(e))
+        # Model-only: the key exists to authenticate the identity and validity PROBES at the
+        # gateway, and those measure weights. A prompt release runs none of them, so a host
+        # whose colony key is missing must not die reading a file this run never uses.
+        key = cfg.key_file.read_text(encoding="utf-8").strip() if dimension == UNSALTED_DIMENSION else ""
+        ask_factory = lambda model: (lambda prompt: chat(cfg.gateway_url, key, model, prompt, timeout_s=cfg.probe_timeout_s))
+        if a.dry_run:
+            async def fake(prompt): return "I am Kannaka. []"
+            ask_factory = lambda model: fake
+        row = asyncio.run(release(cfg, remote, ask_factory=ask_factory, local_run=local_run, week=a.week,
+                                  dry_run=a.dry_run, dimension=dimension, candidate=a.candidate))
     print(json.dumps({k: row[k] for k in ("week", "decision", "version", "previous", "reason", "spend_usd", "over_budget")}, default=str))
     return _exit_code(row)
 
