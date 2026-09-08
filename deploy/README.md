@@ -321,9 +321,10 @@ runs as `grid-verdicts.service`'s `ExecStartPost`, so a non-zero exit marks that
     failed twice, so the live relay is still splitting to a candidate the ledger has closed): run
     `sudo systemctl restart grid-odin.service` and check `journalctl -u grid-odin` for
     `A/B: none` — the nightly reconciler retries this, so the unit stays failed until it is
-    fixed. If the reason also ends `the relay did not come back and may be DOWN — restart
-    grid-odin.service`, the revert's own restart failed too: `grid.env` is correct and the unit
-    is not running, so the colony has no mind until you restart it.
+    fixed. If the reason also ends `the relay did not come back and may be DOWN -- restart
+    grid-odin.service` (two hyphens, as the gate writes it), the revert's own restart failed too:
+    `grid.env` is correct and the unit is not running, so the colony has no mind until you
+    restart it.
   - The reason ends `: flip_failed` (a `rollback` whose `ollama cp` failed, so the alias was never
     moved): check debain2's ollama and re-run it.
   - The row is `unchanged` and carries `"evals": {"unresolved": true}` — the gate found something

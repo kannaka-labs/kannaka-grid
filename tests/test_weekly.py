@@ -2870,9 +2870,19 @@ def _factorial_week(tmp_path, *, model_incumbent="m0", prompt_incumbent="p0"):
 
 
 async def _judge(cfg, tmp_path, dimension, week="W2"):
-    """Judge one leg. `week` is load-bearing: the partner's judging row bounds this leg only when
-    that row belongs to the SAME judging cycle, so a fixture that judges two legs must give them
-    one week, and a two-Sunday fixture must give them different ones."""
+    """Judge one leg. `week` is only the row's label here, and NOTHING reads it.
+
+    It used to say the opposite -- "`week` is load-bearing: the partner's judging row bounds this
+    leg only when that row belongs to the SAME judging cycle" -- which was the ISO-week proxy
+    Task 6 deleted. Whether the bound applies is decided by the two episodes' `judgings` counts
+    (`_judge_ab`), and the bound itself is the partner's `ts` and `verdict_window`. A fixture
+    therefore does NOT have to give two legs one week label, and giving a two-Sunday fixture
+    different ones proves nothing on its own -- which is exactly what
+    `test_the_bound_survives_the_calendar_rolling_over_between_the_two_legs` demonstrates by
+    running the second leg under a different ISO week and getting the same bound.
+
+    A docstring describing a deleted rule is how the rule gets reintroduced; this helper is
+    called by every factorial test, so it is the worst place in the suite for one."""
     async def never(p): raise AssertionError("probes must not run during an A/B week")
     return await release(cfg, FakeRemote({}), ask_factory=lambda m: never,
                          local_run=lambda c: 0, week=week, dimension=dimension)
@@ -4428,6 +4438,127 @@ def test_the_nightly_records_a_release_that_was_applied_and_never_written_down(t
     capsys.readouterr()
 
 
+def test_the_repair_records_the_version_it_proved_not_the_one_grid_env_is_splitting_to(tmp_path, monkeypatch, capsys):
+    # N1. `_unrecorded_release` proves its three facts of the standing `flip_incomplete`'s own
+    # version; `candidate` is `env_candidate or last["version"]`, i.e. whatever grid.env is
+    # splitting to. On the path C2 exists for those are the same tag -- a won flip clears the
+    # candidate line on its way through -- and they DIVERGE the moment a split is running beside
+    # the unrecorded flip. Written about `candidate`, the gate recorded `released
+    # kannaka-brain-v2` for a version that was never live, never won and was never flipped, into
+    # an append-only hash-chained file, at exit 0: `_last_released` moved onto it, `status` then
+    # lies, and `rollback`'s default target becomes v2's `previous`, SKIPPING the version
+    # actually in service. Worse than the silence it replaced, because a hash chain cannot be
+    # quietly corrected afterwards.
+    #
+    # The hand-set candidate is not exotic: hand-starting a split by editing grid.env is a
+    # documented flow with its own receipt in deploy/README.md, and re-testing a tag the gate has
+    # already A/B'd is the natural way an operator reaches it (it also has an `ab_started` row,
+    # so the reconciler's hand-start exemption does not fire).
+    #
+    # Mutation: `version=candidate` (and `"winner": candidate`) in ab_reconcile's row -> the row
+    # records kannaka-brain-v2 and `_last_released` returns v2 while the relay serves v4.
+    import grid.weekly as weekly_mod
+    from grid.versions import Versions
+    from grid.weekly import _last_released, main
+    grid_env = _ab_cli_env(tmp_path, monkeypatch,
+                           "MIND_MODEL_ALIAS=kannaka-brain-v4\n"
+                           "MIND_LLM_CANDIDATE=kannaka-brain-v2\nMIND_AB_SPLIT=0.2\n")
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v3", decision="released",
+                 previous="kannaka-brain-v2")
+    # An earlier, closed A/B on v2 -- so v2 has an `ab_started` row and the hand-start exemption
+    # is not what saves us here.
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v2", decision="ab_started",
+                 incumbent="kannaka-brain-v3")
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v2", decision="held",
+                 reason="colony A/B lost: 0.100 vs 0.200", short_arms=[])
+    # ...and the C2 state: v4 won, the alias copy applied it, the relay restart failed.
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v4", decision="ab_started",
+                 incumbent="kannaka-brain-v3")
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v4", decision="flip_incomplete",
+                 winner="kannaka-brain-v4", reason="alias serves the candidate; relay restart failed twice")
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)
+
+    assert main(["ab", "--check", "--dimension", "model"]) == 0
+    row = _last_row(tmp_path)
+    ab = row["evals"]["colony_ab"]
+    # The row is about the tag the proof is about, in every field that names a version.
+    assert row["decision"] == "released"
+    assert row["version"] == "kannaka-brain-v4" and ab["winner"] == "kannaka-brain-v4"
+    assert row["previous"] == "kannaka-brain-v3"
+    vs = Versions(tmp_path / "releases" / "versions.jsonl")
+    assert _last_released(vs, dimension="model")["version"] == "kannaka-brain-v4"
+    assert weekly_mod._env_get(grid_env, "MIND_MODEL_ALIAS") == "kannaka-brain-v4"   # ledger == world
+    # kannaka-brain-v2 is never recorded as released -- it was never live and never won.
+    assert "kannaka-brain-v2" not in {r["version"] for r in vs.rows() if r["decision"] == "released"}
+    # ...but the split it was taking IS cleared, and the row says both things rather than
+    # silently merging them. Mutation: drop the `candidate != recorded` clause -> the row records
+    # a release and says nothing about the traffic it just stopped.
+    assert ab["candidate"] == "kannaka-brain-v2"
+    assert "also carried a kannaka-brain-v2 split, now cleared" in row["reason"]
+    assert weekly_mod._env_get(grid_env, "MIND_LLM_CANDIDATE") == ""
+    capsys.readouterr()
+
+
+def test_a_repair_that_could_not_restart_the_relay_says_so_and_is_retried(tmp_path, monkeypatch, capsys):
+    # N3. The C2 state exists BECAUSE the relay would not restart, so a second failure on the
+    # night the reconciler first proves the unrecorded release is the likely continuation, not an
+    # exotic one. That night's row is `flip_incomplete` and records nothing -- correctly, since
+    # env and the live relay disagree about the very value it would record -- but it used to say
+    # "recording it now" while recording nothing (the self-contradicting row this wave fixed
+    # elsewhere) AND carry `winner: None`, which burned the marker: the next night read THAT row
+    # as `last`, found no winner, and returned False for ever after. The release was then lost
+    # permanently and `rollback` stayed bricked.
+    #
+    # Mutations, both run: `"winner": recorded if outcome == "ok" else None` -> night 2 writes a
+    # plain `held` and the release is never recorded; and restore the unconditional "recording it
+    # now" -> night 1's row claims a recording it did not make.
+    import grid.weekly as weekly_mod
+    from grid.versions import Versions
+    from grid.weekly import _last_released, main
+    grid_env = _ab_cli_env(tmp_path, monkeypatch,
+                           "MIND_MODEL_ALIAS=kannaka-brain-v4\nMIND_LLM_CANDIDATE=\n"
+                           "MIND_AB_SPLIT=0.2\n")
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v3", decision="released",
+                 previous="kannaka-brain-v2")
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v4", decision="ab_started",
+                 incumbent="kannaka-brain-v3")
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v4", decision="flip_incomplete",
+                 winner="kannaka-brain-v4", reason="alias serves the candidate; relay restart failed twice")
+    vs = Versions(tmp_path / "releases" / "versions.jsonl")
+
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 1)      # night 1: the relay is still down
+    assert main(["ab", "--check", "--dimension", "model"]) == 3
+    night1 = _last_row(tmp_path)
+    assert night1["decision"] == "flip_incomplete"
+    # It says plainly that nothing was recorded, and does NOT claim otherwise.
+    assert "the release is still NOT recorded" in night1["reason"]
+    assert "recording it now" not in night1["reason"]
+    assert _last_released(vs, dimension="model")["version"] == "kannaka-brain-v3"
+    # ...and it carries the proof forward, unchanged, so tomorrow can finish the job.
+    assert night1["version"] == "kannaka-brain-v4"
+    assert night1["evals"]["colony_ab"]["winner"] == "kannaka-brain-v4"
+    capsys.readouterr()
+
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)      # night 2: the relay is back
+    assert main(["ab", "--check", "--dimension", "model"]) == 0
+    night2 = _last_row(tmp_path)
+    assert night2["decision"] == "released" and night2["version"] == "kannaka-brain-v4"
+    assert "recording it now" in night2["reason"]
+    assert _last_released(vs, dimension="model")["version"] == "kannaka-brain-v4"
+    capsys.readouterr()
+
+    # Night 3 has nothing left to repair, and the emergency lever works and names v3.
+    assert main(["ab", "--check", "--dimension", "model"]) == 0
+    assert "no A/B running" in capsys.readouterr().out
+    monkeypatch.setattr(weekly_mod, "Remote", lambda *a, **k: FakeRemote({}))
+    assert main(["rollback"]) == 0
+    rolled = _last_row(tmp_path)
+    assert rolled["decision"] == "rolled_back" and rolled["version"] == "kannaka-brain-v3"
+    assert rolled["previous"] == "kannaka-brain-v4"
+    assert weekly_mod._env_get(grid_env, "MIND_MODEL_ALIAS") == "kannaka-brain-v3"
+    capsys.readouterr()
+
+
 def test_the_gate_is_never_quiet_while_the_ledger_and_the_world_disagree(tmp_path, monkeypatch, capsys):
     # C2's backstop, and the property the brief names: a state that is both wrong and silent is
     # worse than either alone. Before the nightly gets a chance to record it -- or if the live
@@ -4578,6 +4709,8 @@ def test_one_dimensions_registry_fault_does_not_silence_the_others_nightly(tmp_p
     # ...and the prompt fault is a row of its own rather than a traceback that ate the model's.
     assert by_dim["prompt"]["evals"][UNRESOLVED] is True
     assert "variant registry did not load" in by_dim["prompt"]["reason"]
+
+
 def test_a_broken_registry_does_not_block_the_prompt_reconcilers_repair(tmp_path, monkeypatch, capsys):
     # The reconciler is not a prompt reader, and after C2 it must not become one. Its
     # applied-but-unrecorded test asks whether the LIVE grid.env line is the winner; resolved

@@ -2088,28 +2088,57 @@ def ab_reconcile(cfg: WeeklyConfig, *, dimension: str = UNSALTED_DIMENSION, loca
                "ledger closed its A/B")
     last_rel = _last_released(versions, dimension=dimension)
     applied = _unrecorded_release(cfg, dimension, last, last_rel)
+    # N1: THE ROW MUST BE ABOUT THE VERSION THE PROOF IS ABOUT. `_unrecorded_release` proves its
+    # three facts of `last["version"]` -- the standing flip_incomplete's winner -- while
+    # `candidate` is `env_candidate or last["version"]`, i.e. whatever grid.env is splitting to.
+    # Those are the same tag on the path C2 exists for (a won flip clears the candidate line on
+    # its way through), and DIFFERENT the moment a split is running beside it: an operator
+    # re-testing a tag the gate has A/B'd before, which is a documented flow with its own
+    # receipt. Written about `candidate`, the gate recorded `released kannaka-brain-v2` -- a
+    # version that was never live, never won and was never flipped -- into an append-only,
+    # hash-chained file at exit 0, moved `_last_released` onto it, and left `rollback`'s default
+    # target skipping the version actually in service. That is worse than the silence it
+    # replaced, because a hash chain cannot be quietly corrected afterwards.
+    recorded = last["version"] if applied else None
     if applied:
         # C2, the half that actually CLOSES the gap rather than shouting about it. A won A/B whose
         # alias copy succeeded and whose relay restart did not leaves the release applied to the
         # world and absent from the ledger, and the reconciler is the one thing that runs nightly
         # and can see both. `_unrecorded_release` will only say yes to evidence that no other path
         # can produce, so this records a release that demonstrably happened -- it never invents one.
-        why = (f"colony A/B reconciled: {candidate} was flipped live but the relay restart failed, "
-               f"so the release was applied and never recorded; recording it now (was {last_rel['version']})")
+        why = (f"colony A/B reconciled: {recorded} was flipped live but the relay restart failed, "
+               f"so the release was applied and never recorded (last recorded release: "
+               f"{last_rel['version']})")
+        if candidate != recorded:
+            # Two facts, one row, and the row says both rather than silently merging them.
+            why = f"{why}; {cfg.grid_env.name} also carried a {candidate} split, now cleared"
     outcome = end_ab(cfg, dimension=dimension, local_run=local_run, dry_run=dry_run)
     if outcome != "ok":
         why = f"{why}; relay restart failed clearing the A/B"
-    # A repair that could not restart the relay is still `flip_incomplete` and is still retried
-    # tomorrow night -- including the recording, which must not be written on a run that left env
-    # and the live relay disagreeing about the very value it is recording.
-    decision = "flip_incomplete" if outcome != "ok" else ("released" if applied else "held")
-    row = release_row(week=_iso_week(), decision=decision,
-                      dimension=dimension, version=candidate, previous=last_rel["version"] if last_rel else None,
+    if applied and outcome == "ok":
+        decision, why = "released", f"{why}; recording it now"
+    elif applied:
+        # N3: the recording must NOT be written on a run that left env and the live relay
+        # disagreeing about the very value it records -- but the row must then say plainly that
+        # nothing was recorded, instead of claiming "recording it now" while recording nothing.
+        # That is the self-contradicting row this wave fixed elsewhere, three functions away.
+        #
+        # And it must stay RETRYABLE. `_unrecorded_release` reads the last decision row, which is
+        # about to be THIS one, so a `winner: None` here would burn the marker and lose the
+        # recording for good -- the C2 state exists *because* the relay would not restart, so a
+        # second failure tonight is the likely continuation, not an exotic one. Carrying the same
+        # `version` and `winner` forward keeps tomorrow night's proof intact.
+        decision = "flip_incomplete"
+        why = f"{why}; the release is still NOT recorded, and is retried on the next reconcile"
+    else:
+        decision = "held" if outcome == "ok" else "flip_incomplete"
+    row = release_row(week=_iso_week(), decision=decision, dimension=dimension,
+                      version=recorded if applied else candidate,
+                      previous=last_rel["version"] if last_rel else None,
                       base="", run="", adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
                       grid_examples={}, verdict_window=_window(cfg.verdicts_dir),
                       evals={"colony_ab": {"reconciled": True, "binding": False, "candidate": candidate,
-                                           "winner": candidate if applied and outcome == "ok" else None,
-                                           "short_arms": [],
+                                           "winner": recorded, "short_arms": [],
                                            "other_dimensions": _other_dimensions(cfg, versions, dimension)}},
                       spend_usd=0.0, rogue_ledger_ts=0.0, reason=why)
     return _ledger(versions, row, dry_run=dry_run)
