@@ -143,3 +143,198 @@ def test_doubled_literal_brace_renders_correctly(tmp_path):
     assert rendered == "Note: {escaped braces} around directive=GO"
     # sanity: load_registry validated this template without complaint
     load_registry(registry_path)
+
+
+# --- Fix round 1 -------------------------------------------------------
+#
+# I1: a template can pass the placeholder check and still fail to render.
+# load_registry now smoke-renders every template with dummy values so both
+# shapes below are load-time VariantErrors, not a runtime IndexError/KeyError
+# swallowed by the relay's poll loop.
+
+def test_load_registry_rejects_bare_positional_placeholder(tmp_path):
+    """A bare "{}" is auto-numbered, not a *named* field, so the placeholder
+    scan never sees it as unknown -- only a smoke-render catches it."""
+    from grid.variants import VariantError, load_registry
+    template_path = _write_template(tmp_path, "t.md", "hello {directive} {}")
+    entry = _valid_entry(template_path, tmp_path)
+    registry_path = _write_registry(tmp_path, default="bare-brace", variants={"bare-brace": entry})
+    with pytest.raises(VariantError, match="bare-brace"):
+        load_registry(registry_path)
+
+
+def test_load_registry_rejects_nested_format_spec_naming_an_unknown_field(tmp_path):
+    """string.Formatter().parse() does not recurse into a nested format spec,
+    so "{directive:{width}}" reports only `directive` as used; only a
+    smoke-render discovers that `width` is never supplied."""
+    from grid.variants import VariantError, load_registry
+    template_path = _write_template(tmp_path, "t.md", "hello {directive:{width}}")
+    entry = _valid_entry(template_path, tmp_path)
+    registry_path = _write_registry(tmp_path, default="nested-unknown", variants={"nested-unknown": entry})
+    with pytest.raises(VariantError, match="nested-unknown"):
+        load_registry(registry_path)
+
+
+# I3: every structural failure must be a VariantError naming the registry
+# file (and the variant, where one is identifiable) -- never a bare KeyError,
+# AttributeError, or json.JSONDecodeError.
+
+def test_load_registry_rejects_malformed_json(tmp_path):
+    from grid.variants import VariantError, load_registry
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text("{not json", encoding="utf-8")
+    with pytest.raises(VariantError, match=r"registry\.json"):
+        load_registry(registry_path)
+
+
+def test_load_registry_rejects_registry_missing_variants_key(tmp_path):
+    from grid.variants import VariantError, load_registry
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps({"default": "v1"}), encoding="utf-8")
+    with pytest.raises(VariantError, match=r"registry\.json"):
+        load_registry(registry_path)
+
+
+def test_load_registry_rejects_non_dict_variants(tmp_path):
+    from grid.variants import VariantError, load_registry
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps({"default": "v1", "variants": ["v1"]}), encoding="utf-8")
+    with pytest.raises(VariantError, match=r"registry\.json"):
+        load_registry(registry_path)
+
+
+def test_load_registry_rejects_entry_missing_a_required_field(tmp_path):
+    """A structural error inside one entry (here: no `temperature` key) must
+    still come out as a VariantError naming that variant, not a raw KeyError
+    that a caller's `except VariantError` would not catch."""
+    from grid.variants import VariantError, load_registry
+    template_path = _write_template(tmp_path, "t.md", "hello {directive}")
+    entry = _valid_entry(template_path, tmp_path)
+    del entry["temperature"]
+    registry_path = _write_registry(tmp_path, default="no-temp", variants={"no-temp": entry})
+    with pytest.raises(VariantError, match="no-temp"):
+        load_registry(registry_path)
+
+
+def test_load_registry_rejects_entry_that_is_not_an_object(tmp_path):
+    from grid.variants import VariantError, load_registry
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps({"default": "v1", "variants": {"v1": "not-an-object"}}), encoding="utf-8")
+    with pytest.raises(VariantError, match="v1"):
+        load_registry(registry_path)
+
+
+# I5: template_file must stay inside the registry's own directory.
+
+def test_load_registry_rejects_absolute_template_path(tmp_path):
+    from grid.variants import VariantError, load_registry
+    outside = tmp_path.parent / "outside-abs.md"
+    outside.write_text("hello {directive}", encoding="utf-8", newline="\n")
+    entry = _valid_entry(outside, tmp_path.parent, template_file=str(outside))
+    registry_path = _write_registry(tmp_path, default="abs-path", variants={"abs-path": entry})
+    with pytest.raises(VariantError, match="abs-path"):
+        load_registry(registry_path)
+    outside.unlink()
+
+
+def test_load_registry_rejects_path_traversal_template_file(tmp_path):
+    from grid.variants import VariantError, load_registry
+    outside = tmp_path.parent / "outside-rel.md"
+    outside.write_text("hello {directive}", encoding="utf-8", newline="\n")
+    entry = _valid_entry(outside, tmp_path.parent)
+    entry["template_file"] = f"../{outside.name}"
+    registry_path = _write_registry(tmp_path, default="traversal", variants={"traversal": entry})
+    with pytest.raises(VariantError, match="traversal"):
+        load_registry(registry_path)
+    outside.unlink()
+
+
+# I4: the three type checks below had zero coverage; deleting any one of them
+# left the whole suite green. Also: render_prompt's substitution keys must
+# never drift from PLACEHOLDERS, or a new placeholder silently KeyErrors at
+# render time inside the relay's poll loop.
+
+def test_load_registry_rejects_temperature_of_wrong_type(tmp_path):
+    from grid.variants import VariantError, load_registry
+    template_path = _write_template(tmp_path, "t.md", "hello {directive}")
+    entry = _valid_entry(template_path, tmp_path, temperature=1)  # int, not float
+    registry_path = _write_registry(tmp_path, default="bad-temp", variants={"bad-temp": entry})
+    with pytest.raises(VariantError, match="bad-temp"):
+        load_registry(registry_path)
+
+
+def test_load_registry_rejects_max_tokens_of_wrong_type(tmp_path):
+    from grid.variants import VariantError, load_registry
+    template_path = _write_template(tmp_path, "t.md", "hello {directive}")
+    entry = _valid_entry(template_path, tmp_path, max_tokens=100.0)  # float, not int
+    registry_path = _write_registry(tmp_path, default="bad-tokens", variants={"bad-tokens": entry})
+    with pytest.raises(VariantError, match="bad-tokens"):
+        load_registry(registry_path)
+
+
+def test_load_registry_rejects_recall_of_wrong_type(tmp_path):
+    from grid.variants import VariantError, load_registry
+    template_path = _write_template(tmp_path, "t.md", "hello {directive}")
+    entry = _valid_entry(template_path, tmp_path, recall="true")  # string, not bool
+    registry_path = _write_registry(tmp_path, default="bad-recall", variants={"bad-recall": entry})
+    with pytest.raises(VariantError, match="bad-recall"):
+        load_registry(registry_path)
+
+
+def test_render_prompt_substitution_keys_match_placeholders(fixture_request):
+    """Ties render_prompt's .format() kwargs to PLACEHOLDERS so the two
+    cannot silently drift apart: add a ninth placeholder without a matching
+    kwarg (or vice versa) and this fails instead of surfacing as a render-time
+    KeyError in production."""
+    from grid.proposal import render_prompt
+    from grid.variants import PLACEHOLDERS, Variant
+
+    captured: dict = {}
+
+    class _RecordingTemplate:
+        def format(self, **kwargs):
+            captured.update(kwargs)
+            return ""
+
+    variant = Variant(
+        id="probe", template=_RecordingTemplate(), sha256="0" * 64,
+        temperature=0.1, max_tokens=1, recall=True, note="probe",
+    )
+    render_prompt(fixture_request, ["x"], variant)
+    assert set(captured) == PLACEHOLDERS
+
+
+# Minors folded in.
+
+def test_load_registry_rejects_duplicate_variant_keys(tmp_path):
+    """M1: json.loads keeps the last of two duplicate object keys silently;
+    the registry must reject that instead of serving one template while an
+    operator reads another entry's note."""
+    from grid.variants import VariantError, load_registry
+    template_path = _write_template(tmp_path, "t.md", "hello {directive}")
+    good_entry_json = json.dumps(_valid_entry(template_path, tmp_path, note="first"))
+    other_entry_json = json.dumps(_valid_entry(template_path, tmp_path, note="second"))
+    registry_path = tmp_path / "registry.json"
+    # Hand-build the JSON text so the same key "dup" appears twice.
+    text = '{"default": "dup", "variants": {"dup": %s, "dup": %s}}' % (good_entry_json, other_entry_json)
+    registry_path.write_text(text, encoding="utf-8")
+    with pytest.raises(VariantError, match="dup"):
+        load_registry(registry_path)
+
+
+def test_load_registry_rejects_empty_template(tmp_path):
+    from grid.variants import VariantError, load_registry
+    template_path = _write_template(tmp_path, "t.md", "")
+    entry = _valid_entry(template_path, tmp_path)
+    registry_path = _write_registry(tmp_path, default="empty", variants={"empty": entry})
+    with pytest.raises(VariantError, match="empty"):
+        load_registry(registry_path)
+
+
+def test_load_registry_rejects_non_string_note(tmp_path):
+    from grid.variants import VariantError, load_registry
+    template_path = _write_template(tmp_path, "t.md", "hello {directive}")
+    entry = _valid_entry(template_path, tmp_path, note={"not": "a string"})
+    registry_path = _write_registry(tmp_path, default="bad-note", variants={"bad-note": entry})
+    with pytest.raises(VariantError, match="bad-note"):
+        load_registry(registry_path)
