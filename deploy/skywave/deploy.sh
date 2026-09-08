@@ -5,9 +5,10 @@
 #
 # Exit codes: 0 done · 3 needs passwordless sudo · 4 gateway/master key missing
 #             5 kannaka binary missing · 6 a unit failed to start
+#             7 the checkout is not at origin/$BRANCH (fetch, checkout or pull failed)
 set -euo pipefail
 
-REPO_URL="${GRID_REPO_URL:-https://github.com/NickFlach/kannaka-grid.git}"
+REPO_URL="${GRID_REPO_URL:-https://github.com/kannaka-labs/kannaka-grid.git}"
 BRANCH="${GRID_BRANCH:-main}"
 ROOT=/srv/grid
 CHECKOUT=$ROOT/kannaka-grid
@@ -36,9 +37,23 @@ if [ ! -d $CHECKOUT/.git ]; then
   git clone --recurse-submodules -b "$BRANCH" "$REPO_URL" $CHECKOUT
 else
   log "updating checkout"
-  git -C $CHECKOUT fetch -q origin && git -C $CHECKOUT checkout -q "$BRANCH" && git -C $CHECKOUT pull -q --ff-only
+  # NOT `a && b && c`: under `set -e` a failure of any command in an AND-list except
+  # the LAST one does not exit the shell, so a fetch that failed -- a moved remote, a
+  # revoked deploy key -- was swallowed and every step below then "succeeded" against
+  # yesterday's code, printing DONE while deploying nothing. Seen for real on
+  # 2026-09-08, after the repository moved owner.
+  git -C $CHECKOUT fetch -q origin || die "cannot fetch $(git -C $CHECKOUT remote get-url origin): moved, unreachable, or the key lost access" 7
+  git -C $CHECKOUT checkout -q "$BRANCH" || die "cannot check out $BRANCH" 7
+  git -C $CHECKOUT pull -q --ff-only || die "$BRANCH does not fast-forward; the checkout has diverged" 7
   git -C $CHECKOUT submodule update --init -q
 fi
+# The resting state, not the steps: every command above can return 0 and still leave
+# the checkout behind origin. Assert what we actually have, because that is what runs.
+have=$(git -C $CHECKOUT rev-parse HEAD)
+want=$(git -C $CHECKOUT rev-parse "origin/$BRANCH")
+[ "$have" = "$want" ] || die "checkout is at ${have:0:8} but origin/$BRANCH is ${want:0:8}; nothing below would have been deployed" 7
+log "checkout at ${have:0:8} = origin/$BRANCH"
+
 [ -e $ROOT/thegrid ] || ln -s $CHECKOUT/thegrid $ROOT/thegrid
 if [ ! -x $VENV/bin/python ]; then
   log "creating venv"

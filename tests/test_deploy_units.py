@@ -404,6 +404,39 @@ def run_probe(tmp_path, *, journal: str, mainpid: str, invocation: str = "012345
                           cwd=str(REPO), env=e, capture_output=True, text=True)
 
 
+def test_deploy_sh_cannot_report_done_over_a_stale_checkout():
+    """A deploy that fetched nothing and said DONE is worse than one that failed.
+
+    On 2026-09-08 the repository moved owner, the host's remote still named the old one, and
+    `git fetch` failed with "Repository not found". The update was written as
+    `fetch && checkout && pull`, and under `set -e` a failure of any command in an AND-list
+    EXCEPT THE LAST does not exit the shell -- so the failure was swallowed, every step below
+    ran against a day-old checkout, and the script printed DONE. The host was left without the
+    code the operator believed they had just deployed.
+
+    Two guards, because the first only covers the steps: each git command fails loudly on its
+    own, and then the RESTING STATE is asserted -- the checkout's HEAD must equal
+    origin/BRANCH -- because every one of those commands can return zero and still leave the
+    checkout behind.
+
+    Mutation A: restore the `fetch && checkout && pull` chain -> RED.
+    Mutation B: delete the HEAD-equals-origin assertion -> RED.
+    """
+    text = (SKYWAVE / "deploy.sh").read_text(encoding="utf-8")
+    assert "set -euo pipefail" in text                       # the reason the AND-list is a trap
+    fetches = [ln for ln in text.splitlines()
+               if "git -C $CHECKOUT fetch" in ln and not ln.lstrip().startswith("#")]
+    assert fetches, "deploy.sh no longer fetches"
+    for ln in fetches:
+        assert "&&" not in ln, ("a failed fetch inside an AND-list is swallowed by set -e; "
+                                "it must fail on its own line")
+        assert "|| die" in ln, "a failed fetch must die rather than fall through"
+    # The resting-state check: what is actually here, not what the steps returned.
+    assert 'rev-parse "origin/$BRANCH"' in text, "deploy.sh does not read origin/$BRANCH"
+    assert 'rev-parse HEAD' in text, "deploy.sh does not read the checkout HEAD"
+    assert any('[ "$have" = "$want" ]' in ln and "die" in ln for ln in text.splitlines()),         "deploy.sh does not refuse when the checkout is not at origin/$BRANCH"
+
+
 def test_deploy_sh_keeps_the_informative_failure_on_a_failed_relay_start():
     """`enable --now grid-odin.service` can now return non-zero, because the readiness gate can
     fail the start job. Under `set -euo pipefail` a bare call aborts the script with a naked
