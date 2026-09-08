@@ -312,14 +312,18 @@ def test_a_candidate_that_cannot_answer_loses_instead_of_reading_short(tmp_path)
 def test_an_arm_that_was_never_answered_is_not_scored_as_bad_wording(tmp_path):
     # An outage is an availability failure of the colony, not a wording failure of the arm:
     # defer-binned asks are excluded from BOTH sides of the ratio and reported on their own.
-    # Mutation: count the defer bins as `answered` -> validity reads 0.75, not 1.0, and the
-    # candidate is one bad week away from losing for a gateway that was down.
+    # The outage is seeded DEEP -- 200 binned asks against 120 answered -- so the exclusion is
+    # load-bearing at the decision, not only in the counts: folded in, validity would be
+    # 120/320 = 0.375, under the floor, and this arm would LOSE for a gateway that was down.
+    # Mutation: count the defer bins as `answered` -> the win below becomes exactly that loss.
     from grid.weekly import ab_decide
-    arms = _seed_validity(tmp_path, candidate=(120, 0), incumbent=(120, 0), cand_defer=40)
+    arms = _seed_validity(tmp_path, candidate=(120, 0), incumbent=(120, 0), cand_defer=200)
     assert arms["cand"]["answered"] == 120 and arms["cand"]["valid"] == 120
-    assert arms["cand"]["unanswered"] == 40 and arms["cand"]["validity"] == 1.0
+    assert arms["cand"]["unanswered"] == 200 and arms["cand"]["validity"] == 1.0
     assert arms["inc"]["unanswered"] == 0
-    assert ab_decide(arms, incumbent="inc", candidate="cand")[0] == "win"
+    assert 120 / (120 + 200) < 0.5                       # the folded ratio the mutation would produce
+    verdict, reason = ab_decide(arms, incumbent="inc", candidate="cand")
+    assert verdict == "win" and "validity" not in reason
 
 
 def test_the_validity_floor_is_silent_below_its_minimum_and_for_the_incumbent(tmp_path):
@@ -333,6 +337,11 @@ def test_the_validity_floor_is_silent_below_its_minimum_and_for_the_incumbent(tm
     assert at_bar["cand"]["answered"] == VALIDITY_MIN_ANSWERED
     assert ab_decide(at_bar, incumbent="inc", candidate="cand")[0] == "loss"
     assert VALIDITY_MIN == 0.5 and VALIDITY_MIN_ANSWERED == 20
+    # Silent AT the floor as well as below it: the spec says *below* 0.5, so a candidate sitting
+    # exactly on it survives. Mutation: `< VALIDITY_MIN` -> `<= VALIDITY_MIN`, RED here.
+    on_floor = _seed_validity(tmp_path / "on_floor", candidate=(10, 10), incumbent=(120, 0))
+    assert on_floor["cand"]["answered"] == 20 and on_floor["cand"]["validity"] == VALIDITY_MIN
+    assert ab_decide(on_floor, incumbent="inc", candidate="cand")[0] == "inconclusive"
     # And silent for the INCUMBENT, whatever its validity: a running model that stops parsing is
     # a colony-wide fault the `ab_check` stuck rule owns, and a floor branch here would report it
     # as a verdict on the candidate -- which answered everything. Mutation: add an incumbent
@@ -341,6 +350,51 @@ def test_the_validity_floor_is_silent_below_its_minimum_and_for_the_incumbent(tm
     assert sick_inc["inc"]["validity"] == pytest.approx(0.2) and sick_inc["cand"]["validity"] == 1.0
     verdict, reason = ab_decide(sick_inc, incumbent="inc", candidate="cand")
     assert verdict == "inconclusive" and "validity" not in reason
+
+
+def test_a_malformed_or_unknown_log_row_is_excluded_and_never_takes_the_gate_down(tmp_path, caplog):
+    import logging
+    from grid.odin import DEFER_BIN_REASON, DEFER_BIN_REASON_RE
+    from grid.verdicts import Ledger
+    from grid.weekly import ab_arms
+    # The two must stay married: the reader recognises the shape the writer writes. Mutation:
+    # reword either side alone (`f"gave up after {DEFER_LIMIT}"`) -> RED, before any row is read.
+    assert DEFER_BIN_REASON_RE.match(DEFER_BIN_REASON)
+    v = tmp_path / "v"
+    _seed_ab(v, since_ts=1_000_000, inc="inc", cand="cand", n_inc=1, n_cand=1, inc_rep=0, cand_rep=0,
+             before=0, excluded=0)
+    extra = [
+        # `"ts": null` -- a hand-edit or a truncated writer. The count loop reads EVERY row, so
+        # before the `or 0` this raised TypeError out of ab_arms and took the Sunday release AND
+        # the nightly check down with it. Mutation: `int(e.get("ts") or 0)` -> `int(e.get("ts", 0))`
+        # in EITHER loop -> TypeError, and this test is the only thing that notices.
+        {"ts": None, "request_id": "null-ts", "outcome": "proposed", "model_alias": "cand"},
+        # A rejection with no reason counts as ANSWERED: odin always passes one, so this is a
+        # foreign writer, and "she answered badly" is the reading that can cost the candidate
+        # the week. Mutation: count it as `unanswered` -> answered reads 2.
+        {"ts": 1_000_500, "request_id": "no-reason", "outcome": "rejected", "reason": None, "model_alias": "cand"},
+        # M5: a rejection that merely STARTS like the defer bin is an answer, not an outage.
+        # Mutation: match the reason by `startswith("deferred ")` -> unanswered reads 2,
+        # validity climbs, and an arm that cannot answer stops being able to lose.
+        {"ts": 1_000_600, "request_id": "near-miss", "outcome": "rejected",
+         "reason": "deferred to human review", "model_alias": "cand"},
+        {"ts": 1_000_700, "request_id": "binned", "outcome": "rejected", "reason": DEFER_BIN_REASON,
+         "model_alias": "cand"},
+        # An outcome this gate has never seen is counted in none of the three -- silence is the
+        # safe direction -- but it says so. Mutation: drop the `else` branch and its warning, or
+        # widen `elif "rejected"` to a bare `else` -> RED on the warning or on `answered`.
+        {"ts": 1_000_800, "request_id": "weird", "outcome": "abandoned", "model_alias": "cand"},
+    ]
+    with open(v / "proposals.jsonl", "a", encoding="utf-8") as f:
+        for e in extra:
+            f.write(json.dumps(e) + "\n")
+    Ledger(v / "verdicts.jsonl").append({"request_id": "null-ts", "model_alias": "cand", "tier": "new",
+                                         "births": 1, "fitness": 1})   # the join loop coerces `ts` too
+    with caplog.at_level(logging.WARNING, logger="grid.weekly"):
+        arms = ab_arms(v, since_ts=1_000_000, incumbent="inc", candidate="cand")
+    assert arms["cand"]["answered"] == 3 and arms["cand"]["valid"] == 1 and arms["cand"]["unanswered"] == 1
+    assert arms["cand"]["settled"] == 1                    # the null-ts row windows out of the join, not a crash
+    assert "abandoned" in caplog.text and "does not count" in caplog.text
 
 
 def test_ab_arms_windows_on_proposal_ts_and_excludes_unattributable_tiers(tmp_path):
@@ -437,7 +491,7 @@ async def test_release_starts_an_ab_instead_of_flipping(tmp_path):
     assert ab["candidate"] == "kannaka-brain-v4" and ab["incumbent"] == "kannaka-brain-v3" and ab["since_ts"] > 0
 
 
-async def _run_ab_week(tmp_path, *, inc_rep, cand_rep, n_cand=110, local_run=None,
+async def _run_ab_week(tmp_path, *, inc_rep, cand_rep, n_cand=110, n_inc=120, cand_rejected=(0, 0), local_run=None,
                        alias="kannaka-brain-v3", remote_fail=frozenset()):
     cfg = _cfg(tmp_path); v = tmp_path / "v"
     from grid.versions import Versions, release_row
@@ -446,7 +500,8 @@ async def _run_ab_week(tmp_path, *, inc_rep, cand_rep, n_cand=110, local_run=Non
     kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="", grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0)
     vs.append(release_row(week="W0", decision="released", version="kannaka-brain-v3", previous=None, evals={}, reason="", **kw))
     vs.append(release_row(week="W1", decision="ab_started", version="kannaka-brain-v4", previous="kannaka-brain-v3", evals={"colony_ab": {"candidate": "kannaka-brain-v4", "incumbent": "kannaka-brain-v3", "split": 0.2, "since_ts": since}}, reason="", **kw))
-    _seed_ab(v, since_ts=since, inc_rep=inc_rep, cand_rep=cand_rep, n_cand=n_cand)
+    _seed_ab(v, since_ts=since, inc_rep=inc_rep, cand_rep=cand_rep, n_cand=n_cand, n_inc=n_inc,
+             cand_rejected=cand_rejected)
     (tmp_path / "grid.env").write_text(f"MIND_MODEL_ALIAS={alias}\nMIND_LLM_MODEL=kannaka-brain-current\nMIND_LLM_CANDIDATE=kannaka-brain-v4\nMIND_AB_SPLIT=0.2\n")
     r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
                     "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST},
@@ -471,6 +526,30 @@ async def test_ab_loss_holds_and_never_releases(tmp_path):
     assert row["decision"] == "held" and row["reason"].startswith("colony A/B lost")
     assert not any(c.startswith("ollama cp") for c in r.commands)
     assert "MIND_MODEL_ALIAS=kannaka-brain-v3" in env and "MIND_LLM_CANDIDATE=kannaka-brain-v4" not in env and restarts
+
+
+async def test_a_validity_loss_blacklists_the_tag_even_with_the_incumbent_undersampled(tmp_path):
+    # I1, a livelock. A validity loss ALWAYS has the candidate under MIN_SAMPLE -- its rejects
+    # settle nothing -- so if `short_arms` judged the row, an incumbent that also happens to sit
+    # under MIN_SAMPLE (80 here) would make it name both arms, `lost_tags` would read that as a
+    # colony throughput fault and abstain, and `find_candidate` would hand the same broken
+    # candidate back next Sunday to lose identically forever. A validity loss is fully
+    # attributed, so it carries N2's `[]`: nothing relevant was short, the colony decided.
+    # Mutation: restore the plain `short_arms(...)` call -> short_arms reads
+    # ["kannaka-brain-v4", "kannaka-brain-v3"] and the tag is NOT remembered, both RED below.
+    from grid.versions import Versions
+    from grid.weekly import lost_tags
+    row, r, env, restarts = await _run_ab_week(tmp_path, inc_rep=20, cand_rep=0, n_inc=80, n_cand=8,
+                                               cand_rejected=(32, 0))
+    ab = row["evals"]["colony_ab"]
+    assert row["decision"] == "held" and "validity" in row["reason"]
+    cand = ab["arms"]["kannaka-brain-v4"]
+    # 9 answers that parsed (8 plus the excluded-tier ask) against 32 that did not; only 8 settle.
+    assert cand["answered"] == 41 and cand["valid"] == 9 and cand["settled"] == 8
+    assert ab["arms"]["kannaka-brain-v3"]["settled"] == 80 < 100      # the incumbent IS under the bar
+    assert ab["short_arms"] == []
+    assert lost_tags(Versions(tmp_path / "releases" / "versions.jsonl")) == {"kannaka-brain-v4"}
+    assert not any(c.startswith("ollama cp") for c in r.commands)     # and it certainly did not ship
 
 
 async def test_ab_inconclusive_continues_then_holds_at_max_weeks(tmp_path):

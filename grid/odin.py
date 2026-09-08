@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -34,6 +35,16 @@ UNPARSEABLE_LIMIT = 3       # consecutive failed parses before the file is binne
 # ever filed. Bin it after this many consecutive defers so thegrid can file a fresh
 # request, which may hash to the other arm.
 DEFER_LIMIT = 4
+# The reason a binned ask is logged under, named because it is read as well as written:
+# `grid/weekly.py` must recognise it to keep asks that were never answered OUT of the
+# validity ratio. Left as a prefix test on the reader's side, a future rejection worded
+# "deferred to human review" would be miscounted as an outage, the arm's validity would
+# climb toward 1.0, and the floor would go quiet -- reopening the exact bug it exists to
+# catch. The pattern matches the SHAPE rather than this literal so that rows written under
+# an older DEFER_LIMIT keep reading as unanswered: a bumped limit must not retroactively
+# blame an arm for a gateway that was down. `tests/test_weekly.py` pins the two together.
+DEFER_BIN_REASON = f"deferred {DEFER_LIMIT} times"
+DEFER_BIN_REASON_RE = re.compile(r"deferred \d+ times\Z")
 AB_SPLIT = 0.2
 
 # The one dimension that hashes the BARE request id, because arm_for has done exactly
@@ -283,7 +294,7 @@ class Relay:
             del self._defers[req.request_id]
             self._retry_not_before.pop(req.request_id, None)
             epoch, tick = await self._epoch_tick()
-            reason = f"deferred {DEFER_LIMIT} times"
+            reason = DEFER_BIN_REASON
             self._log(req, prompt, None, "rejected", reason, epoch, tick, model_alias=alias, variant=variant)
             await self._publish("rejected", epoch, tick, request_id=req.request_id, reason=reason)
             return "rejected"

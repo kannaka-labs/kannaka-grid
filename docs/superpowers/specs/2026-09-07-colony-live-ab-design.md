@@ -92,9 +92,18 @@ them (they are not release-state rows). `colony_ab` in every row becomes:
 ```
 {"binding": bool, "candidate": tag|None, "incumbent": tag, "split": 0.2, "since_ts": ms,
  "min_sample": 100, "tolerance": 0.10, "weeks": n,
- "arms": {tag: {"settled": n, "reproduced": n, "rate": f, "births_per_proposal": f}},
+ "arms": {tag: {"settled": n, "reproduced": n, "rate": f, "births_per_proposal": f,
+                "answered": n, "valid": n, "unanswered": n, "validity": f}},
  "winner": tag|None}
 ```
+
+The four attempt keys come from the proposal log rather than the verdict rows (runtime-and-prompt-loop
+Task 3): `valid` replies became genomes, `answered` is every reply that arrived, valid or not, and
+`unanswered` counts asks the relay binned after repeated defers, which are excluded from both sides
+of `validity = valid / answered` so an outage never reads as a wording failure. `ab_decide` rejects a
+candidate whose `validity` falls below `VALIDITY_MIN` over at least `VALIDITY_MIN_ANSWERED` answered
+asks; without it a badly-answering arm settles nothing and merely reads `inconclusive` on sample size.
+`ab_decide` reads all eight keys, so an arm dict built by hand must carry them.
 
 (`binding: false` with `arms` over the trailing week for rows outside an A/B — today's advisory
 shape, kept.)

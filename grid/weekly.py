@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .odin import DEFER_BIN_REASON_RE
 from .proposal_log import ProposalLog
 from .remote import Remote, RemoteError
 from .verdicts import Ledger
@@ -218,17 +219,31 @@ def ab_arms(verdicts_dir: Path, *, since_ts: int, incumbent: str, candidate: str
       - `unanswered`: the ask was binned after repeated defers, so no reply ever arrived.
     Unanswered asks sit OUTSIDE both sides of the ratio. A gateway outage is an availability
     failure of the colony, and folding it in would report it as a wording failure of the arm.
+
+    A rejection whose `reason` is missing counts as ANSWERED. `odin` never writes one -- every
+    reject path there passes a reason -- so this is the hand-edit/foreign-writer case, and
+    "she answered badly" is the reading that can cost the candidate the week. Guessing the
+    other way would let a writer that omits reasons silence the floor entirely.
+
+    An outcome this function does not recognise is counted in NONE of the three, and warned
+    about once per distinct value. Silence is the safe direction (a smaller `answered` keeps
+    the floor below VALIDITY_MIN_ANSWERED and quiet, rather than judging on a bucket the
+    reader does not understand), but silently is not: the log says a producer moved ahead of
+    the gate.
     """
     vdir = Path(verdicts_dir)
     acc = {t: {"settled": 0, "reproduced": 0, "births": 0, "answered": 0, "valid": 0, "unanswered": 0}
            for t in (incumbent, candidate)}
-    entries = {}
+    entries, unknown = {}, set()
     for e in ProposalLog(vdir).read_all():        # one pass: the join index AND the attempt counts
         rid = e.get("request_id")
         if not rid:
             continue
         entries[rid] = e
-        if int(e.get("ts", 0)) < since_ts:        # the same window the verdict join applies below
+        # `or 0`, not a default: this now runs on EVERY row, not only the ones a verdict
+        # joined to, so a single hand-edited `"ts": null` would otherwise TypeError out of
+        # both the Sunday release and the nightly check. Same standard as the guard above.
+        if int(e.get("ts") or 0) < since_ts:      # the same window the verdict join applies below
             continue
         a = acc.get(str(e.get("model_alias", "")))
         if a is None:
@@ -238,15 +253,20 @@ def ab_arms(verdicts_dir: Path, *, since_ts: int, incumbent: str, candidate: str
             a["answered"] += 1
             a["valid"] += 1
         elif outcome == "rejected":
-            # `deferred N times` is the reason grid/odin.py bins an ask under when the mind
-            # never answered; every other rejection reason means she answered badly.
-            if str(e.get("reason") or "").startswith("deferred "):
+            # The reason grid/odin.py bins an ask under when the mind never answered at all;
+            # every other rejection reason means she answered, and answered badly.
+            if DEFER_BIN_REASON_RE.match(str(e.get("reason") or "")):
                 a["unanswered"] += 1
             else:
                 a["answered"] += 1
+        else:
+            unknown.add(str(outcome))
+    if unknown:
+        log.warning("proposal log: outcome(s) this gate does not count, excluded from every "
+                    "attempt tally: %s", ", ".join(sorted(unknown)))
     for row in Ledger(vdir / "verdicts.jsonl").rows():
         e = entries.get(row.get("request_id"))
-        if e is None or int(e.get("ts", 0)) < since_ts or row.get("tier") in EXCLUDED_TIERS:
+        if e is None or int(e.get("ts") or 0) < since_ts or row.get("tier") in EXCLUDED_TIERS:
             continue
         a = acc.get(str(row.get("model_alias", "")))
         if a is None:
@@ -262,6 +282,17 @@ def ab_arms(verdicts_dir: Path, *, since_ts: int, incumbent: str, candidate: str
             for t, v in acc.items()}
 
 
+def is_validity_loss(arms: dict, *, candidate: str) -> bool:
+    """Does the validity floor reject this candidate? The floor's condition, named, because
+    two callers must agree on it: `ab_decide`, which returns the verdict, and `release`, which
+    has to say WHOSE fault the verdict was. Asking the arms again is exact -- the floor is the
+    first thing `ab_decide` tests, so it returns this loss whenever this is True -- and it
+    beats sniffing the reason prose, which an ordinary loss on the merits shares a prefix with.
+    """
+    c = arms[candidate]
+    return c["answered"] >= VALIDITY_MIN_ANSWERED and c["validity"] < VALIDITY_MIN
+
+
 def ab_decide(arms: dict, *, incumbent: str, candidate: str, min_sample: int = MIN_SAMPLE,
               tolerance: float = TOLERANCE) -> tuple[str, str]:
     i, c = arms[incumbent], arms[candidate]
@@ -273,7 +304,7 @@ def ab_decide(arms: dict, *, incumbent: str, candidate: str, min_sample: int = M
     # The floor is the CANDIDATE's alone. An incumbent below it is not a candidate failure at
     # all but a colony-wide fault (the shared gateway, the ISA, the corpus), and the stuck
     # rule in `ab_check` already owns that case; a branch here would only double-report it.
-    if c["answered"] >= VALIDITY_MIN_ANSWERED and c["validity"] < VALIDITY_MIN:
+    if is_validity_loss(arms, candidate=candidate):
         return "loss", (f"colony A/B lost: {candidate} validity {c['validity']:.2f} below "
                         f"{VALIDITY_MIN} over {c['answered']} answered")
     if i["settled"] < min_sample or c["settled"] < min_sample:
@@ -529,8 +560,18 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
             return _ledger(versions, row, dry_run=dry_run)
         arms = ab_arms(cfg.verdicts_dir, since_ts=state["since_ts"], incumbent=state["incumbent"], candidate=state["candidate"])
         verdict, reason = ab_decide(arms, incumbent=state["incumbent"], candidate=state["candidate"])
+        # I1/N2: a validity loss is FULLY ATTRIBUTED to the candidate -- it was asked plenty and
+        # answered badly -- so it carries the `[]` encoding, exactly like a loss on the merits.
+        # Left to short_arms() it would not: a validity loss has the candidate under MIN_SAMPLE
+        # by definition (its rejects settle nothing), so whenever the incumbent also happens to
+        # sit under MIN_SAMPLE the row would name BOTH arms short, lost_tags would read that as
+        # a colony throughput fault and abstain, and find_candidate would hand the same broken
+        # candidate back every Sunday to lose identically forever -- on a verdict whose whole
+        # claim is that sample size was not the problem.
+        short = ([] if is_validity_loss(arms, candidate=state["candidate"])
+                 else short_arms(arms, incumbent=state["incumbent"], candidate=state["candidate"]))
         block = {**started_ab, "binding": True, "arms": arms, "weeks": state["weeks"] + 1, "winner": None,
-                 "short_arms": short_arms(arms, incumbent=state["incumbent"], candidate=state["candidate"])}
+                 "short_arms": short}
         if verdict == "inconclusive" and state["weeks"] + 1 >= MAX_WEEKS:
             outcome = end_ab(cfg, local_run=local_run, dry_run=dry_run)
             base_reason = f"colony A/B inconclusive after {MAX_WEEKS} weeks: {reason}"
