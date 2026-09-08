@@ -30,7 +30,12 @@ def test_colony_binds_localhost_and_is_bounded():
     assert "--host 127.0.0.1" in text
     assert "--mutator odin" in text
     assert "--state /srv/grid/colony-one/state/colony.pkl" in text
-    assert "MemoryMax=192M" in text and "MemorySwapMax=0" in text and "CPUQuota=5%" in text
+    assert "MemoryMax=192M" in text and "MemorySwapMax=0" in text and "CPUQuota=40%" in text
+    # 40%, raised from 5% on 2026-09-08: at 5% the kernel throttled the cgroup in
+    # 2,237,576 of 2,237,577 periods and the colony ran at 1.41 tick/s against a
+    # configured 10. The quota is the binding limit on how fast anything can be
+    # measured, so it is pinned rather than left to drift.
+    assert "CPUQuota=5%" not in text, "the 5% cap starved the evaluator; see the unit comment"
     assert "grid.launcher" in text
 
 

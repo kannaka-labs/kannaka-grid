@@ -22,7 +22,21 @@ ReadWritePaths=/srv/grid/colony-one/state
 MemoryMax=192M
 MemoryHigh=176M
 MemorySwapMax=0
-CPUQuota=5%
+# 40%, raised from 5% on 2026-09-08. At 5% the kernel throttled this cgroup in
+# 2,237,576 of 2,237,577 periods and the colony advanced 1.41 tick/s against a
+# configured 10; at 40% it runs 9.82 tick/s and uses 29%, so this is headroom
+# rather than the new limit. Ticks are verdicts, and verdicts are the only
+# honest evaluator the program has.
+#
+# WHAT THIS TRADES, deliberately: the 5% cap also kept the colony from moving its
+# own weather. grid/launcher.py's proxy reads the WHOLE HOST, so storms are meant
+# to come from the mind's LLM calls and other load -- "the weather is Odin itself".
+# 0.4 of a core is about 6.7% of this 6-CPU host, roughly +2.7 C against a storm
+# threshold of +1.5 C, so the colony can now storm itself. Measured after the
+# change: heat 45.8 -> ~48 mean with spikes to 53.8 and regen dipping to 0.71.
+# The fix that would restore the intent at any quota is to have the proxy subtract
+# this cgroup's own usage from the host reading; that is our code, not thegrid's.
+CPUQuota=40%
 
 [Install]
 WantedBy=multi-user.target

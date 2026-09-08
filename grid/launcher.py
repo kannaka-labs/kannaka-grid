@@ -8,8 +8,14 @@ one raises. Memory pressure and CPU usage remain real cgroup readings.
 
 The proxy reads the WHOLE HOST, not the colony's cgroup. thegrid's substrate
 fires a storm when its fast heat EMA rises 1.5 C over a slow baseline, and the
-colony is capped at CPUQuota=5%: its own work could never move a cgroup-derived
-number that far, so `storm` and `thermal.throttle` could never fire. Reading
+colony WAS capped at CPUQuota=5% so its own work could never move a cgroup-derived
+number that far, and `storm` and `thermal.throttle` could only fire from OUTSIDE
+load. That cap was raised to 40% on 2026-09-08 to buy tick rate (1.41 -> 9.82
+tick/s), and this property no longer holds: 0.4 of a core is about 6.7% of a
+6-CPU host, roughly +2.7 C against a storm threshold of +1.5 C, so the colony can
+now storm itself. Measured after the change: heat 45.8 -> ~48 mean, spiking 53.8.
+To restore the intent at any quota, subtract this cgroup's own usage from the host
+reading below -- that is this file's job, not thegrid's. Reading
 the host means the mind's own LLM calls, the KAX machines, and any other load
 on the box are the colony's weather -- which is exactly what thegrid's
 substrate intends by "the weather is Odin itself".
