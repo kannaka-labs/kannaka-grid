@@ -460,23 +460,52 @@ it. Then, in the order you will meet them:
 3. At `MAX_WEEKS` it is held on the two-week cap, with a reason blaming sample size rather than
    the fact that nobody judged it.
 
-**A second Sunday is judged normally, not bounded to the first.** The bound applies only between
-two legs judged in the SAME weekly cycle; a partner judged *last* Sunday is behind this leg, not
-ahead of it, so a factorial run that reads inconclusive in week 1 is free to count week 2's
-traffic in full. (An earlier build keyed this on elapsed hours and refused the second Sunday
-outright, which wrote no row, never advanced the two-week counter, and left the interlock
-blocking both dimensions indefinitely.)
+**A second Sunday is judged normally, not bounded to the first.** The bound applies when the
+partner has been *judged more times than this leg has* — a fact about the two experiments, not
+about the calendar. Within one round the leg judged first has an equal count and is unbounded;
+the leg judged second sees a partner one ahead and is held to what it saw. By the following
+Sunday the counts have caught up, so a factorial run that read inconclusive in week 1 is free to
+count week 2's traffic in full. Nothing here needs `--week`, a clock, or the two commands landing
+on the same date: run the second leg on Monday morning if you like. (Two earlier builds keyed
+this on elapsed hours and then on the ISO week. The first refused the second Sunday outright and
+livelocked the gate; the second silently unbounded a leg run after midnight, because ISO weeks
+roll over on Monday while the gate's cycle starts Sunday 06:00.)
 
 If for some reason a leg cannot be judged factorially — its partner had already closed before it
 started, a third dimension was splitting alongside, an `ab_started` row is missing an arm label,
-or the partner's recorded verdict prefix cannot be honoured — the week is judged two-arm and
-**says so**: the row carries `factorial_judged: false`, its `reason` gains `[factorial run,
-judged two-arm: …]`, and a WARNING is logged. A row never claims a marginal it did not compute.
+or the partner's judging row records no verdict prefix — the week is judged two-arm and **says
+so**: the row carries `factorial_judged: false`, its `reason` gains `[factorial run, judged
+two-arm: …]`, and a WARNING is logged. A row never claims a marginal it did not compute.
+
+**A degraded week does not blacklist if anything else was splitting.** A two-arm number taken
+while another dimension was live was measured across two uncontrolled conditions, which is the
+thing the interlock exists to refuse; such a row carries `remember: false` and the
+rejected-candidate memory skips it, so the candidate is retested once the confound clears. With
+no neighbour the leg really was an ordinary single-dimension A/B, its tally is complete, and a
+loss is remembered as always. `colony A/B inconclusive after 2 weeks` is remembered either way —
+that is the guard against retesting a candidate that can never reach sample size, and a
+confounded week is still a week in which it did not reach it.
+
+**One fault refuses the week rather than degrading it: a verdict ledger that no longer matches
+what was already measured over it.** The prefix check re-derives the hash chain over the recorded
+rows, so an in-place edit is caught as well as an insertion or a deletion. When it fails, the gate
+writes no row, moves nothing, and exits non-zero:
+```
+grid.weekly: error: verdict row 3 of the recorded prefix no longer hashes to its own chain value;
+the file has been rewritten below the prefix. The prompt A/B cannot be judged over a verdict
+ledger that no longer matches what its partner measured … Restore the ledger from the receipts,
+or abort both legs with `grid.weekly ab --abort --dimension <d>`
+```
+Every other fault degrades, because "we cannot cross these two dimensions" still leaves one
+honest measurement. This one says the colony's own fossil record changed underneath a measurement
+already recorded, and a two-arm tally over the same file repairs nothing.
 
 The keys a factorial week adds under `.evals.colony_ab`: `factorial` (on every `ab_started` row,
 true or false), `factorial_judged`, `factorial_with`, `factorial_since_ts`, `factorial_until_ts`
 and `factorial_until_verdicts` (both null on the leg judged first, whose partner has not been
 judged this cycle and which therefore needs no bound), `cells`, and `interaction`.
+`factorial_partner_abandoned` says the partner stopped splitting mid-window
+without ever being judged, in which case the window is truncated there.
 `factorial_judged` is on **every** A/B row — including the nightly `ab --check` stuck row and the
 `ab --abort` snapshot, both of which are two-arm over the leg's own window and say so. Every A/B
 row in either mode also carries `other_dimensions` — an advisory record of what else was

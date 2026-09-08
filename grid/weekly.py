@@ -23,7 +23,7 @@ from .odin import DEFER_BIN_REASON_RE, DIMENSIONS, UNSALTED_DIMENSION
 from .proposal_log import ProposalLog, variant_of
 from .remote import Remote, RemoteError
 from .variants import get_variant
-from .verdicts import GENESIS, Ledger
+from .verdicts import GENESIS, Ledger, chain_hash
 from .versions import Versions, decide, dimension_of, release_row
 from .weekly_probe import chat, run_identity, run_validity
 
@@ -378,31 +378,54 @@ def _row_arm(dimensions: tuple[str, ...], entry: dict, verdict_row: dict | None 
     return CELL_SEP.join(parts)
 
 
-def _verdict_prefix(rows: list[dict], recorded: dict | None) -> list[dict]:
+def _verdict_prefix(rows: list[dict], recorded: dict | None, *, torn_at: int | None = None) -> list[dict]:
     """The verdict rows that had landed when `recorded` was taken. All of them if it is None.
 
     `recorded` is a `verdict_window` block off a ledger row: `{"rows": N, "chain_head": H}`. The
     verdict ledger is append-only and hash-chained, so the first N rows are an exact, immutable
-    set and `H` is the chain value after them -- checking it is what turns "the first N rows"
-    from an assumption into a verified one. A file that no longer extends that prefix has been
-    rewritten or replaced, which is not a condition to measure through.
+    set -- provided they still hash the way they did, which is what this RECOMPUTES rather than
+    assumes. Comparing only the stored `chain` string of row N would catch insertion, deletion and
+    reordering, and would miss an in-place edit of a row's fields: every stored hash stays
+    untouched while the tally changes. Re-deriving the chain over the prefix, the way
+    `Ledger.verify` does over the whole file, closes exactly that gap.
 
-    Raises rather than trimming quietly. `_judge_ab` asks `_verdict_prefix_fault` first and
-    degrades to a two-arm tally with a stated reason, so a Sunday still produces a row; this is
-    the guard for every other caller, the same split `_validate_candidate` keeps.
+    A recorded head that is missing is a FAULT, not a reason to skip the check. `_window` always
+    stores a truthy head (GENESIS for an empty ledger), so the only rows without one are
+    hand-edited or older -- which is precisely the population a integrity check exists for, and
+    the length test alone is much weaker than nothing looks.
+
+    Raises rather than trimming quietly. `_refuse_untrustworthy_ledger` asks first and refuses the
+    week; `_verdict_prefix_fault` asks first and degrades; this is the guard for every other
+    caller, the same split `_validate_candidate` keeps.
     """
     if recorded is None:
         return rows
     n = recorded.get("rows")
-    if not isinstance(n, int) or isinstance(n, bool) or n < 0 or n > len(rows):
+    if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+        raise ValueError(f"the recorded verdict prefix names {n!r} rows, which is not a count")
+    if n > len(rows):
+        if torn_at is not None:
+            # `Ledger.rows()` stops at a corrupt line and returns the readable prefix, so "shorter
+            # than recorded" is what a torn ledger looks like from here. Saying "rows were
+            # removed" would send an operator looking for the wrong fault.
+            raise ValueError(f"the verdict ledger will not parse past line {torn_at}, so only "
+                             f"{len(rows)} of the recorded {n} rows can be read")
         raise ValueError(f"the verdict ledger has {len(rows)} rows and the recorded prefix names "
-                         f"{n!r}; it is not an extension of what was measured before")
+                         f"{n}; it is not an extension of what was measured before")
     prefix = rows[:n]
     head = recorded.get("chain_head")
-    actual = prefix[-1].get("chain") if prefix else GENESIS
-    if head and actual != head:
+    if not head:
+        raise ValueError("the recorded verdict prefix carries no chain head, so the rows it "
+                         "names cannot be shown to be the rows that were measured")
+    prev = GENESIS
+    for i, row in enumerate(prefix):
+        if row.get("chain") != chain_hash(prev, row):
+            raise ValueError(f"verdict row {i + 1} of the recorded prefix no longer hashes to its "
+                             "own chain value; the file has been rewritten below the prefix")
+        prev = row["chain"]
+    if prev != head:
         raise ValueError(f"the verdict ledger's first {n} rows no longer hash to the recorded "
-                         f"chain head; the file has been rewritten below the prefix")
+                         "chain head; the file has been rewritten below the prefix")
     return prefix
 
 
@@ -411,8 +434,10 @@ def _verdict_prefix_fault(verdicts_dir: Path, recorded: dict | None) -> str:
     if recorded is None or recorded.get("rows") is None:
         return ("the partner's judging row records no verdict-ledger prefix, so the two legs "
                 "cannot be shown to have counted the same verdicts")
+    led = Ledger(Path(verdicts_dir) / "verdicts.jsonl")
+    rows = led.rows()
     try:
-        _verdict_prefix(Ledger(Path(verdicts_dir) / "verdicts.jsonl").rows(), recorded)
+        _verdict_prefix(rows, recorded, torn_at=led._corrupt_line)
     except ValueError as e:
         return str(e)
     return ""
@@ -833,7 +858,8 @@ def _ab_episodes(versions: Versions, dimension: str) -> list[dict]:
 
     - `started`  -- the `ab_started` row that opened it;
     - `closed`   -- the row that ENDED the split, or None while it is still running;
-    - `judged`   -- the row that last recorded a VERDICT on it, closing or `ab_inconclusive`.
+    - `judgings` -- HOW MANY verdicts it has had, and `judged` -- the LAST of them, closing or
+      `ab_inconclusive`.
       Not the same as `closed`, and that is C1-prime: an inconclusive week freezes an episode's
       numbers without ending its split, so it is the moment a partner's window must stop, while
       the episode itself goes on running;
@@ -858,11 +884,12 @@ def _ab_episodes(versions: Versions, dimension: str) -> list[dict]:
             if open_now is not None and open_now.get("superseded") is None:
                 open_now["superseded"] = r
             episodes.append({"started": r, "closed": None, "judged": None,
-                             "superseded": None, "weeks": 0})
+                             "superseded": None, "weeks": 0, "judgings": 0})
         elif open_now is not None and r["decision"] in _AB_JUDGING:
             # One branch, keyed on the JUDGING set, so `judged` cannot be set for one kind of
             # verdict and forgotten for the other. Only the closing half also ends the split.
             open_now["judged"] = r
+            open_now["judgings"] += 1
             if r["decision"] == "ab_inconclusive":
                 open_now["weeks"] += 1
             else:
@@ -884,19 +911,22 @@ def _episode_span(episode: dict) -> tuple[int, int | None, dict | None]:
     that bounding: its `week` (which judging cycle it belongs to) and its `verdict_window`
     (the verdict ledger's exact prefix at the instant it was judged).
     """
-    started_ms = int(_episode_state(episode)["since_ts"])
-    ender = episode["closed"] or episode.get("superseded")
-    return (started_ms,
-            int(ender["ts"] * 1000) if ender is not None else None,
-            episode.get("judged"))
+    state = _episode_state(episode)
+    return int(state["since_ts"]), state["ended_ms"], episode.get("judged")
 
 
 def _episode_state(episode: dict) -> dict:
     """One episode read the way every caller of `ab_state` expects it."""
     started, ab = episode["started"], (episode["started"].get("evals") or {}).get("colony_ab") or {}
+    # `ended_ms` is carried on the state rather than looked up again later: `_ab_episodes` re-reads
+    # the ledger on every call and builds fresh row dicts, so a second lookup cannot match the
+    # first one by identity and would have to re-derive which episode it meant.
+    ender = episode["closed"] or episode.get("superseded")
     return {"candidate": ab.get("candidate", started.get("version")), "incumbent": ab.get("incumbent", started.get("previous")),
             "split": ab.get("split", AB_SPLIT), "since_ts": int(ab.get("since_ts") or started["ts"] * 1000),
-            "weeks": episode["weeks"], "started_row": started}
+            "weeks": episode["weeks"], "judgings": episode["judgings"],
+            "ended_ms": int(ender["ts"] * 1000) if ender is not None else None,
+            "started_row": started}
 
 
 def ab_state(versions: Versions, *, dimension: str = UNSALTED_DIMENSION) -> dict | None:
@@ -908,17 +938,80 @@ def ab_state(versions: Versions, *, dimension: str = UNSALTED_DIMENSION) -> dict
     return _episode_state(episodes[-1])
 
 
-def _overlapped(versions: Versions, dimension: str, since_ts: int) -> bool:
+class LedgerRewritten(ValueError):
+    """The verdict ledger no longer matches what an earlier judging row measured over it.
+
+    Its own class so `main` can turn it into a usage error -- a message and a non-zero exit --
+    rather than a traceback, and so it stays distinguishable from every other ValueError the gate
+    throws.
+
+    RAISED BEFORE ANY LEDGER ROW IS WRITTEN, and unlike every other fault in this module it does
+    NOT degrade to a two-arm tally. Every other degrade says "we cannot cross these two
+    dimensions, so measure one"; this one says the colony's own evidence has changed underneath a
+    measurement already recorded, and a two-arm tally over the same file repairs nothing -- it
+    would release a model on the strength of rows the gate has just decided it cannot trust. The
+    verdict ledger is append-only and hash-chained precisely so that this is detectable, and there
+    is no reading of it that does not need a human.
+    """
+
+
+def _overlapped(cfg: WeeklyConfig, versions: Versions, dimension: str, since_ts: int) -> bool:
     """Did any A/B in this dimension split traffic during a leg that opened at `since_ts`?
 
-    The same overlap test `_partner_bound` applies, without the design question on top: this is
-    asked of dimensions that could never BE a partner, only spoil one.
+    TWO SOURCES, the same two the interlock uses, and for the same reason. `_blocking_experiments`
+    reads `ab_state` for tracked experiments and `grid.env` for one started the spec-§7 way, with
+    no `ab_started` row -- a state its docstring records as having genuinely occurred on Skywave.
+    Asked of the ledger alone, this predicate would step straight over a hand-started third split
+    and judge the week factorially across it, blacklisting a candidate on traffic that was
+    answered under a third live condition.
+
+    A hand-started split has no ledger row and therefore no start instant, so "is it splitting
+    now" is all that can be known about it; that counts as overlapping. Conservative in the
+    direction that refuses a tally rather than the one that takes it.
     """
     for episode in _ab_episodes(versions, dimension):
         started_ms, ended_ms, _ = _episode_span(episode)
         if ended_ms is None or ended_ms > since_ts:
             return True
-    return False
+    return bool(_env_get(cfg.grid_env, _dimension_env(dimension)["candidate"]))
+
+
+def _neighbours(cfg: WeeklyConfig, versions: Versions, dimension: str, since_ts: int) -> list[str]:
+    """Every OTHER dimension that split live traffic during this leg's window.
+
+    The question that decides whether a two-arm verdict may be remembered by `lost_tags`: with no
+    neighbour the leg was an ordinary single-dimension A/B and its number is the complete and
+    correct measurement; with one, the number is taken across two uncontrolled conditions.
+    """
+    return sorted(d for d in DIMENSIONS if d != dimension and _overlapped(cfg, versions, d, since_ts))
+
+
+def _refuse_untrustworthy_ledger(cfg: WeeklyConfig, versions: Versions, state: dict, dimension: str) -> None:
+    """Refuse the week outright when the verdict ledger has changed under a recorded measurement.
+
+    Checked before anything is tallied and therefore before anything is written. The only fault
+    that reaches here is a verdict ledger that no longer extends -- or no longer hashes to -- the
+    prefix a partner's judging row recorded over it. An absent prefix is a gap in the VERSIONS
+    ledger and is handled by degrading; this is a fault in the colony's fossil record itself.
+    """
+    partner, _ = _factorial_partner(cfg, versions, state, dimension)
+    if partner is None:
+        return
+    _, other_state, judging_row = partner
+    if judging_row is None or int(other_state["judgings"]) <= int(state["judgings"]):
+        return
+    recorded = judging_row.get("verdict_window")
+    if recorded is None or recorded.get("rows") is None:
+        return                                # a gap in our own row, not in the fossil record
+    led = Ledger(Path(cfg.verdicts_dir) / "verdicts.jsonl")
+    try:
+        _verdict_prefix(led.rows(), recorded, torn_at=led._corrupt_line)
+    except ValueError as e:
+        raise LedgerRewritten(
+            f"{e}. The {dimension} A/B cannot be judged over a verdict ledger that no longer "
+            "matches what its partner measured, and a two-arm tally over the same file would "
+            "repair nothing. Restore the ledger from the receipts, or abort both legs with "
+            "`grid.weekly ab --abort --dimension <d>`") from e
 
 
 def _partner_bound(versions: Versions, dimension: str, since_ts: int,
@@ -1115,8 +1208,22 @@ def lost_tags(versions: Versions, *, dimension: str = UNSALTED_DIMENSION) -> set
         if not tag or dimension_of(r) != dimension:
             continue
         reason = str(r.get("reason", ""))
+        block = (r.get("evals") or {}).get("colony_ab") or {}
         if reason.startswith(("colony A/B lost", "colony A/B stuck", "colony A/B inconclusive")):
-            short = ((r.get("evals") or {}).get("colony_ab") or {}).get("short_arms")
+            # N5: a week the gate itself marked unrememberable. A two-arm verdict taken while
+            # ANOTHER dimension was splitting live traffic was measured across two uncontrolled
+            # conditions -- the thing the interlock exists to refuse -- so it may hold or release
+            # but must not permanently reject. Only `lost` and `stuck` are exempted:
+            # `inconclusive after 2 weeks` is the livelock guard (a candidate that cannot reach
+            # sample size in MAX_WEEKS must not be auto-retried forever), and a confounded week
+            # is still a week in which it did not reach it.
+            #
+            # An EXPLICIT key, never a sniff of the reason prose: the reason is already
+            # load-bearing for the prefix match above and must not become load-bearing twice.
+            if (block.get("remember") is False
+                    and reason.startswith(("colony A/B lost", "colony A/B stuck"))):
+                continue
+            short = block.get("short_arms")
             if short is None or not (set(short) - {tag}):
                 lost_at[tag] = r["ts"]
         elif r["decision"] == "unchanged" and reason.startswith("operator forgot"):
@@ -1332,7 +1439,7 @@ def _is_factorial(state: dict) -> bool:
     return bool(((state["started_row"].get("evals") or {}).get("colony_ab") or {}).get("factorial"))
 
 
-def _factorial_partner(versions: Versions, state: dict, dimension: str) -> tuple[tuple[str, dict, int | None] | None, str]:
+def _factorial_partner(cfg: WeeklyConfig, versions: Versions, state: dict, dimension: str) -> tuple[tuple[str, dict, dict | None] | None, str]:
     """The other leg of a factorial run as `((other, other_state, until_ts), "")`, or
     `(None, why)` naming the reason this week must be judged two-arm instead.
 
@@ -1368,7 +1475,7 @@ def _factorial_partner(versions: Versions, state: dict, dimension: str) -> tuple
     # pair would come to be judged two-arm with nothing logged.
     uncrossable = sorted(d for d in others
                          if {dimension, d} != set(FACTORIAL_DIMENSIONS)
-                         and _overlapped(versions, d, int(state["since_ts"])))
+                         and _overlapped(cfg, versions, d, int(state["since_ts"])))
     if uncrossable:
         return None, (f"{', '.join(uncrossable)} splitting alongside it, which is not one of the "
                       f"{list(FACTORIAL_DIMENSIONS)} axes a factorial tally can cross")
@@ -1390,8 +1497,7 @@ def _factorial_partner(versions: Versions, state: dict, dimension: str) -> tuple
     return None, ""
 
 
-def _judge_ab(cfg: WeeklyConfig, versions: Versions, state: dict, dimension: str, *,
-              week: str) -> tuple[str, str, dict, dict]:
+def _judge_ab(cfg: WeeklyConfig, versions: Versions, state: dict, dimension: str) -> tuple[str, str, dict, dict]:
     """This Sunday's verdict for one dimension: `(verdict, reason, arms, extra_block)`.
 
     Ordinarily a two-arm tally in this dimension alone -- unchanged. On a week that is one leg of
@@ -1400,64 +1506,82 @@ def _judge_ab(cfg: WeeklyConfig, versions: Versions, state: dict, dimension: str
     -- `is_validity_loss`, `short_arms`, `lost_tags` reading `short_arms` back, the operator
     reading the row -- is about THIS dimension's two arms, and a cell is not one of them.
 
-    TWO BOUNDS, BOTH READ OFF THE PARTNER'S OWN JUDGING ROW, and only when that row belongs to
-    the cycle now being judged:
+    TWO BOUNDS, BOTH READ OFF THE PARTNER'S OWN JUDGING ROW:
 
     - `until_ts`, the partner's judging instant, bounds which PROPOSALS are in the window. One
-      answered after the partner's numbers were frozen is not part of what the partner measured.
+      answered after the partner's numbers were frozen is not part of what the partner measured,
+      and a reply that fails validation settles nothing -- so it lands in `answered` and in no
+      verdict row at all, which is the half the prefix below cannot reach.
     - `until_verdicts`, the `verdict_window` that row already records, bounds which VERDICTS
-      count -- the verdict ledger's exact, hash-chained prefix at that instant. This is the bound
-      an earlier round of this report called impossible. It is not: a verdict ROW carries no
-      timestamp, but every judging row has always recorded the verdict ledger's own position, and
-      "count the verdicts that had landed when the partner was judged" is exactly that prefix.
-      Without it, proposals already inside the window go on settling between the two `release`
-      calls and the leg judged second counts more of them -- twelve settlements were enough, on
-      the reviewer's fixture, to release a model in one command order and permanently blacklist a
-      variant in the other.
+      count -- the verdict ledger's exact, hash-chained prefix at that instant. A verdict row
+      carries no timestamp, so proposals already inside the window go on settling between the two
+      `release` calls; without this the leg judged second counts more of them.
 
-    WEEK-SCOPED, and that is not a refinement but a correctness condition. A partner judged LAST
-    Sunday is BEHIND this leg, not ahead of it: its verdict belongs to a cycle that is over, and
-    bounding this week's tally at it would measure last week's numbers again forever. Every
-    still-open partner is exactly one week old on the following Sunday -- the normal state of a
-    factorial run, since an inconclusive first week neither closes an episode nor stops the split
-    -- so a bound that ignored `week` would fire on the FIRST leg of every second Sunday. An
-    earlier version of this gate refused that week outright, which wrote no row, never incremented
-    `weeks`, never reached MAX_WEEKS, and left the interlock blocking both dimensions forever.
-    A leg whose partner has not been judged THIS cycle is simply the first of the cycle, and the
-    first leg needs no bound at all: it cannot count what has not happened yet.
+    WHEN THE BOUND APPLIES: when the partner has been JUDGED MORE TIMES THAN THIS LEG HAS. That
+    is the whole rule, and it is a fact about the two episodes rather than about the calendar.
+    Within one round the leg judged first has an equal count -- so it is unbounded, correctly,
+    since it cannot count what has not happened yet -- and the leg judged second sees a partner
+    one ahead and is held to what the first one saw. On the following Sunday the counts have
+    caught up again, so the first leg of the new round is unbounded and free to count the week's
+    traffic in full.
+
+    An earlier build keyed this on the ISO week instead. That was a proxy for episode identity,
+    and a wrong one: ISO weeks roll over at Monday 00:00 while the gate's cycle starts Sunday
+    06:00, so a second leg run on Monday morning -- the likeliest delay there is -- fell into a
+    different label, was read as the first leg of a new round, and was tallied UNBOUNDED. The two
+    orders then reached opposite binding verdicts on identical data. Counting judgings needs no
+    calendar, no `--week` discipline from the operator, and no clock at all.
 
     `factorial_judged` is on every block this returns, True or False, and a leg whose own row
     claims `factorial` but that could not be judged as one says so IN THE REASON and logs a
-    WARNING. A row must describe what was actually computed: inheriting `factorial: True` from
-    the `ab_started` row while carrying a two-arm tally makes a reader deduce the truth from
-    keys that are ABSENT.
+    WARNING. A row must describe what was actually computed.
     """
-    partner, degraded = _factorial_partner(versions, state, dimension)
+    partner, degraded = _factorial_partner(cfg, versions, state, dimension)
     until_ts: int | None = None
     until_verdicts: dict | None = None
+    abandoned = False
     if partner is not None:
         other, other_state, judging_row = partner
-        if judging_row is not None and str(judging_row.get("week")) == str(week):
-            # The partner was judged in THIS cycle, so this leg is the second and must be held to
-            # what the first one saw. A fault in the recorded prefix degrades the week rather than
-            # taking the Sunday down -- but it must not be silently ignored, or the two legs go
-            # back to measuring different verdict sets with nothing on the row to say so.
+        if judging_row is not None and int(other_state["judgings"]) > int(state["judgings"]):
+            # A recorded prefix that is merely ABSENT degrades the week to a two-arm tally. One
+            # that says the verdict ledger no longer matches what was measured is refused before
+            # this point, by `_refuse_untrustworthy_ledger`.
             fault = _verdict_prefix_fault(cfg.verdicts_dir, judging_row.get("verdict_window"))
             if fault:
                 partner, degraded = None, fault
             else:
                 until_ts = int(judging_row["ts"] * 1000)
                 until_verdicts = judging_row["verdict_window"]
+        elif judging_row is None:
+            # An UNJUDGED partner that was superseded mid-window stopped splitting the moment its
+            # successor opened, and nothing recorded a prefix for it. The design only ever ran up
+            # to that instant, so the window is truncated there rather than running on to now.
+            # Otherwise the row names a partner that had stopped, over traffic belonging to
+            # whatever replaced it -- and a successor that reuses BOTH labels writes rows that ARE
+            # cell keys, inflating the sample and carrying an otherwise-inconclusive week over
+            # MIN_SAMPLE into a binding, blacklisting verdict on somebody else's experiment.
+            if other_state["ended_ms"] is not None:
+                until_ts, abandoned = int(other_state["ended_ms"]), True
     if partner is None:
         arms = ab_arms(cfg.verdicts_dir, since_ts=state["since_ts"], incumbent=state["incumbent"],
                        candidate=state["candidate"], dimension=dimension)
         verdict, reason = ab_decide(arms, incumbent=state["incumbent"], candidate=state["candidate"])
+        block: dict = {"factorial_judged": False}
         if _is_factorial(state):
             degraded = degraded or "no other dimension was splitting during this window"
             log.warning("colony A/B: %s was started as a factorial run but is being judged "
                         "two-arm: %s", dimension, degraded)
             reason = f"{reason} [factorial run, judged two-arm: {degraded}]"
-        return verdict, reason, arms, {"factorial_judged": False}
+            # A two-arm number taken while ANOTHER dimension was splitting live traffic was
+            # measured across two uncontrolled conditions -- precisely what the interlock refuses,
+            # and what this module elsewhere calls a confident wrong answer written into an
+            # append-only file. Such a week may hold, release or read inconclusive; it must not
+            # enter the permanent rejected list. With NO neighbour the leg really was an ordinary
+            # single-dimension A/B for its whole window, the tally is complete and correct, and
+            # remembering a loss is right -- so the flag is set only when a neighbour was live.
+            if _neighbours(cfg, versions, dimension, int(state["since_ts"])):
+                block["remember"] = False
+        return verdict, reason, arms, block
     other, other_state, _ = partner
     pairs = {dimension: (state["incumbent"], state["candidate"]),
              other: (other_state["incumbent"], other_state["candidate"])}
@@ -1470,10 +1594,16 @@ def _judge_ab(cfg: WeeklyConfig, versions: Versions, state: dict, dimension: str
     # APPENDED to the reason, never prepended: `lost_tags` matches on the reason's PREFIX
     # ("colony A/B lost" / "stuck" / "inconclusive"), so a note in front would erase the colony's
     # memory of a candidate that just lost on a perfectly attributable marginal.
-    bounded = "" if until_ts is None else ", up to the verdicts it was judged on"
+    if abandoned:
+        bounded = ", up to the moment that leg was superseded unjudged"
+    elif until_ts is None:
+        bounded = ""
+    else:
+        bounded = ", up to the verdicts it was judged on"
     reason = f"{reason} [factorial marginal, pooled over {other}{bounded}]"
     return verdict, reason, result["marginals"][dimension], {
         "factorial": True, "factorial_judged": True, "factorial_with": {other: other_state["candidate"]},
+        "factorial_partner_abandoned": abandoned,
         "factorial_since_ts": since, "factorial_until_ts": until_ts,
         "factorial_until_verdicts": until_verdicts,
         "cells": four, "interaction": result["interaction"]}
@@ -1568,7 +1698,8 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
         # marginal, pooled over the other. `arms` is THIS dimension's two arms either way, so
         # everything below (the validity floor, short_arms, lost_tags' later read of it) is
         # unchanged and needs no factorial branch of its own.
-        verdict, reason, arms, factorial_block = _judge_ab(cfg, versions, state, dimension, week=week)
+        _refuse_untrustworthy_ledger(cfg, versions, state, dimension)
+        verdict, reason, arms, factorial_block = _judge_ab(cfg, versions, state, dimension)
         # I1/N2: a validity loss is FULLY ATTRIBUTED to the candidate -- it was asked plenty and
         # answered badly -- so it carries the `[]` encoding, exactly like a loss on the merits.
         # Left to short_arms() it would not: a validity loss has the candidate under MIN_SAMPLE
@@ -2320,9 +2451,16 @@ def main(argv: list[str] | None = None) -> int:
         if a.dry_run:
             async def fake(prompt): return "I am Kannaka. []"
             ask_factory = lambda model: fake
-        row = asyncio.run(release(cfg, remote, ask_factory=ask_factory, local_run=local_run, week=a.week,
-                                  dry_run=a.dry_run, dimension=dimension, candidate=a.candidate,
-                                  factorial=a.factorial))
+        try:
+            row = asyncio.run(release(cfg, remote, ask_factory=ask_factory, local_run=local_run, week=a.week,
+                                      dry_run=a.dry_run, dimension=dimension, candidate=a.candidate,
+                                      factorial=a.factorial))
+        except LedgerRewritten as e:
+            # BEFORE the ledger and before any flip: `release` raises on its way in, so nothing
+            # was written and nothing moved. The verdict ledger is hash-chained precisely so this
+            # is detectable, and there is no reading of a detected rewrite that does not need a
+            # human -- so this is the one fault the gate refuses rather than degrades.
+            ap.error(str(e))
     print(json.dumps({k: row[k] for k in ("week", "decision", "version", "previous", "reason", "spend_usd", "over_budget")}, default=str))
     return _exit_code(row)
 
