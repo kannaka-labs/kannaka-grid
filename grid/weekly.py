@@ -2106,9 +2106,12 @@ def ab_reconcile(cfg: WeeklyConfig, *, dimension: str = UNSALTED_DIMENSION, loca
         # world and absent from the ledger, and the reconciler is the one thing that runs nightly
         # and can see both. `_unrecorded_release` will only say yes to evidence that no other path
         # can produce, so this records a release that demonstrably happened -- it never invents one.
+        # `last_rel` is None on a dimension's FIRST-EVER release, which is exactly the state the
+        # prompt dimension is in until its first winner lands -- so this must not subscript it.
+        previously = last_rel["version"] if last_rel else "none"
         why = (f"colony A/B reconciled: {recorded} was flipped live but the relay restart failed, "
                f"so the release was applied and never recorded (last recorded release: "
-               f"{last_rel['version']})")
+               f"{previously})")
         if candidate != recorded:
             # Two facts, one row, and the row says both rather than silently merging them.
             why = f"{why}; {cfg.grid_env.name} also carried a {candidate} split, now cleared"
@@ -2152,8 +2155,10 @@ def _unrecorded_release(cfg: WeeklyConfig, dimension: str,
     three. `last` is the standing `flip_incomplete`:
 
     - it recorded a WINNER equal to its own version, so the colony judged that name and the gate
-      went on to flip it. Nothing else in the module sets `winner`: a reconciler row, an abort
-      snapshot, a stuck row and every start-path failure all carry `winner: None`;
+      went on to flip it. Nothing else in the module sets `winner` EXCEPT the carry-forward this
+      check itself authorises: an abort snapshot, a stuck row and every start-path failure all
+      carry `winner: None`, and a reconciler row does too unless it is carrying a standing
+      `flip_incomplete`'s winner forward so a failed repair can be retried on a later night;
     - the live grid.env line IS that name today. This is what separates a flip that applied from
       one that did not. `flip()`'s tag-copy failure reverts both env lines, and `_flip_local`
       reverts both lines too, so on either of those paths the live line still holds the incumbent

@@ -4711,6 +4711,35 @@ def test_one_dimensions_registry_fault_does_not_silence_the_others_nightly(tmp_p
     assert "variant registry did not load" in by_dim["prompt"]["reason"]
 
 
+def test_the_reconciler_records_a_dimensions_very_first_release(tmp_path, monkeypatch, capsys):
+    # The C2 repair names the previously recorded release in its reason. On a dimension's
+    # FIRST-EVER release there is none, and `_last_released` returns None -- which is precisely
+    # the state the prompt dimension is in until its first winner lands, i.e. the state the very
+    # first prompt experiment ends in. Subscripting it there turned the one nightly path that
+    # repairs a standing `flip_incomplete` into a crash, on the first occasion it would ever run.
+    #
+    # Mutation: `previously = last_rel["version"]` -> TypeError out of `ab_reconcile`, the
+    # nightly dies on this dimension, and the applied-but-unrecorded release stays unrecorded.
+    import grid.weekly as weekly_mod
+    from grid.weekly import main
+    _ab_cli_env(tmp_path, monkeypatch,
+                "MIND_MODEL_ALIAS=kannaka-brain-v3\n"
+                "MIND_PROMPT_VARIANT=v2-terse\nMIND_PROMPT_CANDIDATE=v2-terse\n"
+                "MIND_PROMPT_AB_SPLIT=0.2\n")
+    # No prior `released` row in this dimension at all: the ledger has only this experiment.
+    _seed_ab_row(tmp_path, dimension="prompt", version="v2-terse", decision="ab_started",
+                 incumbent="v1-sandbox", since_ts=1_000_000)
+    _seed_ab_row(tmp_path, dimension="prompt", version="v2-terse", decision="flip_incomplete",
+                 winner="v2-terse", reason="the variant was flipped live; relay restart failed twice")
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)
+
+    assert main(["ab", "--check", "--dimension", "prompt"]) == 0
+    row = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.strip()][-1]
+    assert row["decision"] == "released" and row["version"] == "v2-terse"
+    assert row["previous"] is None                      # there was no previous release
+    assert "last recorded release: none" in row["reason"]
+
+
 def test_a_broken_registry_does_not_block_the_prompt_reconcilers_repair(tmp_path, monkeypatch, capsys):
     # The reconciler is not a prompt reader, and after C2 it must not become one. Its
     # applied-but-unrecorded test asks whether the LIVE grid.env line is the winner; resolved
