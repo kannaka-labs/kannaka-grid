@@ -338,3 +338,74 @@ def test_load_registry_rejects_non_string_note(tmp_path):
     registry_path = _write_registry(tmp_path, default="bad-note", variants={"bad-note": entry})
     with pytest.raises(VariantError, match="bad-note"):
         load_registry(registry_path)
+
+
+# --- the SHIPPED registry, which is what the relay actually serves --------------------------
+
+def test_the_shipped_registry_has_something_to_test_the_default_against():
+    """One variant means the prompt feature is dark by construction: `start_ab` refuses an A/B
+    whose two arms are the same value (odin refuses it at boot), so with a single entry there is
+    no candidate that can legally be written into MIND_PROMPT_CANDIDATE, and every code path
+    built for this dimension is unreachable on the real registry.
+
+    Mutation: delete the second entry from grid/data/prompt_variants.json -> RED.
+    """
+    from grid.variants import load_registry
+    default_id, variants = load_registry()
+    assert default_id == "v1-sandbox"                 # unchanged: a new arm is not a new default
+    challengers = sorted(set(variants) - {default_id})
+    assert challengers, "the registry ships only its default, so no prompt A/B can be started"
+    # ...and a challenger has to be a different prompt, not a renamed copy of the incumbent
+    for vid in challengers:
+        assert variants[vid].template != variants[default_id].template, f"{vid} is a copy of the default"
+        assert variants[vid].sha256 != variants[default_id].sha256
+
+
+def test_every_shipped_variant_keeps_the_two_things_that_make_a_reply_usable():
+    """Both are failure modes seen live, not style rules.
+
+    The sandbox-context paragraph: without it the model's safety layer reads thegrid's directive
+    plus opcodes named steal and corrupt as a request for self-replicating malware and returns an
+    empty completion (finish_reason=content_filter, Skywave 2026-09-05). A variant that drops it
+    does not answer badly, it does not answer at all -- and the answer-quality floor would take a
+    week's traffic to say so.
+
+    The closing instruction: `validate` looks for a bare JSON array of instruction names, so a
+    variant that invites prose loses on answer quality rather than on its wording, which means
+    the experiment measured something other than the thing it claims to measure.
+
+    Mutation: drop either line from a shipped template (and re-pin its hash) -> RED.
+    """
+    from grid.proposal import SANDBOX_CONTEXT
+    from grid.variants import load_registry
+    _, variants = load_registry()
+    for vid, v in sorted(variants.items()):
+        assert v.template.startswith(SANDBOX_CONTEXT), f"{vid} does not open with the sandbox context"
+        assert v.template.rstrip().endswith(
+            "Answer with a JSON array of instruction names and nothing else."), \
+            f"{vid} does not close by asking for a bare JSON array"
+
+
+def test_every_shipped_variant_renders_and_can_be_served_on_either_ask_route(fixture_request):
+    """A shipped variant has to render for real (the loader's smoke-render binds every placeholder
+    to a dummy; this binds the real ones) and has to be servable on BOTH routes the deploy supports.
+
+    `check_sampling_route` takes the relay DOWN at boot for a variant whose temperature or
+    max_tokens differ from the daemon's defaults when there is no MIND_LLM_URL -- and
+    `set-mind-model.sh --via-daemon` is a supported configuration. A variant that deliberately
+    wants different sampling is legitimate, but it constrains the deployment, so it is a
+    deliberate edit here and a note in deploy/README.md, never a surprise on a Sunday.
+
+    Mutation: give a shipped variant temperature 0.9 -> RED.
+    """
+    from grid.odin import check_sampling_route
+    from grid.proposal import render_prompt
+    from grid.variants import load_registry
+    _, variants = load_registry()
+    check_sampling_route(None, *variants.values())
+    for vid, v in sorted(variants.items()):
+        out = render_prompt(fixture_request, ["remembered one"] if v.recall else [], v)
+        assert fixture_request.directive in out and "- harvest (cost 0.1): do harvest" in out, vid
+        for placeholder in ("{directive}", "{isa_lines}", "{ecology}", "{parent}", "{memory}",
+                            "{genome_count}", "{genome_json}", "{genome_cap}"):
+            assert placeholder not in out, f"{vid} left {placeholder} unsubstituted"

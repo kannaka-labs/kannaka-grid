@@ -81,6 +81,44 @@ All commands run from `/srv/grid/kannaka-grid`.
 sudo cp deploy/systemd/grid-bridge.service deploy/systemd/grid-odin.service /etc/systemd/system/ && sudo systemctl daemon-reload
 sudo systemctl enable --now grid-bridge.service grid-odin.service
 ```
+
+### 3a. A relay restart now tells you whether the relay came back
+`grid-odin.service` is `Type=simple`, which means systemd calls the start job done the moment
+it has forked the process. `systemctl restart grid-odin.service` therefore used to exit 0 even
+when the relay died a second later on a `grid.env` it refuses — an unknown `MIND_PROMPT_VARIANT`
+or `MIND_PROMPT_CANDIDATE`, a candidate equal to the incumbent, a split outside (0, 1). Those
+refusals are deliberate and fail-closed, and each leaves the colony's mind **down**, not merely
+mislabelled. The weekly gate reads that exit code and nothing else, so its revert-and-restart
+path — the one whose own comments describe exactly this case — never ran for it, and the ledger
+recorded `ab_started` over a relay that was not running.
+
+The unit's `ExecStartPost=` closes that: `deploy/skywave/relay-ready.sh` waits for the relay to
+log `watching <queue> for <agent>` (emitted only after the env parsed, the variants resolved,
+the sampling route was accepted and the bus connected) and then checks that the `A/B:` and
+`prompt:` lines it logged name the values this unit's `EnvironmentFile` just handed it. It is
+not a `sleep`: it polls for that evidence, scoped to this start's `_SYSTEMD_INVOCATION_ID` so a
+line from the *previous* start can never pass it, and it gives up at once — without waiting out
+its 60 s deadline — if the main process is already gone. Reading the journal is why the unit
+carries `SupplementaryGroups=systemd-journal`.
+
+**What an operator sees when the check fails.** `systemctl restart` (or `deploy.sh`, or the
+gate) exits non-zero with `Job for grid-odin.service failed because the control process exited
+with error code.` `systemctl status grid-odin` shows the failed `relay-ready.sh` control
+process, and `journalctl -u grid-odin -n 40` carries one `relay-ready:` line saying which of the
+three things went wrong, above the relay's own last twenty lines:
+- `the relay exited during start: it read /srv/grid/grid.env and refused it` — the fail-closed
+  case. The refusal itself (`VariantError: unknown variant 'v2-tesre'`, `MIND_PROMPT_AB_SPLIT=1.0
+  is out of range`, …) is in the lines printed above it. Fix `grid.env` and restart. When the
+  weekly gate provoked it, the gate has already put `grid.env` back and restarted onto the
+  restored values, and reported `flip_incomplete` with exit 3.
+- `the relay is still alive after 60s but has not logged 'watching'` — it is stuck before that
+  point, almost always retrying a NATS connect. If the bus is merely slow, raise
+  `RELAY_READY_TIMEOUT_S` (an environment override, default 60; `TimeoutStartSec=120` is the
+  ceiling above it). `Restart=always` keeps retrying in the background either way, so the relay
+  still comes up on its own once the bus does.
+- `the relay came up on a configuration this unit did not hand it` — the process answering is
+  not serving `/srv/grid/grid.env`. Expect this only after an edit that raced a restart.
+
 Receipts (acceptance criteria, spec §12):
 1. `journalctl -u grid-bridge -f` shows no `dropped` lines; from the operator seat, `kannaka swarm tail --subject 'GRID.>'` (or the nats app's capture) shows `GRID.colony-one.event.epoch.started` then `.state` every 60 s.
 2. Storms fire when host load rises: the proxy maps whole-host CPU to 45–85 °C and thegrid's substrate needs its fast thermal average (alpha 0.001 per tick ≈ 1000 ticks) to climb ≥ 1.5 °C over the slow baseline. **Under the unit's `CPUQuota=5%` the colony runs at ~1.5 ticks/s on Skywave (measured 2026-09-05: 45 ticks per 30 s), so 1000 ticks is ~11 minutes**, and a short burst cannot do it. Force one with a full core held for thirty minutes: `timeout 1800 python3 -c 'while True: pass'` (one core ≈ 17 % of Skywave's 6 CPUs ≈ +6.7 °C step). `GRID.colony-one.event.storm` appears during the burst. The first chronicle (receipt 5) likewise lands at tick 2000 ≈ 22 minutes after the colony starts.
@@ -260,6 +298,107 @@ Never put a comment after a value in `grid.env` (`ODIN_RETRY_S=60   # 900 on a C
 `EnvironmentFile` keeps it *in the value*, `float()` on it kills the relay at boot, and neither the
 gate nor the relay strips it — deliberately, so that both always read a value identically. Put the
 comment on its own line above.
+
+## 6. Prompt variants (self-improvement sub-project 3)
+The gate can A/B which **wording** the relay asks the mind with, exactly as §5 A/Bs which
+**model** answers. A *variant* is one prompt template plus the sampling it wants: a Markdown
+file under `grid/data/prompts/` and an entry in the registry at
+`grid/data/prompt_variants.json` naming its file, its sha256, `temperature`, `max_tokens`,
+`recall` (whether the ask is preceded by a `kannaka recall`) and a `note` saying what it is for.
+The relay resolves its variant **once**, at start-up, and logs the id and hash on every
+proposal, so a week's rows can always be attributed to the bytes that produced them.
+
+`python -m grid.weekly ab --dimension prompt` prints what is running; the receipts script's
+`6-prompt-state.txt` prints the registry default, the variant the relay is serving, and each
+arm's answer quality.
+
+**Adding a variant.** Write the template, hash it, add the entry, commit both:
+```bash
+cd /srv/grid/kannaka-grid                     # or your checkout
+$EDITOR grid/data/prompts/v3-my-idea.md
+python3 -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" \
+  grid/data/prompts/v3-my-idea.md
+$EDITOR grid/data/prompt_variants.json        # new key under "variants"; leave "default" alone
+/srv/grid/venv/bin/python -c "from grid.variants import load_registry; d,v=load_registry(); print(d, sorted(v))"
+```
+That last line is the whole acceptance test: the loader fails closed, so if it prints, the
+registry is servable. Two rules the shipped variants exist to illustrate:
+1. **Keep the sandbox-context paragraph.** Without it the model's safety layer reads thegrid's
+   directive plus opcodes named `steal` and `corrupt` as a request for self-replicating malware
+   and returns an empty completion. A variant that drops it does not do badly; it returns
+   nothing at all.
+2. **The reply must still parse as a bare JSON array of instruction names.** A variant that
+   invites reasoning, or a preamble, loses on answer quality rather than on its wording, and the
+   experiment measures the wrong thing.
+
+**A variant is immutable once named.** Editing a template in place and re-pinning its hash is
+refused: not by the loader, which would accept the new bytes, but by the design around it — the
+ledger row that opened an A/B names an id, the proposal log rows name an id and a hash, and
+silently changing what that id says mid-experiment invalidates every row already collected. So
+the loader raises `VariantError` at **start-up** on any drift it can see (a hash that does not
+match its file, a missing or empty template, an unknown placeholder, a template that will not
+render, a path escaping the registry directory, a duplicate id, a `default` naming an absent
+variant) and grid-odin refuses to boot rather than serving something the ledger cannot name.
+There is no warning path and no fallback to the default. **To change a prompt, add a new id.**
+
+**Hand-starting a prompt A/B for a smoke test** — the mirror of §5's model one. In
+`/srv/grid/grid.env` set `MIND_PROMPT_CANDIDATE=<variant id>` and `MIND_PROMPT_AB_SPLIT=0.2`
+(20% candidate, 80% incumbent; its own knob, deliberately not `MIND_AB_SPLIT`, so widening a
+model rollout cannot re-randomise which wording each request gets mid-experiment). Leave
+`MIND_PROMPT_VARIANT` alone unless you mean to change the incumbent: blank means the registry's
+`default`, which is the id the relay logs and the gate counts the incumbent arm under. Then:
+```bash
+sudo systemctl restart grid-odin.service      # non-zero here means it did NOT come back: see §3a
+journalctl -u grid-odin -n 20 | grep 'prompt A/B:'          # both ids and the split
+/srv/grid/venv/bin/python -m grid.weekly ab --dimension prompt     # arms and counts so far
+# each request's variant matches odin's own assignment, from the log alone:
+grep -o '"prompt_variant":"[^"]*"' /srv/grid/colony-one/verdicts/proposals.jsonl | sort | uniq -c
+/srv/grid/venv/bin/python -m grid.weekly ab --abort --dimension prompt   # done: clear and restart
+```
+The nightly reconciler leaves a hand-started split completely alone (it keys on `ab_started`
+rows, i.e. on "did the *gate* start this?"), and stays exempt across as many runs of this
+receipt as you like, because `ab --abort` writes a `held` row and never an `ab_started` one.
+
+**The answer-quality floor, and why a bad variant costs hours instead of weeks.** Each arm's
+proposals are tallied two ways: the verdict rows say what the colony did with the genomes it
+produced, and the proposal log says how many asks it could answer *at all*. `validity` is
+`valid / answered` — asks binned after repeated defers (a gateway outage) sit outside both sides
+of the ratio, because that is the colony's availability failing, not the arm's wording. Once a
+candidate has `answered` at least 20 asks, a `validity` below 0.5 is an immediate **loss**,
+decided before the settled-sample check. That ordering is the point: a variant whose replies do
+not parse produces no genomes, so it settles nothing, so on verdict rows alone it merely looks
+*slow* — it would read `inconclusive` week after week and be held at the two-week cap with a
+reason blaming sample size instead of the wording. The floor is the candidate's alone; an
+incumbent below it is a colony-wide fault, and the nightly stuck check owns that case.
+
+**One experiment at a time.** A `release` that would start an A/B while another dimension is
+already splitting — whether that split is in the ledger or hand-started in `grid.env` — records
+`unchanged: <other> A/B already running (…); refusing to start a … experiment whose verdict it
+would confound` and exits 0. A model verdict collected while a prompt A/B runs was measured
+across two wordings, and a prompt verdict during a model A/B across two sets of weights; both
+are recorded as *binding*, so a confounded week is not a slow week but a confident wrong answer
+written into an append-only file.
+
+**`--factorial` is the deliberate override**, and only on `release`:
+```bash
+/srv/grid/venv/bin/python -m grid.weekly release --dimension prompt --candidate v3-my-idea --factorial
+```
+It refuses when nothing is blocking (it starts a factorial run; it cannot retro-fit one onto an
+A/B already open, and it must not stamp `factorial: True` on an ordinary single-dimension week).
+It does not merely silence the interlock: it changes how the week is judged. The tally becomes
+the four `model|variant` cells, and each dimension is decided on its **marginal** — the two
+cells sharing that level, pooled, with ratios re-derived from the summed counts rather than
+averaged. odin salts the two dimensions' hashes separately, so wording is balanced across both
+model arms by construction and pooling cancels it out. The sample floor stays per marginal, not
+per cell: at `MIN_SAMPLE=100` a 2x2 run needs 50 settled per cell. `factorial` is written onto
+the `ab_started` row either way, true or false, so a later reader can tell a week that
+deliberately crossed two dimensions from one that merely got confounded.
+
+The row also reports an **interaction** — whether the candidate wording helps the candidate
+model more than it helps the incumbent. It is `advisory: True`, it carries its own reason
+saying so, and **nothing reads it, and nothing may**: an interaction is estimated per cell, and
+a cell is a quarter of the traffic a marginal pools. Deciding on it would be deciding on a
+quarter-sample dressed up as the most sophisticated number in the file.
 
 ## Known limits (v0.1)
 - Memories written by the bridge become visible to asks only after the 6 h dream+restart.

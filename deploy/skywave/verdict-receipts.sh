@@ -2,8 +2,9 @@
 # deploy/skywave/verdict-receipts.sh - unattended receipts for the verdict
 # pipeline (deploy/README.md §4). Waits for the relay to log its first proposal,
 # waits for that proposal to settle (SETTLE_TICKS later, or the next epoch),
-# captures GRID.<colony>.verdict while the nightly unit runs once by hand, then
-# exports the corpus. Writes /srv/grid/receipts-verdicts-<ts>/ and prints it.
+# captures GRID.<colony>.verdict while the nightly unit runs once by hand, exports
+# the corpus, and records which prompt variant produced the window's proposals and
+# how well each arm answered. Writes /srv/grid/receipts-verdicts-<ts>/ and prints it.
 #
 #   nohup bash ~/grid-deploy/verdict-receipts.sh > ~/grid-deploy/verdict-receipts.log 2>&1 &
 #
@@ -88,4 +89,63 @@ cp "$EXP/manifest.json" "$OUT/5-manifest.json" 2>/dev/null
 { echo "records=$(wc -l < "$EXP/records.jsonl" 2>/dev/null || echo 0)"; echo "negatives=$(wc -l < "$EXP/negatives.jsonl" 2>/dev/null || echo 0)"; } > "$OUT/5-export-counts.txt"
 rm -rf "$EXP"
 log "export manifest written; corpus records stay on the host"
+
+# 6. prompt state - the prompt dimension's counterpart of the model_alias receipts above.
+# A receipt has shown WHICH MODEL answered since sub-project 2; since the prompt loop it
+# also has to show WHICH WORDING, or a week's numbers cannot be attributed at all. Prints
+# the registry default, the variant the relay is actually serving, the candidate and split
+# if a prompt A/B is running, and each arm's answer quality over the same window the gate
+# judges on. Ids, counts and ratios only: no template text and no reply text, the same
+# held-back rule as everything above.
+cd $ROOT/kannaka-grid && $PY - "$VDIR" "${GRID_ENV:-$ROOT/grid.env}" "${RELEASES_DIR:-$ROOT/releases}" \
+  > "$OUT/6-prompt-state.txt" 2>&1 <<'PY'
+import sys
+from pathlib import Path
+
+from grid.variants import load_registry
+from grid.versions import Versions
+# _env_get on purpose: a receipt that read grid.env more forgivingly than the gate does
+# would hide exactly the divergence it exists to expose.
+from grid.weekly import _env_get, ab_arms, ab_state
+
+vdir, env_path, releases = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+default_id, variants = load_registry()
+print("registry_default", default_id)
+print("registry_variants", ",".join(sorted(variants)))
+for vid in sorted(variants):
+    v = variants[vid]
+    print(f"variant {vid} sha256={v.sha256} temperature={v.temperature} "
+          f"max_tokens={v.max_tokens} recall={v.recall}")
+
+# Blank or absent is not "unknown": odin resolves it to the registry default and logs every
+# proposal under THAT id, so this is the label the arms below are counted under.
+live = (_env_get(env_path, "MIND_PROMPT_VARIANT") or "").strip() or default_id
+candidate = (_env_get(env_path, "MIND_PROMPT_CANDIDATE") or "").strip()
+split = (_env_get(env_path, "MIND_PROMPT_AB_SPLIT") or "").strip() or "0.2 (default)"
+print("active_variant", live, "(known to the registry)" if live in variants else "(NOT IN THE REGISTRY: the relay refuses this at boot)")
+print("prompt_candidate", candidate or "none")
+print("prompt_split", split if candidate else "n/a")
+
+state = ab_state(Versions(releases / "versions.jsonl"), dimension="prompt")
+if state is not None:
+    since, source = state["since_ts"], "ledger ab_started row"
+    incumbent, cand = state["incumbent"], state["candidate"]
+else:
+    # No ab_started row: either nothing is running, or the A/B was hand-started by editing
+    # grid.env, which has no row by construction. Either way there is no window start, so the
+    # arms cover all recorded history -- the same reading grid.weekly's env-only view takes.
+    since, source = 0, "no ledger row; arms cover all recorded history"
+    incumbent, cand = live, (candidate or live)
+print("window_since_ts", since, "-", source)
+arms = ab_arms(vdir, since_ts=since, incumbent=incumbent, candidate=cand, dimension="prompt")
+for arm in sorted(arms):
+    if not arm:
+        continue
+    a = arms[arm]
+    role = "candidate" if arm == cand and cand != incumbent else "incumbent"
+    print(f"arm {arm} ({role}) answered={a['answered']} valid={a['valid']} "
+          f"unanswered={a['unanswered']} validity={a['validity']:.3f} "
+          f"settled={a['settled']} reproduced={a['reproduced']} rate={a['rate']:.3f}")
+PY
+log "prompt state written: $(grep -c '^arm ' "$OUT/6-prompt-state.txt" 2>/dev/null || echo 0) arm(s)"
 echo "$OUT"
