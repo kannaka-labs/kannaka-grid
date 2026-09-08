@@ -2413,7 +2413,8 @@ def test_status_scopes_to_its_dimension_and_never_hides_a_prompt_experiment(tmp_
 
 # ---- Task 6: factorial mode ----
 
-def _seed_factorial(tmp_path, *, cells, since_ts=1_000_000, ts=None, tag="", rejected=None, legacy=()):
+def _seed_factorial(tmp_path, *, cells, since_ts=1_000_000, ts=None, tag="", rejected=None,
+                    legacy=(), settle=True):
     """A 2x2 colony week: `cells` maps `(model, variant)` -> `(settled, reproduced)`.
 
     `ts` places the rows in time (default `since_ts + 1000`, i.e. inside the window) and `tag`
@@ -2451,14 +2452,16 @@ def _seed_factorial(tmp_path, *, cells, since_ts=1_000_000, ts=None, tag="", rej
                 "proposal": ["a", "nop"] if outcome == "proposed" else None, **labels}
 
     base = since_ts + 1000 if ts is None else ts
+    pending = []
     for (model, variant), (settled, reproduced) in cells.items():
         labels = {"model_alias": model, "prompt_variant": variant}
         for i in range(settled):
             rid = f"{tag}{model}-{variant}-{i}"
             rows.append(row(rid, base + i, "proposed", labels))
-            led.append({"request_id": rid, "model_alias": model,
-                        "tier": "reproduced" if i < reproduced else "new",
-                        "births": 2 if i < reproduced else 1, "fitness": 1})
+            verdict = {"request_id": rid, "model_alias": model,
+                       "tier": "reproduced" if i < reproduced else "new",
+                       "births": 2 if i < reproduced else 1, "fitness": 1}
+            (led.append(verdict) if settle else pending.append(verdict))
         invalid, deferred = (rejected or {}).get((model, variant), (0, 0))
         for i in range(invalid):
             rows.append(row(f"{tag}{model}-{variant}-bad-{i}", base + 500 + i, "rejected", labels,
@@ -2474,7 +2477,21 @@ def _seed_factorial(tmp_path, *, cells, since_ts=1_000_000, ts=None, tag="", rej
                     "tier": "reproduced", "births": 9, "fitness": 9})
     with open(v / "proposals.jsonl", "a", encoding="utf-8") as f:
         f.write("".join(json.dumps(r) + "\n" for r in rows))
+    if not settle:
+        # The proposals exist and are inside the window; their verdicts have not landed yet.
+        # `_settle` lands them later, which is what "verdicts settling between the two commands"
+        # means -- the case no proposal-timestamp bound can see, and the one that reversed a
+        # binding verdict on the reviewer's fixture with no new traffic at all.
+        return pending
     return ab_arms(v, since_ts=since_ts, cells=list(cells))
+
+
+def _settle(tmp_path, pending):
+    """Land verdicts that were held back. Appends through the real hash-chained ledger."""
+    from grid.verdicts import Ledger
+    led = Ledger(Path(tmp_path) / "v" / "verdicts.jsonl")
+    for verdict in pending:
+        led.append(verdict)
 
 
 def test_a_factorial_run_decides_each_dimension_on_its_marginal(tmp_path):
@@ -2809,13 +2826,13 @@ def _factorial_week(tmp_path, *, model_incumbent="m0", prompt_incumbent="p0"):
     return cfg, since, prompt_since
 
 
-async def _judge(cfg, tmp_path, dimension, now_ms=None):
-    """Judge one leg. `now_ms` matters for a fixture whose ledger rows carry synthetic
-    timestamps: the staleness guard compares the partner's judging row against the clock, so a
-    fixture on a synthetic clock must supply one or every partner reads as decades stale."""
+async def _judge(cfg, tmp_path, dimension, week="W2"):
+    """Judge one leg. `week` is load-bearing: the partner's judging row bounds this leg only when
+    that row belongs to the SAME judging cycle, so a fixture that judges two legs must give them
+    one week, and a two-Sunday fixture must give them different ones."""
     async def never(p): raise AssertionError("probes must not run during an A/B week")
     return await release(cfg, FakeRemote({}), ask_factory=lambda m: never,
-                         local_run=lambda c: 0, week="W2", dimension=dimension, now_ms=now_ms)
+                         local_run=lambda c: 0, week=week, dimension=dimension)
 
 
 async def test_a_factorial_week_is_judged_on_its_marginal_not_on_a_cell(tmp_path):
@@ -3013,13 +3030,20 @@ async def test_the_window_closes_when_the_partner_closed_not_at_the_end_of_time(
     # window with no upper bound would both move the counts and flip the model verdict.
     _seed_factorial(tmp_path, since_ts=prompt_since, ts=closed_ms + 1000, tag="post-",
                     cells={("m0", "p0"): (60, 60), ("m0", "p1"): (60, 60),
-                           ("m1", "p0"): (60, 0), ("m1", "p1"): (60, 0)})
+                           ("m1", "p0"): (60, 0), ("m1", "p1"): (60, 0)},
+                    rejected={c: (25, 0) for c in (("m0", "p0"), ("m0", "p1"),
+                                                   ("m1", "p0"), ("m1", "p1"))})
     model_row = await _judge(cfg, tmp_path, "model")
     ab = model_row["evals"]["colony_ab"]
     assert ab["factorial_judged"] is True and ab["factorial_until_ts"] == closed_ms
     assert ab["arms"]["m0"]["settled"] == 120 and ab["arms"]["m1"]["settled"] == 120
+    # `until_ts` is what bounds the ATTEMPT tally, and the verdict prefix cannot stand in for it:
+    # a reply that fails validation settles nothing, so it appears in `answered` and in no verdict
+    # row at all. The 50 post-close rejects per marginal would drag `validity` from 1.0 to 0.71.
+    # Mutation: drop `until_ts` from the factorial tally -> `answered` reads 170, not 120.
+    assert ab["arms"]["m0"]["answered"] == 120 and ab["arms"]["m0"]["validity"] == 1.0
     assert model_row["decision"] == "released"                    # 0.25 vs 0.20 on the marginal
-    assert model_row["reason"].endswith("[factorial marginal, pooled over prompt, up to its close]")
+    assert model_row["reason"].endswith("[factorial marginal, pooled over prompt, up to the verdicts it was judged on]")
     # The leg judged FIRST has no upper bound: its partner had not closed yet, and there is
     # nothing to bound it with. It says so by carrying `factorial_until_ts: None`.
     assert prompt_row["evals"]["colony_ab"]["factorial_until_ts"] is None
@@ -3173,16 +3197,13 @@ def test_factorial_is_refused_for_a_pair_no_tally_can_cross(tmp_path, monkeypatc
                                 "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_PROMPT_VARIANT=v1-sandbox\n"
                                 "MIND_ADAPTER=a0\nMIND_ADAPTER_CANDIDATE=a1\nMIND_ADAPTER_AB_SPLIT=0.2\n")
     _prompt_registry(monkeypatch)
-    monkeypatch.setattr(weekly_mod, "DIMENSIONS", frozenset({"model", "prompt", "adapter"}))
-    monkeypatch.setitem(weekly_mod._DIMENSION_ENV, "adapter",
-                        {"live": "MIND_ADAPTER", "candidate": "MIND_ADAPTER_CANDIDATE",
-                         "split": "MIND_ADAPTER_AB_SPLIT"})
+    _extra_dimensions(monkeypatch, "adapter")
     monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)
     with pytest.raises(SystemExit) as e:
         main(["release", "--dimension", "prompt", "--candidate", "v2-terse", "--factorial"])
     assert e.value.code == 2
     err = capsys.readouterr().err
-    assert "can only cross ['model', 'prompt']" in err and "adapter" in err
+    assert str(["model", "prompt"]) in err and "can only cross" in err and "adapter" in err
     assert "MIND_PROMPT_CANDIDATE" not in grid_env.read_text()
 
 
@@ -3268,9 +3289,9 @@ def test_factorial_says_so_when_the_week_starts_nothing(tmp_path, monkeypatch, c
 def test_an_abandoned_ab_episode_can_never_date_a_factorial_window(tmp_path):
     # An `ab_started` row arriving while one is already open ABANDONS the previous episode -- the
     # pre-existing reading, which simply overwrote `started`. Two consequences, both tested here:
-    # nothing JUDGED that split, so it has no moment at which its numbers were frozen and it can
-    # never bound the other leg's tally; and it did END, at the instant its successor opened, so
-    # it stops overlapping legs that started after that.
+    # nothing JUDGED that split, so it has no row that could bound the other leg's tally; and it
+    # did END, at the instant its successor opened, so it stops overlapping legs that started
+    # after that.
     # Mutations: let a superseding opener count as the abandoned episode's `judged` row -> a
     # window is dated from a row that judged nothing. Drop the `superseded` fallback from
     # `_episode_span` -> the abandoned episode has no end and overlaps every later leg forever.
@@ -3283,14 +3304,14 @@ def test_an_abandoned_ab_episode_can_never_date_a_factorial_window(tmp_path):
     assert ab_state(versions, dimension="model")["candidate"] == "m2"   # the reading is unchanged
     # A leg that opened at 1_500 overlapped the ABANDONED episode, so that episode is its
     # partner -- it really was splitting traffic then -- but with no judging row it bounds nothing.
-    partner, judged_ms = _partner_bound(versions, "model", 1_500, True)
-    assert partner["candidate"] == "m1" and judged_ms is None
+    partner, judging_row = _partner_bound(versions, "model", 1_500, True)
+    assert partner["candidate"] == "m1" and judging_row is None
     # ...and once something really does judge the live one, it bounds a leg that overlaps IT.
     _seed_ab_row(tmp_path, dimension="model", version="m2", decision="held", since_ts=2_000, ts=3.0)
     versions = Versions(tmp_path / "releases" / "versions.jsonl")
     assert ab_state(versions, dimension="model") is None
-    partner, judged_ms = _partner_bound(versions, "model", 2_500, True)
-    assert partner["candidate"] == "m2" and judged_ms == 3_000
+    partner, judging_row = _partner_bound(versions, "model", 2_500, True)
+    assert partner["candidate"] == "m2" and judging_row["ts"] == 3.0
     # A leg opened at 4_000 overlaps NEITHER: m2 closed at 3_000, and m1 stopped splitting at
     # 2_000 when m2 opened. Without the `superseded` end, m1 would read as open forever and be
     # handed back as the partner of a leg it never ran alongside.
@@ -3315,11 +3336,11 @@ def test_the_partner_is_the_episode_this_leg_was_designed_against(tmp_path):
                      incumbent="m0", since_ts=int(at * 1000), ts=at)
     versions = Versions(tmp_path / "releases" / "versions.jsonl")
     # A prompt leg opened at 2_000 -- while m1 was splitting, and long before m3 existed.
-    partner, judged_ms = _partner_bound(versions, "model", 2_000, True)
-    assert partner["candidate"] == "m1" and judged_ms == 4_000
+    partner, judging_row = _partner_bound(versions, "model", 2_000, True)
+    assert partner["candidate"] == "m1" and judging_row["ts"] == 4.0
     # A leg opened at 9_500, after m3 started, gets m3: same rule, different answer.
-    later, later_judged = _partner_bound(versions, "model", 9_500, True)
-    assert later["candidate"] == "m3" and later_judged is None
+    later, later_row = _partner_bound(versions, "model", 9_500, True)
+    assert later["candidate"] == "m3" and later_row is None
     # ...and a leg that started after m1 closed but before m3 opened was crossed with nothing.
     # Mutation: drop the `ended_ms > since_ts` half of the overlap test -> m1 comes back here.
     assert _partner_bound(versions, "model", 6_000, True) is None
@@ -3331,6 +3352,28 @@ def test_the_partner_is_the_episode_this_leg_was_designed_against(tmp_path):
     versions = Versions(tmp_path / "releases" / "versions.jsonl")
     marked, _ = _partner_bound(versions, "model", 11_000, False)
     assert marked["candidate"] == "m4"
+
+
+def test_the_newest_of_several_marked_episodes_is_the_partner(tmp_path):
+    # SCAN DIRECTION, restored. Round 1 pinned this and my round-2 rewrite deleted the assertion,
+    # after which I reported the forward-scan mutation as EQUIVALENT. It is not: the overlap
+    # predicate has two disjuncts, and only the first is exclusive. `opened_into_this_leg` matches
+    # EVERY marked episode that opened after this leg started, with no upper limit, so two can
+    # match at once and the scan direction chooses between them -- a different partner, a
+    # different window, and therefore potentially a different binding verdict.
+    # Mutation: iterate `_ab_episodes(...)` forward instead of `reversed(...)` -> "mA" comes back
+    # here with its earlier judging row, and this leg is bounded at the wrong instant.
+    from grid.versions import Versions
+    from grid.weekly import _partner_bound
+    # This leg opened at 1_000. Two model experiments then opened DURING it, both marked
+    # factorial -- each a deliberate operator act, the second superseding the first as the design.
+    for version, decision, at, fact in (("mA", "ab_started", 3.0, True), ("mA", "held", 4.0, None),
+                                        ("mB", "ab_started", 5.0, True), ("mB", "held", 6.0, None)):
+        _seed_ab_row(tmp_path, dimension="model", version=version, decision=decision,
+                     incumbent="m0", since_ts=int(at * 1000), ts=at, factorial=fact)
+    versions = Versions(tmp_path / "releases" / "versions.jsonl")
+    partner, judging_row = _partner_bound(versions, "model", 1_000, False)
+    assert partner["candidate"] == "mB" and judging_row["ts"] == 6.0
 
 
 async def test_a_relabelled_incumbent_row_says_no_tally_was_taken(tmp_path):
@@ -3376,9 +3419,14 @@ def _inconclusive_week(tmp_path, *, judged_first, traffic_between=0):
     # The first leg is judged: too small a sample, so `ab_inconclusive` -- which does NOT close
     # the episode. Its `ts` is the moment its numbers were frozen.
     judged_at = since + 5_000
+    # `verdict_window` exactly as `release` records it on every row: the verdict ledger's own
+    # prefix at the instant this leg was judged. That block IS the bound the other leg is held
+    # to, so a fixture that leaves it `{}` is not reproducing a judging row at all.
+    from grid.weekly import _window
+    judged_kw = {**kw, "verdict_window": _window(cfg.verdicts_dir)}
     vs.append(release_row(week="W2", decision="ab_inconclusive", dimension=judged_first,
                           version="m1" if judged_first == "model" else "p1", previous=None,
-                          reason="sample 40/40 below 100 per arm", ts=judged_at / 1000, **kw,
+                          reason="sample 40/40 below 100 per arm", ts=judged_at / 1000, **judged_kw,
                           evals={"colony_ab": {"weeks": 1}}))
     if traffic_between:
         # Heavily skewed, and stamped AFTER that verdict: the leg judged second must not see it.
@@ -3402,7 +3450,7 @@ async def test_an_inconclusive_partner_still_bounds_the_other_leg(tmp_path):
     # the `judged` assignment from the inconclusive branch of `_ab_episodes`) -> `factorial_until_ts`
     # is None here and the 200 skewed rows below are pooled in, 60 per arm instead of 20.
     cfg, since, judged_at = _inconclusive_week(tmp_path, judged_first="model", traffic_between=50)
-    row = await _judge(cfg, tmp_path, "prompt", now_ms=judged_at + 10_000)
+    row = await _judge(cfg, tmp_path, "prompt")
     ab = row["evals"]["colony_ab"]
     assert ab["factorial_judged"] is True
     assert ab["factorial_until_ts"] == judged_at        # the inconclusive row, not a closing row
@@ -3421,7 +3469,7 @@ async def test_an_inconclusive_first_week_is_order_independent_with_traffic_in_b
         root = tmp_path / "-".join(order)
         root.mkdir()
         cfg, since, judged_at = _inconclusive_week(root, judged_first=order[0], traffic_between=50)
-        rows = {d: await _judge(cfg, root, d, now_ms=judged_at + 10_000) for d in order[1:]}
+        rows = {d: await _judge(cfg, root, d) for d in order[1:]}
         versions = Versions(cfg.releases_dir / "versions.jsonl")
         seen[order] = {
             "decision": {d: r["decision"] for d, r in rows.items()},
@@ -3436,95 +3484,6 @@ async def test_an_inconclusive_first_week_is_order_independent_with_traffic_in_b
     assert list(b["arms"].values())[0] == {"m0": 20, "m1": 20}
     assert a["lost"] == b["lost"] == {"model": [], "prompt": []}
     assert set(a["decision"].values()) == set(b["decision"].values()) == {"ab_inconclusive"}
-
-
-def test_a_leg_whose_partner_was_judged_long_ago_is_refused_before_the_ledger(tmp_path, monkeypatch, capsys):
-    # C1-prime(b), the residual no window can close: a verdict row carries no timestamp, so
-    # proposals already inside the window go on settling between the two commands and the leg
-    # judged second counts more of them. Past FACTORIAL_STALE_S that is enough to reverse a
-    # binding verdict, so the gate refuses.
-    #
-    # BEFORE THE LEDGER, and that is the whole design of it. Recording the week `ab_inconclusive`
-    # instead -- the obvious guard -- would blacklist: MAX_WEEKS is 2, and inconclusive-at-max
-    # writes a `held` row whose reason `lost_tags` matches on the prefix, so the second time the
-    # guard fired it would reject the candidate for an operator's scheduling rather than its
-    # performance. Mutation: raise after `_ledger` instead of before, or return an
-    # `ab_inconclusive` row -> a row lands here and the exit code is 0.
-    import grid.weekly as weekly_mod
-    from grid.versions import Versions
-    from grid.weekly import FACTORIAL_STALE_S, main
-    _release_cli_env(tmp_path, monkeypatch, "")
-    _prompt_registry(monkeypatch, ids=("p0", "p1"))
-    cfg, since, judged_at = _inconclusive_week(tmp_path, judged_first="model")
-    monkeypatch.setenv("GRID_ENV", str(tmp_path / "grid.env"))
-    before = len(Versions(cfg.releases_dir / "versions.jsonl").rows())
-    # The model leg was judged FACTORIAL_STALE_S + 1 h ago, in wall-clock terms.
-    monkeypatch.setattr(weekly_mod.time, "time",
-                        lambda: (judged_at + (FACTORIAL_STALE_S + 3600) * 1000) / 1000)
-    with pytest.raises(SystemExit) as e:
-        main(["release", "--dimension", "prompt", "--candidate", "p1"])
-    assert e.value.code == 2
-    err = capsys.readouterr().err
-    assert "was judged 13.0 h ago" in err and "--force-stale-partner" in err
-    # Nothing written, nothing flipped: the refusal is not a recorded week.
-    assert len(Versions(cfg.releases_dir / "versions.jsonl").rows()) == before
-    assert "MIND_PROMPT_CANDIDATE=p1" in (tmp_path / "grid.env").read_text()
-
-
-def test_the_stale_refusal_can_be_forced_and_the_row_says_it_was(tmp_path, monkeypatch, capsys):
-    # Without an escape a leg that missed the window could never be judged at all and would age
-    # to MAX_WEEKS anyway -- the blacklisting the refusal exists to avoid, reached the long way
-    # round. The override judges the leg TWO-ARM and says so, through the same degrade machinery
-    # every other fallback uses: the operator overrides the refusal, not the arithmetic that made
-    # it necessary. Mutation: have --force-stale-partner judge factorially anyway -> `cells`
-    # appears and `factorial_judged` reads True.
-    import grid.weekly as weekly_mod
-    from grid.weekly import FACTORIAL_STALE_S, main
-    _release_cli_env(tmp_path, monkeypatch, "")
-    _prompt_registry(monkeypatch, ids=("p0", "p1"))
-    cfg, since, judged_at = _inconclusive_week(tmp_path, judged_first="model", traffic_between=50)
-    monkeypatch.setenv("GRID_ENV", str(tmp_path / "grid.env"))
-    monkeypatch.setattr(weekly_mod.time, "time",
-                        lambda: (judged_at + (FACTORIAL_STALE_S + 3600) * 1000) / 1000)
-    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)
-    assert main(["release", "--dimension", "prompt", "--candidate", "p1",
-                 "--force-stale-partner"]) == 0
-    row = _last_row(tmp_path)
-    ab = row["evals"]["colony_ab"]
-    assert ab["factorial_judged"] is False and "cells" not in ab
-    assert "forced with --force-stale-partner" in row["reason"]
-    assert "[factorial run, judged two-arm: the model leg of this factorial run was judged" in row["reason"]
-    # APPENDED, like every other note: `lost_tags` matches on the reason's PREFIX, so a losing
-    # week forced through here must still be remembered. Mutation: prepend the clause -> this.
-    assert not row["reason"].startswith("[")
-    # The advice lives in the operator's terminal, not in an append-only file.
-    assert "Re-run both legs together" not in row["reason"]
-    capsys.readouterr()
-
-
-def test_force_stale_partner_is_refused_where_it_can_do_nothing(tmp_path, monkeypatch, capsys):
-    # Requirement F's rule, applied to the new flag: it is refused on the verbs it means nothing
-    # to, and refused on a `release` that starts an experiment rather than judging one -- there
-    # is no partner to be stale against, and an operator typing it has misread which command they
-    # are running. Mutation: drop either guard -> exit 0.
-    from grid.weekly import main, release
-    _release_cli_env(tmp_path, monkeypatch, "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_PROMPT_VARIANT=v1-sandbox\n")
-    _prompt_registry(monkeypatch)
-    for argv in (["ab", "--force-stale-partner"], ["status", "--force-stale-partner"],
-                 ["rollback", "--force-stale-partner"]):
-        with pytest.raises(SystemExit) as e:
-            main(argv)
-        assert e.value.code == 2 and "only meaningful on `release`" in capsys.readouterr().err
-    with pytest.raises(SystemExit) as e:
-        main(["release", "--dimension", "prompt", "--candidate", "v2-terse", "--force-stale-partner"])
-    assert e.value.code == 2 and "there is none open" in capsys.readouterr().err
-    # ...and `release()` refuses it directly too, the same double-guard idiom the interlock uses.
-    import asyncio
-    async def never(p): raise AssertionError("no probes on a refused run")
-    with pytest.raises(ValueError, match="has no partner"):
-        asyncio.run(release(_cfg(tmp_path), FakeRemote({}), ask_factory=lambda m: never,
-                            local_run=lambda c: 0, week="W1", dimension="prompt",
-                            candidate="v2-terse", force_stale=True))
 
 
 def test_the_nightly_stuck_row_says_it_used_its_own_window(tmp_path, monkeypatch, capsys):
@@ -3580,3 +3539,306 @@ def test_the_abort_snapshot_says_its_tally_is_two_arm(tmp_path, monkeypatch, cap
     assert weekly_mod.main(["ab", "--abort"]) == 0
     block = json.loads(capsys.readouterr().out)["evals"]["colony_ab"]
     assert block["source"] == "env" and block["factorial_judged"] is False
+
+
+# ---- Task 6, fix round 3 ----
+
+def _two_sunday_week(tmp_path):
+    """A factorial run seeded up to the point where week 1 has been judged on BOTH legs.
+
+    Both weeks read `ab_inconclusive`, which is the normal first result at MIN_SAMPLE=100 -- it
+    neither closes an episode nor stops a split, so on the following Sunday both partners are a
+    week old and still open. That is the state that livelocked the gate when the bound was keyed
+    on elapsed time.
+    """
+    from grid.versions import Versions, release_row
+    from grid.weekly import _window
+    cfg = _cfg(tmp_path)
+    since = 1_000_000
+    vs = Versions(cfg.releases_dir / "versions.jsonl")
+    kw = dict(base="", run="", adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
+              grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0)
+    for dim, cand, inc, fact in (("model", "m1", "m0", False), ("prompt", "p1", "p0", True)):
+        vs.append(release_row(week="W1", decision="ab_started", dimension=dim, version=cand,
+                              previous=None, reason="", ts=since / 1000, **kw,
+                              evals={"colony_ab": {"candidate": cand, "incumbent": inc, "split": 0.2,
+                                                   "since_ts": since, "factorial": fact}}))
+    _seed_factorial(tmp_path, since_ts=since, ts=since + 1_000, tag="w1-",
+                    cells={("m0", "p0"): (10, 3), ("m0", "p1"): (10, 1),
+                           ("m1", "p0"): (10, 4), ("m1", "p1"): (10, 2)})
+    # WEEK 1: both legs judged, both inconclusive, both episodes still open.
+    for n, dim in enumerate(("model", "prompt")):
+        vs.append(release_row(week="W1", decision="ab_inconclusive", dimension=dim,
+                              version="m1" if dim == "model" else "p1", previous=None,
+                              reason="sample 20/20 below 100 per arm", ts=(since + 5_000 + n) / 1000,
+                              **{**kw, "verdict_window": _window(cfg.verdicts_dir)},
+                              evals={"colony_ab": {"weeks": 1}}))
+    # A WEEK of traffic then arrives, which week 2 must be free to count.
+    _seed_factorial(tmp_path, since_ts=since, ts=since + 20_000, tag="w2-",
+                    cells={("m0", "p0"): (60, 18), ("m0", "p1"): (60, 6),
+                           ("m1", "p0"): (60, 21), ("m1", "p1"): (60, 9)})
+    (tmp_path / "grid.env").write_text("MIND_MODEL_ALIAS=m0\nMIND_LLM_CANDIDATE=m1\nMIND_AB_SPLIT=0.2\n"
+                                       "MIND_PROMPT_VARIANT=p0\nMIND_PROMPT_CANDIDATE=p1\n"
+                                       "MIND_PROMPT_AB_SPLIT=0.2\n")
+    return cfg, since
+
+
+async def test_the_second_sunday_of_a_factorial_run_is_judged_not_refused(tmp_path):
+    # N1, and it was a Critical of my own making. A bound keyed on how long ago the partner was
+    # judged refuses the FIRST leg of every second Sunday, because a still-open partner is a week
+    # stale BY CONSTRUCTION -- and the refusal wrote no row, so `weeks` never incremented,
+    # MAX_WEEKS never fired, the episode never closed, and the interlock blocked both dimensions
+    # forever. The bound is week-scoped instead: a partner judged in a PREVIOUS cycle is behind
+    # this leg, not ahead of it, so this leg is the first of its cycle and needs no bound.
+    # Mutation: drop the `judging_row["week"] == week` test -> week 2's first leg is bounded at
+    # week 1's verdict prefix, reads the same 20 per arm it read last Sunday, and the run can
+    # never reach MIN_SAMPLE however much traffic arrives.
+    from grid.versions import Versions
+    cfg, since = _two_sunday_week(tmp_path)
+    before = len(Versions(cfg.releases_dir / "versions.jsonl").rows())
+    row = await _judge(cfg, tmp_path, "model", week="W2")
+    ab = row["evals"]["colony_ab"]
+    # A ROW WAS WRITTEN. That is the property the refusal destroyed: a Sunday that produced
+    # nothing is indistinguishable from a Sunday the timer never fired.
+    assert len(Versions(cfg.releases_dir / "versions.jsonl").rows()) == before + 1
+    # ...and it is a FACTORIAL verdict, not a degraded one: the feature must work on the week
+    # that decides. Unbounded, because its partner has not been judged this cycle.
+    assert ab["factorial_judged"] is True and ab["factorial_until_ts"] is None
+    assert ab["arms"]["m0"]["settled"] == 140 and ab["arms"]["m1"]["settled"] == 140
+    assert ab["weeks"] == 2                          # the week counter moved, so MAX_WEEKS can fire
+    # The second leg of the SAME cycle is bounded at the first's prefix, as always.
+    second = await _judge(cfg, tmp_path, "prompt", week="W2")
+    sab = second["evals"]["colony_ab"]
+    assert sab["factorial_judged"] is True and sab["factorial_until_ts"] is not None
+    assert sab["arms"]["p0"]["settled"] == 140 and sab["arms"]["p1"]["settled"] == 140
+
+
+async def test_verdicts_settling_between_the_two_commands_do_not_move_the_second_leg(tmp_path):
+    # N2, the Critical no time-based bound could close. NO NEW PROPOSALS AT ALL: proposals already
+    # inside the shared window merely SETTLE between the two commands, which is what verdicts do.
+    # A proposal-timestamp bound cannot see it, because a verdict row carries no timestamp -- but
+    # the partner's judging row has always recorded `verdict_window`, the verdict ledger's own
+    # hash-chained prefix at that instant, and that is exactly "the verdicts that had landed when
+    # the partner was judged".
+    # Mutation: drop `until_verdicts` from the factorial tally (or make `_verdict_prefix` return
+    # every row) -> the second leg counts the late settlements, its arms read 140 against the
+    # first leg's 80, and the two orders reach different binding verdicts.
+    from grid.versions import Versions, release_row
+    from grid.weekly import _window
+    cfg = _cfg(tmp_path)
+    since = 1_000_000
+    vs = Versions(cfg.releases_dir / "versions.jsonl")
+    kw = dict(base="", run="", adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
+              grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0)
+    for dim, cand, inc, fact in (("model", "m1", "m0", False), ("prompt", "p1", "p0", True)):
+        vs.append(release_row(week="W1", decision="ab_started", dimension=dim, version=cand,
+                              previous=None, reason="", ts=since / 1000, **kw,
+                              evals={"colony_ab": {"candidate": cand, "incumbent": inc, "split": 0.2,
+                                                   "since_ts": since, "factorial": fact}}))
+    _seed_factorial(tmp_path, since_ts=since, ts=since + 1_000, tag="early-",
+                    cells={("m0", "p0"): (20, 6), ("m0", "p1"): (20, 2),
+                           ("m1", "p0"): (20, 7), ("m1", "p1"): (20, 3)})
+    # Proposals INSIDE the window whose verdicts have not landed yet, and which are skewed hard
+    # enough that counting them reverses the model comparison.
+    pending = _seed_factorial(tmp_path, since_ts=since, ts=since + 2_000, tag="late-", settle=False,
+                              cells={("m0", "p0"): (30, 30), ("m0", "p1"): (30, 30),
+                                     ("m1", "p0"): (30, 0), ("m1", "p1"): (30, 0)})
+    (tmp_path / "grid.env").write_text("MIND_MODEL_ALIAS=m0\nMIND_LLM_CANDIDATE=m1\nMIND_AB_SPLIT=0.2\n"
+                                       "MIND_PROMPT_VARIANT=p0\nMIND_PROMPT_CANDIDATE=p1\n"
+                                       "MIND_PROMPT_AB_SPLIT=0.2\n")
+    first = await _judge(cfg, tmp_path, "model", week="W2")
+    assert first["evals"]["colony_ab"]["arms"]["m0"]["settled"] == 40      # only what had settled
+    # ...now 120 verdicts land, on proposals that were already in the window all along.
+    _settle(tmp_path, pending)
+    second = await _judge(cfg, tmp_path, "prompt", week="W2")
+    sab = second["evals"]["colony_ab"]
+    # Bounded at the prefix the model leg recorded, so the two legs measured the SAME verdicts.
+    assert sab["factorial_judged"] is True
+    assert sab["factorial_until_verdicts"]["rows"] == 80
+    assert sab["arms"]["p0"]["settled"] == 40 and sab["arms"]["p1"]["settled"] == 40
+    # The proposal-timestamp bound alone would not have caught this: every late verdict belongs
+    # to a proposal stamped INSIDE the window, before the model leg was judged.
+    assert sab["factorial_until_ts"] > since + 2_000
+
+
+def test_a_rewritten_verdict_ledger_degrades_the_week_instead_of_measuring_through_it(tmp_path):
+    # The prefix is verified, not assumed: `rows: N` plus the chain head after them names an
+    # exact, immutable set, and a file that no longer extends it has been rewritten. That is not
+    # a condition to measure through, and it is not a condition to crash a Sunday over either.
+    # Mutation: drop the chain-head check (or the length check) from `_verdict_prefix` -> the
+    # first two assertions stop raising and a leg is tallied over a prefix that is not the one
+    # its partner measured.
+    from grid.verdicts import Ledger
+    from grid.weekly import _verdict_prefix, _verdict_prefix_fault
+    _seed_factorial(tmp_path, cells={("m0", "p0"): (3, 1), ("m0", "p1"): (3, 1),
+                                     ("m1", "p0"): (3, 1), ("m1", "p1"): (3, 1)})
+    v = Path(tmp_path) / "v"
+    rows = Ledger(v / "verdicts.jsonl").rows()
+    good = {"rows": 8, "chain_head": rows[7]["chain"]}
+    assert len(_verdict_prefix(rows, good)) == 8
+    assert _verdict_prefix(rows, None) == rows          # None means "everything", the two-arm case
+    assert _verdict_prefix_fault(v, good) == ""
+    # A prefix longer than the file: rows were removed.
+    with pytest.raises(ValueError, match="not an extension"):
+        _verdict_prefix(rows, {"rows": 99, "chain_head": "x"})
+    # The right length, the wrong chain: rows were rewritten below the prefix.
+    with pytest.raises(ValueError, match="rewritten below the prefix"):
+        _verdict_prefix(rows, {"rows": 8, "chain_head": "f" * 64})
+    assert "rewritten below the prefix" in _verdict_prefix_fault(v, {"rows": 8, "chain_head": "f" * 64})
+    # A judging row that records no prefix at all cannot bound anything, and says so.
+    assert "records no verdict-ledger prefix" in _verdict_prefix_fault(v, {})
+    assert "records no verdict-ledger prefix" in _verdict_prefix_fault(v, None)
+
+
+async def test_a_leg_whose_partner_recorded_no_prefix_is_judged_two_arm_and_says_so(tmp_path, caplog):
+    # The degrade path for the same fault, end to end. A partner judged by an older writer -- or
+    # by a hand-edited row -- carries no `verdict_window`, so the two legs cannot be shown to have
+    # counted the same verdicts. That is judged two-arm with a stated reason rather than
+    # factorially on an unverifiable window. Mutation: skip `_verdict_prefix_fault` and bound on
+    # `until_ts` alone -> `factorial_judged` reads True on a week nothing could verify.
+    import logging
+    from grid.versions import Versions
+    cfg, since, judged_at = _inconclusive_week(tmp_path, judged_first="model")
+    # Strip the prefix block off the partner's judging row, as an older writer would have left it.
+    path = cfg.releases_dir / "versions.jsonl"
+    lines = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    for r in lines:
+        if r["decision"] == "ab_inconclusive":
+            r["verdict_window"] = {}
+    path.write_text("".join(json.dumps(r) + "\n" for r in lines), encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="grid.weekly"):
+        row = await _judge(cfg, tmp_path, "prompt")
+    ab = row["evals"]["colony_ab"]
+    assert ab["factorial_judged"] is False and "cells" not in ab
+    assert "records no verdict-ledger prefix" in row["reason"]
+    assert "being judged two-arm" in caplog.text
+    assert not row["reason"].startswith("[")        # appended, so lost_tags still sees the prefix
+
+
+def _extra_dimensions(mp, *names):
+    """Stand extra dimensions up in BOTH allowlists and in the gate's env table."""
+    import grid.versions as versions_mod
+    import grid.weekly as weekly_mod
+    mp.setattr(weekly_mod, "DIMENSIONS", frozenset({"model", "prompt", *names}))
+    mp.setattr(versions_mod, "DIMENSIONS", frozenset({"model", "prompt", *names}))
+    for name in names:
+        up = name.upper()
+        mp.setitem(weekly_mod._DIMENSION_ENV, name,
+                   {"live": f"MIND_{up}", "candidate": f"MIND_{up}_CANDIDATE",
+                    "split": f"MIND_{up}_AB_SPLIT"})
+
+
+async def test_a_third_split_that_has_since_closed_still_refuses_the_tally(tmp_path, caplog):
+    # N6a. The third-dimension check asked "is it open right NOW" while the pair asked "did it
+    # overlap this leg's window" -- two adjacent lines of one function meaning different things by
+    # "splitting alongside". Asked the first way, an adapter experiment that ran through half of
+    # this leg and closed before Sunday does not refuse the tally, and its traffic is pooled into
+    # the cells with nothing anywhere saying so.
+    # Mutation: use `ab_state(versions, dimension=d)` for `uncrossable` again -> the adapter split
+    # below is invisible, the week is judged factorially, and `cells` appears on the row.
+    import logging
+    from grid.versions import Versions, release_row
+    cfg = _cfg(tmp_path)
+    vs = Versions(cfg.releases_dir / "versions.jsonl")
+    kw = dict(base="", run="", adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
+              grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0)
+    with pytest.MonkeyPatch.context() as mp:
+        _extra_dimensions(mp, "adapter")
+        for dim, cand, inc, fact, at in (("adapter", "a1", "a0", False, 1.0),
+                                         ("model", "m1", "m0", False, 1.0),
+                                         ("prompt", "p1", "p0", True, 1.0)):
+            vs.append(release_row(week="W1", decision="ab_started", dimension=dim, version=cand,
+                                  previous=None, reason="", ts=at, **kw,
+                                  evals={"colony_ab": {"candidate": cand, "incumbent": inc,
+                                                       "split": 0.2, "since_ts": int(at * 1000),
+                                                       "factorial": fact}}))
+        # The adapter split CLOSED before this Sunday -- but it ran through this leg's window.
+        vs.append(release_row(week="W1", decision="held", dimension="adapter", version="a1",
+                              previous=None, reason="colony A/B lost: 0.1 vs 0.2", ts=5.0, **kw,
+                              evals={}))
+        _seed_factorial(tmp_path, since_ts=1_000, ts=2_000,
+                        cells={("m0", "p0"): (60, 18), ("m0", "p1"): (60, 6),
+                               ("m1", "p0"): (60, 21), ("m1", "p1"): (60, 9)})
+        (tmp_path / "grid.env").write_text("MIND_MODEL_ALIAS=m0\nMIND_PROMPT_VARIANT=p0\n"
+                                           "MIND_PROMPT_CANDIDATE=p1\nMIND_PROMPT_AB_SPLIT=0.2\n"
+                                           "MIND_ADAPTER=a0\n")
+        with caplog.at_level(logging.WARNING, logger="grid.weekly"):
+            row = await _judge(cfg, tmp_path, "prompt")
+    ab = row["evals"]["colony_ab"]
+    assert ab["factorial_judged"] is False and "cells" not in ab
+    assert "adapter splitting alongside it" in row["reason"]
+    assert "being judged two-arm" in caplog.text
+
+
+async def test_a_third_split_that_ended_before_this_leg_began_does_not_refuse(tmp_path):
+    # The other side of the same question, and what stops "did a third dimension overlap" from
+    # collapsing into "has a third dimension ever existed". An adapter experiment that opened and
+    # closed BEFORE this leg's split began never ran alongside it, so it confounds nothing and
+    # must not cost the week its marginal.
+    # Mutation: have `_overlapped` return True for any episode at all -> this week is refused and
+    # judged two-arm, and a third dimension in the allowlist would disable factorial mode forever.
+    from grid.versions import Versions, release_row
+    cfg = _cfg(tmp_path)
+    vs = Versions(cfg.releases_dir / "versions.jsonl")
+    kw = dict(base="", run="", adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
+              grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0)
+    with pytest.MonkeyPatch.context() as mp:
+        _extra_dimensions(mp, "adapter")
+        # An adapter A/B that ran from 100 ms to 500 ms and closed -- entirely before the pair.
+        vs.append(release_row(week="W0", decision="ab_started", dimension="adapter", version="a1",
+                              previous=None, reason="", ts=0.1, **kw,
+                              evals={"colony_ab": {"candidate": "a1", "incumbent": "a0",
+                                                   "split": 0.2, "since_ts": 100}}))
+        vs.append(release_row(week="W0", decision="held", dimension="adapter", version="a1",
+                              previous=None, reason="colony A/B lost: 0.1 vs 0.2", ts=0.5,
+                              **kw, evals={}))
+        for dim, cand, inc, fact in (("model", "m1", "m0", False), ("prompt", "p1", "p0", True)):
+            vs.append(release_row(week="W1", decision="ab_started", dimension=dim, version=cand,
+                                  previous=None, reason="", ts=1.0, **kw,
+                                  evals={"colony_ab": {"candidate": cand, "incumbent": inc,
+                                                       "split": 0.2, "since_ts": 1_000,
+                                                       "factorial": fact}}))
+        _seed_factorial(tmp_path, since_ts=1_000, ts=2_000,
+                        cells={("m0", "p0"): (60, 18), ("m0", "p1"): (60, 6),
+                               ("m1", "p0"): (60, 21), ("m1", "p1"): (60, 9)})
+        (tmp_path / "grid.env").write_text("MIND_MODEL_ALIAS=m0\nMIND_LLM_CANDIDATE=m1\n"
+                                           "MIND_AB_SPLIT=0.2\nMIND_PROMPT_VARIANT=p0\n"
+                                           "MIND_PROMPT_CANDIDATE=p1\nMIND_PROMPT_AB_SPLIT=0.2\n"
+                                           "MIND_ADAPTER=a0\n")
+        row = await _judge(cfg, tmp_path, "prompt")
+    ab = row["evals"]["colony_ab"]
+    assert ab["factorial_judged"] is True and set(ab["cells"]) == {"m0|p0", "m0|p1", "m1|p0", "m1|p1"}
+    assert ab["arms"]["p0"]["settled"] == 120
+
+
+async def test_the_refusal_names_every_split_it_cannot_cross(tmp_path, caplog):
+    # N6b. With only three dimensions `uncrossable` can never hold more than one entry, so "names
+    # all of them" was indistinguishable from "names the first" and the round-2 mutation could
+    # not tell them apart. With FOUR it can. Mutation: return on the first non-crossable
+    # dimension found (`next(...)` instead of collecting) -> only "adapter" is named and the
+    # operator is told about half of what is confounding their week.
+    import logging
+    from grid.versions import Versions, release_row
+    cfg = _cfg(tmp_path)
+    vs = Versions(cfg.releases_dir / "versions.jsonl")
+    kw = dict(base="", run="", adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
+              grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0)
+    with pytest.MonkeyPatch.context() as mp:
+        _extra_dimensions(mp, "adapter", "sampler")
+        for dim, cand, inc, fact in (("adapter", "a1", "a0", False), ("sampler", "s1", "s0", False),
+                                     ("model", "m1", "m0", False), ("prompt", "p1", "p0", True)):
+            vs.append(release_row(week="W1", decision="ab_started", dimension=dim, version=cand,
+                                  previous=None, reason="", ts=1.0, **kw,
+                                  evals={"colony_ab": {"candidate": cand, "incumbent": inc,
+                                                       "split": 0.2, "since_ts": 1_000,
+                                                       "factorial": fact}}))
+        _seed_factorial(tmp_path, since_ts=1_000, ts=2_000,
+                        cells={("m0", "p0"): (60, 18), ("m0", "p1"): (60, 6),
+                               ("m1", "p0"): (60, 21), ("m1", "p1"): (60, 9)})
+        (tmp_path / "grid.env").write_text("MIND_MODEL_ALIAS=m0\nMIND_PROMPT_VARIANT=p0\n"
+                                           "MIND_PROMPT_CANDIDATE=p1\nMIND_PROMPT_AB_SPLIT=0.2\n"
+                                           "MIND_ADAPTER=a0\nMIND_SAMPLER=s0\n")
+        with caplog.at_level(logging.WARNING, logger="grid.weekly"):
+            row = await _judge(cfg, tmp_path, "prompt")
+    assert "adapter, sampler splitting alongside it" in row["reason"]
+    assert row["evals"]["colony_ab"]["factorial_judged"] is False
