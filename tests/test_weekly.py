@@ -2265,7 +2265,14 @@ async def test_release_itself_refuses_a_second_experiment_not_only_the_cli(tmp_p
     assert cfg.grid_env.read_text() == before
     # ...and it still never refuses a JUDGING week: the pre-existing prompt A/B week tests all
     # run with a model release in the same ledger and must keep reaching their verdict.
-    assert row["version"] == "v2-terse" and row["evals"] == {}      # M5: no model-keyed advisory
+    # M5's rule is unchanged and is what this asserts: NO MODEL-KEYED advisory on a prompt row --
+    # `colony_ab` here must never carry `by_alias`, which is keyed by model alias. It is no longer
+    # `evals == {}` because fix round 1 (review Minor 3) puts the other-dimension key on the
+    # interlock's own row: it is the one row whose entire subject is what the other dimension is
+    # doing, and it used to record that only as prose in the reason.
+    assert row["version"] == "v2-terse"
+    assert row["evals"] == {"colony_ab": {"other_dimensions": {
+        "advisory": True, "splitting": {"model": "kannaka-brain-v4"}}}}
 
 
 def test_an_illegal_candidate_is_refused_whatever_the_ledger_says(tmp_path, monkeypatch, capsys):
@@ -2930,3 +2937,365 @@ def test_candidate_and_factorial_are_refused_on_the_verbs_they_mean_nothing_to(t
     assert main(["ab", "--forget", "kannaka-brain-v4"]) == 0
     assert [r["decision"] for r in Versions(tmp_path / "releases" / "versions.jsonl").rows()] == ["unchanged"]
     capsys.readouterr()
+
+
+# ---- Task 6, fix round 1 ----
+
+async def test_both_legs_reach_the_same_verdicts_whichever_order_they_are_judged_in(tmp_path):
+    # C1, THE CRITICAL. `release` judges ONE dimension per call, so a factorial week is two
+    # commands and whichever runs first ends its own leg. Asking only "is the partner open NOW"
+    # made the second leg fall back to a two-arm tally over its OWN since_ts -- and on this very
+    # fixture the two orderings then disagreed about a binding, irreversible verdict on identical
+    # data: model-then-prompt RELEASED m1, prompt-then-model HELD it and wrote it into lost_tags,
+    # a blacklist no Sunday retries without a hand-typed `ab --forget`. Nothing constrains the
+    # order: the systemd timer judges the model leg and the prompt leg is hand-run.
+    #
+    # Mutation: make `_factorial_partner` consult only `ab_state` again (drop the `_closed_partner`
+    # branch) -> the two orderings below produce different decisions and different lost_tags.
+    from grid.versions import Versions
+    outcomes = {}
+    for order in (("model", "prompt"), ("prompt", "model")):
+        root = tmp_path / "-".join(order)
+        root.mkdir()
+        cfg, since, prompt_since = _factorial_week(root)
+        rows = {}
+        for dim in order:
+            rows[dim] = await _judge(cfg, root, dim)
+        versions = Versions(cfg.releases_dir / "versions.jsonl")
+        outcomes[order] = {
+            "decisions": {d: r["decision"] for d, r in rows.items()},
+            # The verdict prose, without the window annotation: the leg judged FIRST has no
+            # partner-close to bound it and says so, which is a truthful fact about the run
+            # rather than a difference in the verdict. Everything binding is compared.
+            "reasons": {d: r["reason"].split(" [factorial")[0] for d, r in rows.items()},
+            "suffixed": {d: " [factorial marginal, pooled over" in r["reason"] for d, r in rows.items()},
+            "arms": {d: {a: v["settled"] for a, v in r["evals"]["colony_ab"]["arms"].items()}
+                     for d, r in rows.items()},
+            "judged": {d: r["evals"]["colony_ab"]["factorial_judged"] for d, r in rows.items()},
+            "lost": {d: sorted(lost_tags(versions, dimension=d)) for d in order},
+        }
+    a, b = outcomes[("model", "prompt")], outcomes[("prompt", "model")]
+    # Not merely the same verdicts: the same arms, the same reason strings and the same memory.
+    assert a == b, f"order-dependent:\n{a}\n{b}"
+    # ...and both legs really were judged factorially, on the marginal, over the shared window --
+    # 120 per arm, not the 125/205 a two-arm tally over the wider window would give.
+    assert a["judged"] == {"model": True, "prompt": True}
+    assert a["decisions"] == {"model": "released", "prompt": "held"}
+    assert a["arms"]["model"] == {"m0": 120, "m1": 120}
+    assert a["arms"]["prompt"] == {"p0": 120, "p1": 120}
+    assert a["lost"] == {"model": [], "prompt": ["p1"]}
+    assert a["suffixed"] == {"model": True, "prompt": True}
+
+
+async def test_the_window_closes_when_the_partner_closed_not_at_the_end_of_time(tmp_path):
+    # The upper bound is the half of the window the first fix round did not have. Traffic that
+    # arrives AFTER the first leg closes was answered with that leg's candidate already cleared by
+    # `end_ab` -- one fixed level of that dimension, a different experiment -- so it belongs to no
+    # cell. Mutation: drop `until_ts` from the `ab_arms` call in `_judge_ab` (or make `_in_window`
+    # ignore it) -> the post-close batch is pooled in and both arms read 180, not 120.
+    from grid.versions import Versions
+    cfg, since, prompt_since = _factorial_week(tmp_path)
+    prompt_row = await _judge(cfg, tmp_path, "prompt")            # closes the prompt leg, now-ish
+    closed_ms = int(Versions(cfg.releases_dir / "versions.jsonl").rows()[-1]["ts"] * 1000)
+    # 60 more settled per cell, stamped AFTER the prompt leg closed and heavily biased, so a
+    # window with no upper bound would both move the counts and flip the model verdict.
+    _seed_factorial(tmp_path, since_ts=prompt_since, ts=closed_ms + 1000, tag="post-",
+                    cells={("m0", "p0"): (60, 60), ("m0", "p1"): (60, 60),
+                           ("m1", "p0"): (60, 0), ("m1", "p1"): (60, 0)})
+    model_row = await _judge(cfg, tmp_path, "model")
+    ab = model_row["evals"]["colony_ab"]
+    assert ab["factorial_judged"] is True and ab["factorial_until_ts"] == closed_ms
+    assert ab["arms"]["m0"]["settled"] == 120 and ab["arms"]["m1"]["settled"] == 120
+    assert model_row["decision"] == "released"                    # 0.25 vs 0.20 on the marginal
+    assert model_row["reason"].endswith("[factorial marginal, pooled over prompt, up to its close]")
+    # The leg judged FIRST has no upper bound: its partner had not closed yet, and there is
+    # nothing to bound it with. It says so by carrying `factorial_until_ts: None`.
+    assert prompt_row["evals"]["colony_ab"]["factorial_until_ts"] is None
+
+
+def test_ab_arms_windows_at_both_ends(tmp_path):
+    # `until_ts` is exclusive and is applied by BOTH loops -- the attempt tally and the verdict
+    # join. Applied to only one, a row would be counted as an ask but not as a settle (or the
+    # reverse), and every ratio built from the two would be over different intervals.
+    # Mutation: drop the upper bound from either loop in `ab_arms` -> `answered` and `settled`
+    # stop agreeing below.
+    from grid.weekly import ab_arms
+    _seed_factorial(tmp_path, since_ts=1_000_000, ts=1_001_000, tag="in-",
+                    cells={("m0", "p0"): (4, 2), ("m0", "p1"): (4, 2),
+                           ("m1", "p0"): (4, 2), ("m1", "p1"): (4, 2)})
+    _seed_factorial(tmp_path, since_ts=1_000_000, ts=1_009_000, tag="late-",
+                    cells={("m0", "p0"): (7, 7), ("m0", "p1"): (7, 7),
+                           ("m1", "p0"): (7, 7), ("m1", "p1"): (7, 7)})
+    v = Path(tmp_path) / "v"
+    cells = [("m0", "p0"), ("m0", "p1"), ("m1", "p0"), ("m1", "p1")]
+    both = ab_arms(v, since_ts=1_000_000, until_ts=1_005_000, cells=cells)
+    assert all(c["settled"] == 4 and c["answered"] == 4 for c in both.values())
+    # No upper bound is "up to now", which is what every two-arm call wants and gets by default.
+    open_ended = ab_arms(v, since_ts=1_000_000, cells=cells)
+    assert all(c["settled"] == 11 and c["answered"] == 11 for c in open_ended.values())
+    # The bound is EXCLUSIVE: a row stamped exactly at the partner's close was answered after the
+    # relay had been restarted without it, so it is outside.
+    edge = ab_arms(v, since_ts=1_000_000, until_ts=1_009_000, cells=cells)
+    assert all(c["settled"] == 4 for c in edge.values())
+    # ...and the same two bounds on the two-arm path, which is where every existing caller is.
+    two = ab_arms(v, since_ts=1_000_000, until_ts=1_005_000, incumbent="p0", candidate="p1",
+                  dimension="prompt")
+    assert two["p0"]["settled"] == 8 and two["p1"]["settled"] == 8
+
+
+async def test_a_partner_that_closed_before_this_leg_started_is_not_a_partner(tmp_path):
+    # `_closed_partner` filters on the close landing AFTER this leg's since_ts. A partner that
+    # started and finished before this experiment even began never overlapped it, so there is no
+    # design and no window: judging this leg factorially would cross two things that were never
+    # live together. Mutation: drop the `closed_ms > since_ts` test -> the week below is judged
+    # factorially over an empty intersection and reads inconclusive on a phantom sample.
+    from grid.versions import Versions, release_row
+    cfg = _cfg(tmp_path)
+    vs = Versions(cfg.releases_dir / "versions.jsonl")
+    kw = dict(base="", run="", adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
+              grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0)
+    # A model A/B that opened and closed long ago, in ledger-time seconds.
+    vs.append(release_row(week="W0", decision="ab_started", dimension="model", version="m1",
+                          previous=None, reason="", ts=100.0, **kw,
+                          evals={"colony_ab": {"candidate": "m1", "incumbent": "m0", "split": 0.2,
+                                               "since_ts": 100_000}}))
+    vs.append(release_row(week="W0", decision="held", dimension="model", version="m1",
+                          previous=None, reason="colony A/B lost: 0.1 vs 0.2", ts=200.0, **kw, evals={}))
+    # ...and a prompt A/B that started afterwards, marked factorial (it should never have been).
+    vs.append(release_row(week="W1", decision="ab_started", dimension="prompt", version="p1",
+                          previous=None, reason="", ts=300.0, **kw,
+                          evals={"colony_ab": {"candidate": "p1", "incumbent": "p0", "split": 0.2,
+                                               "since_ts": 300_000, "factorial": True}}))
+    _seed_factorial(tmp_path, since_ts=300_000, ts=301_000,
+                    cells={("m0", "p0"): (60, 18), ("m0", "p1"): (60, 6),
+                           ("m1", "p0"): (60, 21), ("m1", "p1"): (60, 9)})
+    (tmp_path / "grid.env").write_text("MIND_MODEL_ALIAS=m0\nMIND_PROMPT_VARIANT=p0\n"
+                                       "MIND_PROMPT_CANDIDATE=p1\nMIND_PROMPT_AB_SPLIT=0.2\n")
+    row = await _judge(cfg, tmp_path, "prompt")
+    ab = row["evals"]["colony_ab"]
+    assert ab["factorial_judged"] is False and "cells" not in ab
+    assert "no other dimension was splitting during this window" in row["reason"]
+
+
+async def test_a_row_says_whether_it_was_actually_judged_factorially(tmp_path, caplog):
+    # I1. A block that inherits `factorial: True` from its `ab_started` row while carrying a
+    # two-arm tally makes a reader deduce the truth from keys that are ABSENT. Every block now
+    # says which it was, in the row and in the log. Mutation: drop `factorial_judged` from either
+    # branch of `_judge_ab` -> KeyError; drop the reason clause or the warning -> the two
+    # assertions below.
+    import logging
+    cfg, since, prompt_since = _factorial_week(tmp_path, model_incumbent=None)
+    with caplog.at_level(logging.WARNING, logger="grid.weekly"):
+        row = await _judge(cfg, tmp_path, "prompt")
+    ab = row["evals"]["colony_ab"]
+    assert ab["factorial"] is True            # the run was STARTED factorial...
+    assert ab["factorial_judged"] is False    # ...and was not JUDGED that way. Both are recorded.
+    assert "[factorial run, judged two-arm: a factorial leg is missing an arm label" in row["reason"]
+    assert "being judged two-arm" in caplog.text
+    # The reason clause is APPENDED, so `lost_tags` still sees the prefix it matches on.
+    assert row["reason"].startswith("colony A/B ")
+
+
+async def test_a_plain_two_arm_week_is_not_labelled_factorial_and_says_nothing_about_it(tmp_path):
+    # An ordinary week says `factorial_judged: False` and mentions factorial nowhere -- neither
+    # in the reason nor as a `cells` block. Mutation: always take the factorial branch, or emit
+    # the degrade clause for a week that never claimed to be factorial -> the assertions below.
+    # (The other half of the reviewer's R4, that `start_ab` writes `factorial: False` explicitly,
+    # is pinned by `test_start_ab_records_the_other_dimensions_without_help_from_release`.)
+    row, r, env, restarts = await _run_prompt_ab_week(tmp_path, inc_rep=30, cand_rep=28)
+    ab = row["evals"]["colony_ab"]
+    assert ab["factorial_judged"] is False
+    assert "factorial" not in row["reason"]
+    assert "cells" not in ab and "factorial_with" not in ab
+
+
+def test_start_ab_records_the_other_dimensions_without_help_from_release(tmp_path, monkeypatch):
+    # M-5: requirement E says EVERY A/B row carries the advisory key, and it used to be spliced on
+    # by `release` after the fact -- so any other caller of `start_ab` wrote an `ab_started` row
+    # without it. Mutation: move the key back out of `start_ab`'s block -> KeyError here.
+    from grid.weekly import start_ab
+    _prompt_registry(monkeypatch)
+    cfg = _cfg(tmp_path)
+    cfg.grid_env.write_text("MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_CANDIDATE=kannaka-brain-v4\n"
+                            "MIND_AB_SPLIT=0.2\nMIND_PROMPT_VARIANT=v1-sandbox\n")
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v4", decision="ab_started",
+                 incumbent="kannaka-brain-v3")
+    block, outcome = start_ab(cfg, candidate="v2-terse", incumbent="v1-sandbox", dimension="prompt",
+                              local_run=lambda c: 0, dry_run=True)
+    assert block["factorial"] is False
+    assert block["other_dimensions"] == {"advisory": True,
+                                         "splitting": {"model": "kannaka-brain-v4"}}
+
+
+def test_the_interlock_row_records_the_experiment_that_blocked_it(tmp_path, monkeypatch, capsys):
+    # M-3: the refusal row is the one row whose entire subject is what the other dimension is
+    # doing, and it recorded that only as prose. On a PROMPT refusal its `evals` was `{}`
+    # outright, so the week the gate refused to start left no machine-readable trace of why.
+    # Mutation: use `_advisory_evals` again at either interlock site -> the assertion below.
+    import grid.weekly as weekly_mod
+    from grid.weekly import main
+    _both_split_env(tmp_path, monkeypatch)
+    _prompt_registry(monkeypatch)
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v4", decision="ab_started",
+                 incumbent="kannaka-brain-v3")
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)
+    assert main(["release", "--dimension", "prompt", "--candidate", "v2-terse"]) == 0
+    row = _last_row(tmp_path)
+    assert row["decision"] == "unchanged"
+    assert row["evals"]["colony_ab"]["other_dimensions"] == {
+        "advisory": True, "splitting": {"model": "kannaka-brain-v4"}}
+    capsys.readouterr()
+
+
+def test_factorial_is_refused_for_a_pair_no_tally_can_cross(tmp_path, monkeypatch, capsys):
+    # I2. Both guards used to ask only "is SOMETHING blocking", while `_factorial_partner` refuses
+    # anything but the two axes `ab_arms(cells=...)` knows how to cross -- and refused it
+    # silently. With a third dimension in odin's allowlist (which FACTORIAL_DIMENSIONS' own
+    # comment anticipates) `--factorial` would be ACCEPTED for a pair the gate cannot compute,
+    # start both splits, and then judge both legs two-arm over a shared window: the exact failure
+    # the interlock exists to prevent, reached by typing the flag that claims to prevent it.
+    # Mutation: drop the pair check from `_factorial_pair_fault` -> exit 0 and a second split.
+    import grid.weekly as weekly_mod
+    from grid.weekly import main
+    grid_env = _release_cli_env(tmp_path, monkeypatch,
+                                "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_PROMPT_VARIANT=v1-sandbox\n"
+                                "MIND_ADAPTER=a0\nMIND_ADAPTER_CANDIDATE=a1\nMIND_ADAPTER_AB_SPLIT=0.2\n")
+    _prompt_registry(monkeypatch)
+    monkeypatch.setattr(weekly_mod, "DIMENSIONS", frozenset({"model", "prompt", "adapter"}))
+    monkeypatch.setitem(weekly_mod._DIMENSION_ENV, "adapter",
+                        {"live": "MIND_ADAPTER", "candidate": "MIND_ADAPTER_CANDIDATE",
+                         "split": "MIND_ADAPTER_AB_SPLIT"})
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)
+    with pytest.raises(SystemExit) as e:
+        main(["release", "--dimension", "prompt", "--candidate", "v2-terse", "--factorial"])
+    assert e.value.code == 2
+    err = capsys.readouterr().err
+    assert "can only cross ['model', 'prompt']" in err and "adapter" in err
+    assert "MIND_PROMPT_CANDIDATE" not in grid_env.read_text()
+
+
+async def test_a_third_dimension_is_never_drafted_into_a_factorial_tally(tmp_path, caplog):
+    # The other half of I2, and the reviewer's surviving mutation R5: `_factorial_partner`'s
+    # FACTORIAL_DIMENSIONS guard was untested because it is unreachable while DIMENSIONS is
+    # {model, prompt}. Stand a third dimension up and it is reachable -- and it must refuse
+    # LOUDLY, because a silent skip is how a factorial week comes to be judged two-arm with
+    # nothing logged. Mutation: drop the guard -> `ab_arms(cells=...)` crosses model x prompt
+    # while the ADAPTER experiment is the one that is actually splitting, and the row claims
+    # `factorial_judged: True`.
+    import logging
+    import grid.weekly as weekly_mod
+    from grid.versions import Versions, release_row
+    cfg = _cfg(tmp_path)
+    vs = Versions(cfg.releases_dir / "versions.jsonl")
+    kw = dict(base="", run="", adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
+              grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0)
+    import grid.versions as versions_mod
+    with pytest.MonkeyPatch.context() as mp:
+        # A third dimension in odin's allowlist, which FACTORIAL_DIMENSIONS' own comment
+        # anticipates. Both allowlists move together, the way a real one would.
+        mp.setattr(weekly_mod, "DIMENSIONS", frozenset({"model", "prompt", "adapter"}))
+        mp.setattr(versions_mod, "DIMENSIONS", frozenset({"model", "prompt", "adapter"}))
+        mp.setitem(weekly_mod._DIMENSION_ENV, "adapter",
+                   {"live": "MIND_ADAPTER", "candidate": "MIND_ADAPTER_CANDIDATE",
+                    "split": "MIND_ADAPTER_AB_SPLIT"})
+        for dim, cand, inc in (("adapter", "a1", "a0"), ("prompt", "p1", "p0")):
+            vs.append(release_row(week="W1", decision="ab_started", dimension=dim, version=cand,
+                                  previous=None, reason="", **kw,
+                                  evals={"colony_ab": {"candidate": cand, "incumbent": inc, "split": 0.2,
+                                                       "since_ts": 1_000_000, "factorial": True}}))
+        _seed_factorial(tmp_path, since_ts=1_000_000,
+                        cells={("m0", "p0"): (60, 18), ("m0", "p1"): (60, 6),
+                               ("m1", "p0"): (60, 21), ("m1", "p1"): (60, 9)})
+        (tmp_path / "grid.env").write_text("MIND_MODEL_ALIAS=m0\nMIND_PROMPT_VARIANT=p0\n"
+                                           "MIND_PROMPT_CANDIDATE=p1\nMIND_PROMPT_AB_SPLIT=0.2\n"
+                                           "MIND_ADAPTER=a0\nMIND_ADAPTER_CANDIDATE=a1\n"
+                                           "MIND_ADAPTER_AB_SPLIT=0.2\n")
+        with caplog.at_level(logging.WARNING, logger="grid.weekly"):
+            row = await _judge(cfg, tmp_path, "prompt")
+    ab = row["evals"]["colony_ab"]
+    assert ab["factorial_judged"] is False and "cells" not in ab
+    assert "adapter is not one of the ['model', 'prompt'] axes" in row["reason"]
+    assert "being judged two-arm" in caplog.text
+
+
+def test_a_cell_needs_one_label_per_dimension(tmp_path):
+    # M-1: a 1-tuple built the single-label key "m0", which is the one shape an unattributable
+    # row's partial attribution could collide with -- the whole exclusion argument rests on every
+    # real cell key carrying both labels. Mutation: drop the arity check -> no raise, and the
+    # tally comes back keyed "m0".
+    from grid.weekly import ab_arms
+    _seed_factorial(tmp_path, cells={("m0", "p0"): (1, 1), ("m0", "p1"): (1, 0),
+                                     ("m1", "p0"): (1, 0), ("m1", "p1"): (1, 0)})
+    with pytest.raises(ValueError, match="one label per dimension"):
+        ab_arms(Path(tmp_path) / "v", since_ts=0, cells=[("m0",), ("m0", "p1")])
+
+
+def test_factorial_says_so_when_the_week_starts_nothing(tmp_path, monkeypatch, capsys):
+    # M-2: the flag's precondition (another dimension IS splitting) can be satisfied while this
+    # dimension has nothing to test -- here the candidate is already the live incumbent. Not a
+    # usage error, because an operator cannot know it in advance; but requirement F's principle is
+    # that a flag is never accepted and silently dropped, and the row is the only place a reader
+    # looks. Mutation: drop `_factorial_note` from the "already the live incumbent" path -> the
+    # word factorial appears nowhere in the row.
+    import grid.weekly as weekly_mod
+    from grid.weekly import main
+    _both_split_env(tmp_path, monkeypatch)
+    _prompt_registry(monkeypatch)
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v4", decision="ab_started",
+                 incumbent="kannaka-brain-v3")
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)
+    # v1-sandbox is MIND_PROMPT_VARIANT, i.e. the live incumbent: there is nothing to test.
+    assert main(["release", "--dimension", "prompt", "--candidate", "v1-sandbox", "--factorial"]) == 0
+    row = _last_row(tmp_path)
+    assert row["decision"] == "unchanged"
+    assert row["reason"].endswith("--factorial had no effect: no experiment was started")
+    assert "already the live prompt incumbent" in row["reason"]
+    capsys.readouterr()
+
+
+def test_an_abandoned_ab_episode_is_never_reported_as_a_closed_partner(tmp_path):
+    # An `ab_started` row arriving while one is already open ABANDONS the previous episode --
+    # the pre-existing reading, which simply overwrote `started`. It did not CLOSE it: nothing
+    # ended that split, so there is no closing row, no moment it stopped, and nothing that could
+    # bound a factorial window. Mutation: have a new opener close the episode it supersedes ->
+    # `_closed_partner` returns the abandoned one and dates a window from a row that closed
+    # nothing, silently truncating the other leg's tally.
+    from grid.versions import Versions
+    from grid.weekly import _closed_partner, ab_state
+    _seed_ab_row(tmp_path, dimension="model", version="m1", decision="ab_started",
+                 incumbent="m0", since_ts=1_000)
+    _seed_ab_row(tmp_path, dimension="model", version="m2", decision="ab_started",
+                 incumbent="m0", since_ts=2_000)
+    versions = Versions(tmp_path / "releases" / "versions.jsonl")
+    assert ab_state(versions, dimension="model")["candidate"] == "m2"   # the reading is unchanged
+    assert _closed_partner(versions, "model", 0) is None
+    # ...and once something really does close it, it IS a closed partner, dated by that row.
+    _seed_ab_row(tmp_path, dimension="model", version="m2", decision="held")
+    versions = Versions(tmp_path / "releases" / "versions.jsonl")
+    assert ab_state(versions, dimension="model") is None
+    state, closed_ms = _closed_partner(versions, "model", 0)
+    assert state["candidate"] == "m2" and closed_ms > 0
+    # ...and with several closed episodes behind it, the MOST RECENT one is the partner: an older
+    # experiment that also overlapped was itself superseded, and dating a window from it would
+    # truncate this leg's tally at a moment the partner was still splitting. Mutation: walk the
+    # episodes forward instead of reversed -> "m2" comes back here, and its earlier close ts.
+    _seed_ab_row(tmp_path, dimension="model", version="m3", decision="ab_started",
+                 incumbent="m0", since_ts=3_000)
+    _seed_ab_row(tmp_path, dimension="model", version="m3", decision="held")
+    versions = Versions(tmp_path / "releases" / "versions.jsonl")
+    latest, latest_ms = _closed_partner(versions, "model", 0)
+    assert latest["candidate"] == "m3" and latest_ms >= closed_ms
+
+
+async def test_a_relabelled_incumbent_row_says_no_tally_was_taken(tmp_path):
+    # The one A/B-week path that computes no tally at all: the incumbent's label changed mid-A/B,
+    # so `arms` is {} and the evaluation is skipped. That block inherits `factorial` from the
+    # `ab_started` row exactly like every other week's does, so it has to say outright that
+    # nothing was judged -- otherwise a factorial run's skipped week reads as a factorial verdict
+    # whose keys merely happen to be missing. Mutation: drop `factorial_judged` there -> KeyError.
+    row, r, env, restarts = await _run_prompt_ab_week(tmp_path, inc_rep=30, cand_rep=28,
+                                                      live_variant="v9-relabelled")
+    ab = row["evals"]["colony_ab"]
+    assert row["decision"] == "ab_inconclusive" and ab["arms"] == {}
+    assert ab["factorial_judged"] is False
+    assert "incumbent label changed mid-A/B" in row["reason"]

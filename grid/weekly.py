@@ -376,6 +376,20 @@ def _row_arm(dimensions: tuple[str, ...], entry: dict, verdict_row: dict | None 
     return CELL_SEP.join(parts)
 
 
+def _in_window(entry: dict, since_ts: int, until_ts: int | None) -> bool:
+    """Is this proposal inside the tally's window? `[since_ts, until_ts)`, upper bound optional.
+
+    ONE rule, because `ab_arms` applies it twice -- once to count attempts and once to join
+    verdicts -- and a window the two loops disagree about would report settles from outside the
+    same interval it counted asks over.
+
+    `or 0`, not a `.get` default: this runs on EVERY row, so a single hand-edited `"ts": null`
+    would otherwise TypeError out of both the Sunday release and the nightly check.
+    """
+    ts = int(entry.get("ts") or 0)
+    return ts >= since_ts and (until_ts is None or ts < until_ts)
+
+
 #: "not given", which is NOT `None`. `ab_state` yields `incumbent=None` for an `ab_started` row
 #: that never recorded one (hand-edited, or written by an older writer), and `ab_arms` has always
 #: accepted that and simply matched no row against it. A `None` default here would make those two
@@ -383,8 +397,9 @@ def _row_arm(dimensions: tuple[str, ...], entry: dict, verdict_row: dict | None 
 _UNSET: object = object()
 
 
-def ab_arms(verdicts_dir: Path, *, since_ts: int, incumbent=_UNSET, candidate=_UNSET,
-            dimension=_UNSET, cells: list[tuple[str, str]] | None = None) -> dict:
+def ab_arms(verdicts_dir: Path, *, since_ts: int, until_ts: int | None = None,
+            incumbent=_UNSET, candidate=_UNSET, dimension=_UNSET,
+            cells: list[tuple[str, str]] | None = None) -> dict:
     """Per-arm colony outcome for proposals MADE since `since_ts` (the proposal's own ts,
     joined by request_id), so only asks that ran under the split count.
 
@@ -392,6 +407,13 @@ def ab_arms(verdicts_dir: Path, *, since_ts: int, incumbent=_UNSET, candidate=_U
     for the settled tally and on the log entry for the attempt tally, exactly as before. For
     `prompt` BOTH tallies read the log entry's variant, because a verdict row carries no variant
     at all -- the join is what attributes it.
+
+    `until_ts` closes the window at the top, exclusive; `None` means "up to now", which is what
+    every two-arm call wants. It exists for the factorial case, where the interval that carries
+    the design is the one in which BOTH splits ran: it opens at the later of the two starts and
+    closes when the first of them ends. Bounded at only one end, the leg judged second would be
+    tallied over rows answered after its partner's candidate had already been cleared -- a
+    different experiment, counted into the same cells.
 
     `cells` is the FACTORIAL mode and replaces `incumbent`/`candidate`/`dimension` rather than
     joining them: a cell IS a pair of labels, so a single dimension has no meaning here. Given
@@ -452,6 +474,12 @@ def ab_arms(verdicts_dir: Path, *, since_ts: int, incumbent=_UNSET, candidate=_U
                              "both: a cell is a pair of labels, so one dimension has no meaning")
         for d in FACTORIAL_DIMENSIONS:
             _dimension_env(d)                 # every axis, before counting a row
+        # ARITY, checked rather than assumed. A 1-tuple builds the single-label key "m0", which
+        # is the one shape an unattributable row's partial attribution could collide with -- the
+        # whole exclusion argument rests on every real cell key having both labels in it.
+        bad = [c for c in cells if len(c) != len(FACTORIAL_DIMENSIONS)]
+        if bad:
+            raise ValueError(f"a cell needs one label per dimension {FACTORIAL_DIMENSIONS}; got {bad}")
         dimensions, arm_keys = FACTORIAL_DIMENSIONS, tuple(cell_key(*c) for c in cells)
     vdir = Path(verdicts_dir)
     acc = {t: {"settled": 0, "reproduced": 0, "births": 0, "answered": 0, "valid": 0, "unanswered": 0}
@@ -462,10 +490,7 @@ def ab_arms(verdicts_dir: Path, *, since_ts: int, incumbent=_UNSET, candidate=_U
         if not rid:
             continue
         entries[rid] = e
-        # `or 0`, not a default: this now runs on EVERY row, not only the ones a verdict
-        # joined to, so a single hand-edited `"ts": null` would otherwise TypeError out of
-        # both the Sunday release and the nightly check. Same standard as the guard above.
-        if int(e.get("ts") or 0) < since_ts:      # the same window the verdict join applies below
+        if not _in_window(e, since_ts, until_ts):  # the same window the verdict join applies below
             continue
         arm = _row_arm(dimensions, e)
         if not arm:
@@ -491,7 +516,7 @@ def ab_arms(verdicts_dir: Path, *, since_ts: int, incumbent=_UNSET, candidate=_U
                     "attempt tally: %s", ", ".join(sorted(unknown)))
     for row in Ledger(vdir / "verdicts.jsonl").rows():
         e = entries.get(row.get("request_id"))
-        if e is None or int(e.get("ts") or 0) < since_ts or row.get("tier") in EXCLUDED_TIERS:
+        if e is None or not _in_window(e, since_ts, until_ts) or row.get("tier") in EXCLUDED_TIERS:
             continue
         # The verdict row's own alias for `model` (unchanged); the joined log entry for every
         # other dimension, because a verdict row records no variant -- the join is the only
@@ -534,6 +559,39 @@ def _advisory_evals(cfg: WeeklyConfig, dimension: str) -> dict:
     A/B rows already carry, and building a second summary nothing consumes would be worse.
     """
     return {"colony_ab": colony_ab(cfg.verdicts_dir)} if dimension == UNSALTED_DIMENSION else {}
+
+
+def _factorial_note(factorial: bool, reason: str) -> str:
+    """Say so when `--factorial` was given and the week started no experiment at all.
+
+    The flag's precondition (another dimension IS splitting) can be perfectly satisfied while this
+    dimension has nothing to test -- the candidate is already the live incumbent, or Rogue
+    promoted nothing, or the tag is in `lost_tags`. That is not a usage error, because an operator
+    cannot know it in advance, so it is not refused; but requirement F's principle is that a flag
+    is never accepted and silently dropped, and the row is the only place a reader will look.
+
+    APPENDED, like every other note this module adds to a reason: `lost_tags` matches on the
+    PREFIX and `_exit_code`'s D5 rule keys on a reason ENDING in ": flip_failed", so this is the
+    one shape that is safe at both ends -- these rows never end in that suffix.
+    """
+    if not factorial:
+        return reason
+    log.warning("--factorial was given but no experiment was started this week: %s", reason)
+    return f"{reason}; --factorial had no effect: no experiment was started"
+
+
+def _interlock_evals(cfg: WeeklyConfig, versions: Versions, dimension: str) -> dict:
+    """The advisory evals an interlock refusal records, WITH the other-dimension key.
+
+    The refusal row was the one row missing it, and it is the one row whose entire subject is what
+    the other dimension is doing -- it recorded that only as prose in `_interlock_reason`. On a
+    prompt refusal `_advisory_evals` is `{}` outright, so the week the gate refused to start left
+    no machine-readable trace of WHY at all.
+    """
+    evals = _advisory_evals(cfg, dimension)
+    block = dict(evals.get("colony_ab") or {})
+    block["other_dimensions"] = _other_dimensions(cfg, versions, dimension)
+    return {**evals, "colony_ab": block}
 
 
 def ab_decide(arms: dict, *, incumbent: str, candidate: str, min_sample: int = MIN_SAMPLE,
@@ -697,32 +755,81 @@ def is_stuck(arms: dict, *, since_ts: int, now_ms: int, incumbent: str, candidat
     return arms[incumbent]["settled"] >= STUCK_INCUMBENT_MIN or arms[incumbent]["settled"] == 0
 
 
-def ab_state(versions: Versions, *, dimension: str = UNSALTED_DIMENSION) -> dict | None:
-    """The running A/B IN ONE DIMENSION: the last ab_started row not yet closed by a
-    released/held/rolled_back/flip_incomplete row.
+#: The decisions that CLOSE a running A/B. Named, because two readers now key on it: `ab_state`,
+#: which wants the episode still open, and `_closed_partner`, which wants the last one that
+#: closed and when. (`_AB_DECISIONS` below is a different set -- it includes the openers, because
+#: the reconciler asks a different question of it.)
+_AB_CLOSING = ("released", "held", "rolled_back", "flip_incomplete")
+
+
+def _ab_episodes(versions: Versions, dimension: str) -> list[dict]:
+    """Every A/B episode in one dimension, oldest first: what opened it, what closed it, and how
+    many `ab_inconclusive` weeks it accumulated in between.
+
+    ONE scan, two readers. `ab_state` wants the episode still open; `_closed_partner` wants the
+    last one that CLOSED, and the moment it did. Two loops over the same rows asking almost the
+    same question is how the two drift, and a factorial verdict now depends on both agreeing.
 
     Rows from another dimension are skipped outright rather than merely ignored as openers:
     they must not CLOSE this dimension's A/B either. A model release landing mid-week would
     otherwise silently end a running prompt experiment in the ledger while the relay kept
     splitting to it -- the exact env/ledger divergence the reconciler exists to repair.
+
+    An `ab_started` row arriving while one is already open opens a NEW episode and abandons the
+    previous one -- which keeps `closed: None` and is therefore never reported as a closed
+    partner. That is the pre-existing reading (the old scan simply overwrote `started`), kept.
     """
     _dimension_env(dimension)                 # refuse an unknown dimension before reading rows
-    started, weeks = None, 0
+    episodes: list[dict] = []
     for r in versions.rows():
         if dimension_of(r) != dimension:
             continue
+        open_now = episodes[-1] if episodes and episodes[-1]["closed"] is None else None
         if r["decision"] == "ab_started":
-            started, weeks = r, 0
-        elif started is not None and r["decision"] == "ab_inconclusive":
-            weeks += 1
-        elif started is not None and r["decision"] in ("released", "held", "rolled_back", "flip_incomplete"):
-            started = None
-    if started is None:
-        return None
-    ab = (started.get("evals") or {}).get("colony_ab") or {}
+            episodes.append({"started": r, "closed": None, "weeks": 0})
+        elif open_now is not None and r["decision"] == "ab_inconclusive":
+            open_now["weeks"] += 1
+        elif open_now is not None and r["decision"] in _AB_CLOSING:
+            open_now["closed"] = r
+    return episodes
+
+
+def _episode_state(episode: dict) -> dict:
+    """One episode read the way every caller of `ab_state` expects it."""
+    started, ab = episode["started"], (episode["started"].get("evals") or {}).get("colony_ab") or {}
     return {"candidate": ab.get("candidate", started.get("version")), "incumbent": ab.get("incumbent", started.get("previous")),
             "split": ab.get("split", AB_SPLIT), "since_ts": int(ab.get("since_ts") or started["ts"] * 1000),
-            "weeks": weeks, "started_row": started}
+            "weeks": episode["weeks"], "started_row": started}
+
+
+def ab_state(versions: Versions, *, dimension: str = UNSALTED_DIMENSION) -> dict | None:
+    """The running A/B IN ONE DIMENSION: the last ab_started row not yet closed by a
+    released/held/rolled_back/flip_incomplete row."""
+    episodes = _ab_episodes(versions, dimension)
+    if not episodes or episodes[-1]["closed"] is not None:
+        return None
+    return _episode_state(episodes[-1])
+
+
+def _closed_partner(versions: Versions, dimension: str, since_ts: int) -> tuple[dict, int] | None:
+    """The last A/B in this dimension that CLOSED after `since_ts`, and the ms it closed at.
+
+    "Was the partner splitting during this leg's window", asked of the ledger, which is the fact
+    `ab_state` cannot answer once the partner has been judged. Without it the second leg of a
+    factorial week is judged two-arm and the two legs disagree about a binding verdict purely
+    because of which command an operator typed first -- see `_factorial_partner`.
+
+    Closed BEFORE this leg even started means the two never overlapped, so it is not a partner at
+    all; that is what `since_ts` filters out. Only the most recent closed episode is considered:
+    an older one that also overlapped was itself superseded, and the interlock means there is at
+    most one experiment per dimension at a time anyway.
+    """
+    for episode in reversed(_ab_episodes(versions, dimension)):
+        if episode["closed"] is None:
+            continue
+        closed_ms = int(episode["closed"]["ts"] * 1000)
+        return (_episode_state(episode), closed_ms) if closed_ms > since_ts else None
+    return None
 
 
 def _blocking_experiments(cfg: WeeklyConfig, versions: Versions, dimension: str) -> list[tuple[str, str]]:
@@ -784,6 +891,35 @@ def _factorial_reason(blocking: list[tuple[str, str]], dimension: str) -> str:
     return (_open_elsewhere(blocking)
             + f"; --factorial: the {dimension} experiment was started ALONGSIDE it by explicit "
               "operator request, and each dimension is decided on its own marginal")
+
+
+def _factorial_pair_fault(blocking: list[tuple[str, str]], dimension: str) -> str:
+    """Why `--factorial` cannot be honoured here, or "" when it can. One rule, two callers.
+
+    Two things are checked and they are not the same thing. NOTHING BLOCKING means there is no
+    second experiment, so `factorial: True` would be stamped on an ordinary single-dimension A/B
+    -- and the judging path keys on exactly that marker, so the next experiment started in the
+    other dimension would be drafted into a "design" whose first leg had already been collecting
+    unbalanced traffic for a week.
+
+    The second check is the one the review found missing: the blocker must be a dimension this
+    module can actually CROSS. `_factorial_partner` refuses anything but `FACTORIAL_DIMENSIONS`,
+    so with a third dimension in odin's allowlist -- which `FACTORIAL_DIMENSIONS`' own comment
+    anticipates -- `--factorial` would be ACCEPTED for a pair the gate cannot compute, start both
+    splits, and then judge both legs two-arm over a shared window. That is the exact failure the
+    interlock exists to prevent, reached by typing the flag that claims to prevent it. Refuse it
+    at the argument instead, where an operator can still do something about it.
+    """
+    if not blocking:
+        return ("--factorial overrides the interlock, and nothing is blocking: no other "
+                f"dimension is splitting live traffic, so a {dimension} experiment started now "
+                "is an ordinary single-dimension run")
+    pair = {dimension} | {d for d, _ in blocking}
+    if pair != set(FACTORIAL_DIMENSIONS):
+        return (f"--factorial can only cross {sorted(FACTORIAL_DIMENSIONS)}; this week would "
+                f"cross {sorted(pair)}, which no tally in grid.weekly can compute -- the "
+                "experiments would both be judged two-arm over a shared window")
+    return ""
 
 
 def _other_dimensions(cfg: WeeklyConfig, versions: Versions, dimension: str) -> dict:
@@ -1006,9 +1142,13 @@ def start_ab(cfg: WeeklyConfig, *, candidate: str, incumbent: str, dimension: st
     # the function that puts the name in grid.env and restarts the relay onto it.
     _validate_candidate(dimension, candidate)
     since = now_ms if now_ms is not None else int(time.time() * 1000)
+    # Built HERE, not spliced on by `release` afterwards: requirement E says every A/B row carries
+    # it, and a second caller of `start_ab` would otherwise write an `ab_started` row without it.
+    # `Versions` is re-opened from cfg the same way `ab_check`, `ab_reconcile` and `ab_forget` do.
     block = {"binding": True, "candidate": candidate, "incumbent": incumbent, "split": AB_SPLIT, "since_ts": since,
              "min_sample": MIN_SAMPLE, "tolerance": TOLERANCE, "weeks": 0, "arms": {}, "winner": None,
-             "factorial": factorial}
+             "factorial": factorial,
+             "other_dimensions": _other_dimensions(cfg, Versions(cfg.releases_dir / "versions.jsonl"), dimension)}
     if dry_run:
         return block, "ok"
     before_cand = _env_get(cfg.grid_env, keys["candidate"])
@@ -1055,40 +1195,63 @@ def _is_factorial(state: dict) -> bool:
     return bool(((state["started_row"].get("evals") or {}).get("colony_ab") or {}).get("factorial"))
 
 
-def _factorial_partner(versions: Versions, state: dict, dimension: str) -> tuple[str, dict] | None:
-    """The other leg of a factorial run, or None if this is an ordinary two-arm week.
+def _factorial_partner(versions: Versions, state: dict, dimension: str) -> tuple[tuple[str, dict, int | None] | None, str]:
+    """The other leg of a factorial run as `((other, other_state, until_ts), "")`, or
+    `(None, why)` naming the reason this week must be judged two-arm instead.
 
     EITHER leg's marker is enough, and that is not a courtesy. `--factorial` is typed exactly
     once, on the run that starts SECOND -- the first was started when nothing was blocking and
     had no reason to claim anything. Requiring this dimension's own row to carry the marker would
-    judge the first-started experiment two-arm over a window it shared with the second, which is
-    precisely the confounded verdict the interlock exists to prevent: the override would then fix
-    one leg and quietly corrupt the other.
+    judge the first-started experiment two-arm over a window it shared with the second.
 
-    Both legs must still be OPEN IN THE LEDGER. Once one closes, its candidate stops splitting
-    and the design is gone; the remaining leg falls back to its two-arm tally, and the advisory
-    `other_dimensions` key on the row is what records that the window was shared.
+    THE PARTNER MAY ALREADY HAVE CLOSED, and this is the whole of the C1 fix. `release` judges
+    ONE dimension per call, so a factorial week is two commands; whichever runs first ends its own
+    leg (a win flips, a loss and an inconclusive-at-MAX both call `end_ab`). Asking only "is the
+    partner open NOW" therefore made the second leg fall back to a two-arm tally over its own
+    `since_ts`, and the two orderings disagreed about a BINDING, irreversible verdict on identical
+    data -- on the fixture in the tests, one order releases the candidate model and the other
+    writes it into `lost_tags` for good. Nothing constrains the order: the systemd timer judges
+    the model leg, the prompt leg is hand-run.
+
+    So the question asked of the ledger is "was the partner SPLITTING during this leg's window",
+    which `_closed_partner` answers from the rows the reconciler already keys on. The window
+    returned with it is `[max(starts), partner_close)` -- the interval in which both splits
+    really ran -- and it is the same interval whichever command runs first, because it is derived
+    from what the ledger records rather than from what happens to be open at the moment of asking.
+    `until_ts` is None while the partner is still open, which is the leg judged first.
     """
     for other in sorted(DIMENSIONS):
-        # Only the two axes `ab_arms(cells=...)` knows how to cross. A third dimension in odin's
-        # allowlist is not silently drafted into a design nothing here can compute.
-        if other == dimension or {dimension, other} != set(FACTORIAL_DIMENSIONS):
+        if other == dimension:
             continue
-        other_state = ab_state(versions, dimension=other)
-        if other_state is None or not (_is_factorial(state) or _is_factorial(other_state)):
+        # Only the two axes `ab_arms(cells=...)` knows how to cross. A third dimension in odin's
+        # allowlist is not silently drafted into a design nothing here can compute -- and, unlike
+        # before, saying so out loud, because a silent skip here is how a `--factorial` week
+        # accepted for an uncomputable pair would come to be judged two-arm with nothing logged.
+        if {dimension, other} != set(FACTORIAL_DIMENSIONS):
+            if ab_state(versions, dimension=other) is not None:
+                return None, (f"{other} is not one of the {list(FACTORIAL_DIMENSIONS)} axes a "
+                              "factorial tally can cross")
+            continue
+        open_state = ab_state(versions, dimension=other)
+        until_ts: int | None = None
+        if open_state is not None:
+            other_state = open_state
+        else:
+            closed = _closed_partner(versions, other, state["since_ts"])
+            if closed is None:
+                continue
+            other_state, until_ts = closed
+        if not (_is_factorial(state) or _is_factorial(other_state)):
             continue
         # All four labels, or no design. An `ab_started` row that never recorded an incumbent --
         # hand-edited, or written by an older writer -- yields `incumbent: None`, which names no
         # cell and cannot be pooled. The two-arm path tolerates that (the arm simply matches
-        # nothing and the week reads inconclusive); a cell key built from it would not. Fall
-        # back rather than crash the Sunday run, and let the advisory key record the overlap.
+        # nothing and the week reads inconclusive); a cell key built from it would not.
         labels = [state["incumbent"], state["candidate"], other_state["incumbent"], other_state["candidate"]]
         if not all(isinstance(x, str) and x for x in labels):
-            log.warning("colony A/B: a factorial leg is missing an arm label (%s); judging %s "
-                        "two-arm instead", labels, dimension)
-            continue
-        return other, other_state
-    return None
+            return None, f"a factorial leg is missing an arm label ({labels})"
+        return (other, other_state, until_ts), ""
+    return None, ""
 
 
 def _judge_ab(cfg: WeeklyConfig, versions: Versions, state: dict, dimension: str) -> tuple[str, str, dict, dict]:
@@ -1100,32 +1263,48 @@ def _judge_ab(cfg: WeeklyConfig, versions: Versions, state: dict, dimension: str
     -- `is_validity_loss`, `short_arms`, `lost_tags` reading `short_arms` back, the operator
     reading the row -- is about THIS dimension's two arms, and a cell is not one of them.
 
-    The window is the LATER of the two starts. A request that arrived before the second split
-    began was answered at one fixed level of that dimension, so it is not part of the design at
-    all; counting it into a cell would put unbalanced traffic into the pool and hand back exactly
-    the unattributable number the whole exercise is avoiding.
+    The window is `[max(starts), partner_close)`: the interval in which BOTH splits ran. A request
+    that arrived before the second split began was answered at one fixed level of that dimension,
+    and one that arrived after the first leg closed was answered with that leg's candidate already
+    cleared; neither is part of the design, and counting either into a cell would pool unbalanced
+    traffic and hand back the unattributable number the whole exercise is avoiding. Because both
+    bounds come from the LEDGER rather than from what happens to be open at the moment of asking,
+    both legs are tallied over the same interval whichever command runs first.
+
+    `factorial_judged` is on every block this returns, True or False, and a leg whose own row
+    claims `factorial` but that could not be judged as one says so IN THE REASON and logs a
+    WARNING. A row must describe what was actually computed: inheriting `factorial: True` from
+    the `ab_started` row while carrying a two-arm tally makes a reader deduce the truth from
+    keys that are ABSENT.
     """
-    partner = _factorial_partner(versions, state, dimension)
+    partner, degraded = _factorial_partner(versions, state, dimension)
     if partner is None:
         arms = ab_arms(cfg.verdicts_dir, since_ts=state["since_ts"], incumbent=state["incumbent"],
                        candidate=state["candidate"], dimension=dimension)
         verdict, reason = ab_decide(arms, incumbent=state["incumbent"], candidate=state["candidate"])
-        return verdict, reason, arms, {}
-    other, other_state = partner
+        if _is_factorial(state):
+            degraded = degraded or "no other dimension was splitting during this window"
+            log.warning("colony A/B: %s was started as a factorial run but is being judged "
+                        "two-arm: %s", dimension, degraded)
+            reason = f"{reason} [factorial run, judged two-arm: {degraded}]"
+        return verdict, reason, arms, {"factorial_judged": False}
+    other, other_state, until_ts = partner
     pairs = {dimension: (state["incumbent"], state["candidate"]),
              other: (other_state["incumbent"], other_state["candidate"])}
     since = max(int(state["since_ts"]), int(other_state["since_ts"]))
     cells = [(m, p) for m in pairs[UNSALTED_DIMENSION] for p in pairs["prompt"]]
-    four = ab_arms(cfg.verdicts_dir, since_ts=since, cells=cells)
+    four = ab_arms(cfg.verdicts_dir, since_ts=since, until_ts=until_ts, cells=cells)
     result = ab_decide_factorial(four, model=pairs[UNSALTED_DIMENSION], prompt=pairs["prompt"])
     verdict, reason = result[dimension]
     # APPENDED to the reason, never prepended: `lost_tags` matches on the reason's PREFIX
     # ("colony A/B lost" / "stuck" / "inconclusive"), so a note in front would erase the colony's
     # memory of a candidate that just lost on a perfectly attributable marginal.
-    reason = f"{reason} [factorial marginal, pooled over {other}]"
+    closed = "" if until_ts is None else ", up to its close"
+    reason = f"{reason} [factorial marginal, pooled over {other}{closed}]"
     return verdict, reason, result["marginals"][dimension], {
-        "factorial": True, "factorial_with": {other: other_state["candidate"]},
-        "factorial_since_ts": since, "cells": four, "interaction": result["interaction"]}
+        "factorial": True, "factorial_judged": True, "factorial_with": {other: other_state["candidate"]},
+        "factorial_since_ts": since, "factorial_until_ts": until_ts,
+        "cells": four, "interaction": result["interaction"]}
 
 
 def _iso_week() -> str:
@@ -1195,6 +1374,9 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
             # mislabel and a blacklisting. Now lost_tags abstains for two independent reasons.
             block = {**started_ab, "binding": True, "arms": {}, "weeks": state["weeks"] + 1,
                      "winner": None, "short_arms": [state["candidate"], state["incumbent"]],
+                     # No tally was taken at all, factorial or otherwise: `arms` is {}. Said
+                     # explicitly rather than left to be inferred from the inherited `factorial`.
+                     "factorial_judged": False,
                      "other_dimensions": _other_dimensions(cfg, versions, dimension)}
             base_reason = (f"incumbent label changed mid-A/B ({env_incumbent} != "
                            f"{state['incumbent']}); evaluation skipped")
@@ -1305,26 +1487,23 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
     # make. This copy is the guard for every OTHER caller, the same reason `start_ab` keeps its own
     # copy of the equal-arms refusal and `_validate_candidate` is checked twice.
     blocking = _blocking_experiments(cfg, versions, dimension)
-    if factorial and not blocking:
-        # The second guard, and the reason it is not tidiness: with nothing blocking, a
-        # `--factorial` start would write `factorial: True` onto an ordinary single-dimension
-        # A/B, and `_factorial_partner` keys the JUDGING path on exactly that marker. The next
-        # experiment started in the other dimension would then be drafted into a "design" whose
-        # first leg had already been collecting unbalanced traffic for a week.
-        raise ValueError("--factorial overrides the interlock, and nothing is blocking: no other "
-                         f"dimension is splitting live traffic, so a {dimension} experiment "
-                         "started now is an ordinary single-dimension run")
+    if factorial and (fault := _factorial_pair_fault(blocking, dimension)):
+        # The second guard. `main` refuses this too, and must, to turn it into a usage error
+        # rather than a traceback; this copy is the guard for every OTHER caller, the same reason
+        # `start_ab` keeps its own copy of the equal-arms refusal.
+        raise ValueError(fault)
     if blocking and not factorial:
         row = release_row(decision="unchanged", dimension=dimension, version=(cand or {}).get("tag"),
                           previous=released, adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
-                          evals=_advisory_evals(cfg, dimension), spend_usd=0.0,
+                          evals=_interlock_evals(cfg, versions, dimension), spend_usd=0.0,
                           reason=_interlock_reason(blocking, dimension), **common)
         return _ledger(versions, row, dry_run=dry_run)
     if cand is None or cand["tag"] == released:
         decision, reason = decide(candidate=(cand or {}).get("tag"), released=released, identity=True, validity=True)
         row = release_row(decision=decision, dimension=dimension, version=(cand or {}).get("tag"), previous=released,
                           adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
-                          evals=_advisory_evals(cfg, dimension), spend_usd=0.0, reason=reason, **common)
+                          evals=_advisory_evals(cfg, dimension), spend_usd=0.0,
+                          reason=_factorial_note(factorial, reason), **common)
         return _ledger(versions, row, dry_run=dry_run)
     if cand["tag"] == _live_arm(cfg, dimension):
         # I1, and it is not the same case as `== released` above: a dimension that has never had
@@ -1340,7 +1519,8 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
         decision, reason = "unchanged", f"{cand['tag']} is already the live {dimension} incumbent"
         row = release_row(decision=decision, dimension=dimension, version=cand["tag"], previous=released,
                           adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
-                          evals=_advisory_evals(cfg, dimension), spend_usd=0.0, reason=reason, **common)
+                          evals=_advisory_evals(cfg, dimension), spend_usd=0.0,
+                          reason=_factorial_note(factorial, reason), **common)
         return _ledger(versions, row, dry_run=dry_run)
     if cand["tag"] in lost_tags(versions, dimension=dimension):
         decision = "held"
@@ -1352,7 +1532,8 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
         forget = f"grid.weekly ab --forget {cand['tag']}"
         if dimension != UNSALTED_DIMENSION:
             forget = f"{forget} --dimension {dimension}"
-        reason = f"{cand['tag']} already lost/stuck the colony A/B; run `{forget}` to retest"
+        reason = _factorial_note(factorial, f"{cand['tag']} already lost/stuck the colony A/B; "
+                                 f"run `{forget}` to retest")
         row = release_row(decision=decision, dimension=dimension, version=cand["tag"], previous=released,
                           adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
                           evals=_advisory_evals(cfg, dimension), spend_usd=0.0, reason=reason, **common)
@@ -1364,7 +1545,7 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
         # as a probe failure. Skip the check (proceed) when the key's model list can't be read.
         models = key_models(cfg, remote)
         if models is not None and cand["tag"] not in models and models not in _WILDCARD_MODEL_LISTS:
-            decision, reason = "held", f"candidate {cand['tag']} not on the colony key"
+            decision, reason = "held", _factorial_note(factorial, f"candidate {cand['tag']} not on the colony key")
             row = release_row(decision=decision, dimension=dimension, version=cand["tag"], previous=released,
                               adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
                               evals=_advisory_evals(cfg, dimension), spend_usd=0.0, reason=reason, **common)
@@ -1377,7 +1558,7 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
             evals["identity"] = identity = await run_identity(ask, runs=cfg.identity_runs)
             evals["validity"] = validity = await run_validity(ask, cfg.verdicts_dir)
         except Exception as e:
-            decision, reason = "held", f"probe failed: {e}"
+            decision, reason = "held", _factorial_note(factorial, f"probe failed: {e}")
             evals["probe_error"] = str(e)
             row = release_row(decision=decision, dimension=dimension, version=cand["tag"], previous=released,
                               adapter_sha256="", gguf_sha256="", set_manifest_sha256="", evals=evals,
@@ -1400,14 +1581,15 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
         spend = 0.0
         h = {"adapter_sha256": "", "gguf_sha256": "", "set_manifest_sha256": ""}
         decision, reason = "released", f"{dimension} candidate {cand['tag']}: no model probes to run"
+    if decision != "released":
+        # The probes (or `decide`) held this week, so nothing is started: same note as the five
+        # early returns above, in the one place they all bypass.
+        reason = _factorial_note(factorial, reason)
     if decision == "released":
         # spec §8: probes passed, but a release is now a binding colony A/B, not a flip.
         incumbent = _live_arm(cfg, dimension) or released
         block, outcome = start_ab(cfg, candidate=cand["tag"], incumbent=incumbent, dimension=dimension,
                                   local_run=local_run, dry_run=dry_run, factorial=factorial)
-        # Read AFTER start_ab, which only ever writes this dimension's own env lines, so what the
-        # other dimensions are doing is the same fact before and after.
-        block["other_dimensions"] = _other_dimensions(cfg, versions, dimension)
         evals["colony_ab"] = block
         if outcome == "ok":
             decision, reason = "ab_started", ("probes passed; colony A/B started" if dimension == UNSALTED_DIMENSION
@@ -1537,6 +1719,13 @@ def ab_check(cfg: WeeklyConfig, *, dimension: str = UNSALTED_DIMENSION, now_ms: 
                     env_incumbent, state["incumbent"], MAX_WEEKS)
         return None
     now = now_ms if now_ms is not None else int(time.time() * 1000)
+    # TWO-ARM, over this leg's own window, on a factorial week too, and deliberately. `is_stuck`
+    # asks only whether the candidate settled ANYTHING and `short_arms` is called with a bar of 1,
+    # so this is a liveness check, not a verdict -- there is no rate to attribute and therefore
+    # nothing for a marginal to separate. The error is also in the safe direction: a factorial
+    # leg's own window is the WIDER one (it starts earlier and has no upper bound), so it can only
+    # make an arm look more alive, never less, and the nightly cannot abort an experiment that is
+    # in fact producing. The Sunday gate is where the factorial window matters, and it uses it.
     arms = ab_arms(cfg.verdicts_dir, since_ts=state["since_ts"], incumbent=state["incumbent"],
                    candidate=state["candidate"], dimension=dimension)
     if not is_stuck(arms, since_ts=state["since_ts"], now_ms=now, incumbent=state["incumbent"], candidate=state["candidate"]):
@@ -1912,10 +2101,8 @@ def main(argv: list[str] | None = None) -> int:
     if a.factorial and open_here:
         ap.error(f"there is already a {dimension} A/B open; --factorial starts a factorial run, "
                  "it does not change how a running one is judged")
-    if a.factorial and not blocking:
-        ap.error("--factorial overrides the interlock, and nothing is blocking: no other "
-                 f"dimension is splitting live traffic, so a {dimension} experiment started now "
-                 "is an ordinary single-dimension run")
+    if a.factorial and (fault := _factorial_pair_fault(blocking, dimension)):
+        ap.error(fault)
     if blocking and not a.factorial:
         # A RECORDED row, not a printed message. `unchanged` is the ledger's word for "the gate
         # ran and moved nothing", and without the row a Sunday that did nothing is indistinguishable
@@ -1926,7 +2113,7 @@ def main(argv: list[str] | None = None) -> int:
             week=a.week or _iso_week(), decision="unchanged", dimension=dimension, version=a.candidate,
             previous=last["version"] if last else None, base="", run="", adapter_sha256="", gguf_sha256="",
             set_manifest_sha256="", grid_examples={}, verdict_window=_window(cfg.verdicts_dir),
-            evals=_advisory_evals(cfg, dimension), spend_usd=0.0, rogue_ledger_ts=0.0,
+            evals=_interlock_evals(cfg, versions, dimension), spend_usd=0.0, rogue_ledger_ts=0.0,
             reason=_interlock_reason(blocking, dimension)), dry_run=a.dry_run)
     else:
         if dimension != UNSALTED_DIMENSION and not a.candidate:

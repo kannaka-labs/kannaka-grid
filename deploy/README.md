@@ -394,6 +394,33 @@ per cell: at `MIN_SAMPLE=100` a 2x2 run needs 50 settled per cell. `factorial` i
 the `ab_started` row either way, true or false, so a later reader can tell a week that
 deliberately crossed two dimensions from one that merely got confounded.
 
+**Judging a factorial week takes two commands, and the order does not matter.** `release` decides
+one dimension per call, and `grid-weekly-release.service` runs the bare `grid.weekly release`,
+i.e. the model leg only — so the other leg has to be run by hand on the same Sunday:
+```bash
+/srv/grid/venv/bin/python -m grid.weekly release --dimension prompt
+```
+Whichever runs first ends its own leg, and the second one is still judged on its marginal: the
+partner lookup asks the ledger *was the other dimension splitting during this leg's window*, not
+*is it splitting right now*. The window both legs are tallied over is `[the later of the two
+starts, the moment the first leg closed)` — the interval in which both splits actually ran — and
+it comes out the same whichever command was typed first. Rows answered before the second split
+began, or after the first leg closed, are not part of the design and are excluded, as is any row
+that names only one of the two labels.
+
+If for some reason a leg cannot be judged factorially — its partner had already closed before it
+started, the other running experiment is a dimension this gate cannot cross, or an `ab_started`
+row is missing an arm label — the week is judged two-arm and **says so**: the row carries
+`factorial_judged: false`, its `reason` gains `[factorial run, judged two-arm: …]`, and a WARNING
+is logged. A row never claims a marginal it did not compute.
+
+The keys a factorial week adds under `.evals.colony_ab`: `factorial` (on every `ab_started` row,
+true or false), `factorial_judged`, `factorial_with`, `factorial_since_ts`, `factorial_until_ts`
+(null on the leg judged first, which has no partner-close to bound it), `cells`, and
+`interaction`. Every A/B row in either mode also carries `other_dimensions` — an advisory record
+of what else was splitting when the row was written, including a hand-started split with no
+ledger row of its own.
+
 The row also reports an **interaction** — whether the candidate wording helps the candidate
 model more than it helps the incumbent. It is `advisory: True`, it carries its own reason
 saying so, and **nothing reads it, and nothing may**: an interaction is estimated per cell, and
