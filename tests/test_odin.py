@@ -843,3 +843,42 @@ def test_a_zero_split_is_refused_before_the_sampling_guard_is_ever_consulted(mon
     # run() consults the guard only after cfg exists, i.e. after the check above has fired
     body = inspect.getsource(run)
     assert "check_sampling_route" in body and "def run(cfg: RelayConfig)" in body
+
+
+async def test_a_factorial_relay_logs_both_labels_from_two_independent_draws(tmp_path):
+    # Requirement A for the factorial gate, pinned: the relay ALREADY does everything a 2x2 run
+    # needs, and there must be no second assignment path added for it. With both A/Bs running at
+    # once each request is drawn TWICE -- the model arm from the bare request id (unchanged since
+    # sub-project 3) and the prompt arm from a "prompt:"-salted hash -- and every log row carries
+    # both labels, which is the only thing that lets grid.weekly key a tally by the pair.
+    #
+    # Mutation: salt the prompt draw with the model arm, or drop either salt so both dimensions
+    # hash the same key -> the two draws become perfectly correlated, only two of the four cells
+    # are ever populated, and neither marginal is balanced over the other dimension. Mutation:
+    # drop `model_alias=alias` or `variant=variant` from any _log call -> a row attributable in
+    # one dimension only, which grid.weekly must then exclude from every cell.
+    from grid.odin import arm_for, assign
+    from grid.proposal_log import ProposalLog
+    incumbent, candidate = a_variant("p0"), a_variant("p1", template="OTHER {genome_json}")
+    plog = ProposalLog(tmp_path / "verdicts")
+    r = Relay(tmp_path, colony="c", agent_id="grid-c", mind=FakeMind(answer='["harvest","fork"]'),
+              bus=FakeBus(), clock=Clock(), state_fetch=lambda: state_of(1, 10), proposal_log=plog,
+              model_alias="m0", candidate_mind=FakeMind(answer='["harvest","fork"]'),
+              candidate_alias="m1", split=0.5,
+              prompt_variant=incumbent, prompt_candidate=candidate, prompt_split=0.5)
+    ids = [f"f{i}" for i in range(60)]
+    for rid in ids:
+        write_request(tmp_path, rid)
+        assert await r.poll_once() == "proposed"
+        (tmp_path / "proposal.json").unlink()
+    cells = [(e["model_alias"], variant_of(e)) for e in plog.read_all()]
+    assert len(cells) == len(ids)
+    assert all(m and p for m, p in cells)          # not one row attributable in only one dimension
+    assert cells == [("m1" if arm_for(rid, 0.5) == "candidate" else "m0",
+                      assign(rid, dimension="prompt", arms=["p1", "p0"], weights=[0.5, 0.5]))
+                     for rid in ids]
+    # All four cells populated, and neither draw predicts the other: two independent halves meet
+    # near a quarter, not a half. That independence is what makes each marginal balanced over the
+    # other dimension, which is the entire basis on which grid.weekly is allowed to pool.
+    assert len(set(cells)) == 4
+    assert 0.15 < cells.count(("m1", "p1")) / len(cells) < 0.35
