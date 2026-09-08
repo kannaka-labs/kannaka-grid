@@ -75,6 +75,13 @@ class Versions:
         return self.ledger.rows()
 
     def last_released(self) -> dict | None:
+        """The last release in ANY dimension.
+
+        Almost never what a caller wants now that a row has one: a prompt release is the last
+        release the moment it lands, so a model-scoped caller reading through here gets a
+        variant id where it expects a tag. `grid.weekly._last_released(versions, dimension=...)`
+        is the dimensioned read, and every caller in the gate uses it.
+        """
         rel = [r for r in self.rows() if r["decision"] in ("released", "rolled_back")]
         return rel[-1] if rel else None
 
@@ -89,7 +96,12 @@ class Versions:
 
     def append(self, row: dict) -> dict:
         # Ledger.append keys the settled set on request_id; versions have none, so give it one.
-        return self.ledger.append(dict(row, request_id=f"{row['week']}:{row['decision']}:{row['version']}"))
+        # The dimension is part of it because two dimensions can now decide the same thing about
+        # the same name in the same week -- a model and a prompt `ab --forget` of one name, say --
+        # and two rows sharing a synthesised id is a trap for any later reader that keys on it.
+        # `dimension_of`, so a hand-built row without the key still gets an id.
+        rid = f"{row['week']}:{dimension_of(row)}:{row['decision']}:{row['version']}"
+        return self.ledger.append(dict(row, request_id=rid))
 
     def verify(self) -> bool:
         return self.ledger.verify()

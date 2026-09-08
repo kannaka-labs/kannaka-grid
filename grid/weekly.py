@@ -299,12 +299,18 @@ def ab_arms(verdicts_dir: Path, *, since_ts: int, incumbent: str, candidate: str
     at all -- the join is what attributes it.
 
     An entry with NO attribution in this dimension is counted in neither tally and can never
-    form an arm. That is not the same rule as the model side's, and deliberately: the whole
-    existing corpus predates the prompt registry and carries no variant field, so "" here means
-    "this row cannot say which prompt was used", not "the arm whose name is empty". Bucketed,
-    every legacy row inside the window would pile into one phantom arm -- and when the incumbent
-    itself resolves to "" (an unreadable MIND_PROMPT_VARIANT, the env-only view), that pile is
-    published as the incumbent's own numbers and decides the week.
+    form an arm, in EVERY dimension. "" means "this row cannot say which arm answered it", never
+    "the arm whose name is empty". Bucketed, every unattributable row inside the window piles
+    into one phantom arm -- and when the incumbent itself resolves to "" (an unreadable
+    MIND_PROMPT_VARIANT, the env-only view), that pile is published as the incumbent's own
+    numbers and decides the week.
+
+    The prompt dimension is where this bites hardest, because the whole existing corpus predates
+    the prompt registry and carries no variant field at all. But the model side had the same hole
+    (N7, papered over by `_env_ab_view` popping the "" arm at the one view that could reach it),
+    and guarding it at the counter rather than at one view costs nothing: an arm with no name is
+    not an arm in either dimension. `_env_ab_view` keeps its pop, which now only ever removes a
+    zeroed key.
 
     Two tallies, from two sources, because a bad answer leaves no trace in the first one.
     The verdict rows say what the colony did with the genomes an arm produced. The proposal
@@ -334,7 +340,6 @@ def ab_arms(verdicts_dir: Path, *, since_ts: int, incumbent: str, candidate: str
     vdir = Path(verdicts_dir)
     acc = {t: {"settled": 0, "reproduced": 0, "births": 0, "answered": 0, "valid": 0, "unanswered": 0}
            for t in (incumbent, candidate)}
-    needs_attribution = dimension != UNSALTED_DIMENSION
     entries, unknown = {}, set()
     for e in ProposalLog(vdir).read_all():        # one pass: the join index AND the attempt counts
         rid = e.get("request_id")
@@ -347,7 +352,7 @@ def ab_arms(verdicts_dir: Path, *, since_ts: int, incumbent: str, candidate: str
         if int(e.get("ts") or 0) < since_ts:      # the same window the verdict join applies below
             continue
         arm = _log_arm(dimension, e)
-        if needs_attribution and not arm:
+        if not arm:
             continue                          # no attribution is not an arm; see the docstring
         a = acc.get(arm)
         if a is None:
@@ -376,7 +381,7 @@ def ab_arms(verdicts_dir: Path, *, since_ts: int, incumbent: str, candidate: str
         # other dimension, because a verdict row records no variant -- the join is the only
         # thing that can say which prompt produced the genome it settled.
         arm = str(row.get("model_alias", "")) if dimension == UNSALTED_DIMENSION else _log_arm(dimension, e)
-        if needs_attribution and not arm:
+        if not arm:
             continue
         a = acc.get(arm)
         if a is None:
@@ -401,6 +406,18 @@ def is_validity_loss(arms: dict, *, candidate: str) -> bool:
     """
     c = arms[candidate]
     return c["answered"] >= VALIDITY_MIN_ANSWERED and c["validity"] < VALIDITY_MIN
+
+
+def _advisory_evals(cfg: WeeklyConfig, dimension: str) -> dict:
+    """The advisory colony summary a NON-A/B row of this dimension may carry.
+
+    `colony_ab` is keyed by MODEL ALIAS. On a prompt row that is the wrong dimension's numbers
+    sitting where this row's would go -- harmless (`advisory: True`, nothing decides on it) but
+    wrong, and the kind of wrong that gets read as right later. It is left off rather than
+    replaced: the per-arm equivalent for another dimension is `ab_arms(dimension=...)`, which the
+    A/B rows already carry, and building a second summary nothing consumes would be worse.
+    """
+    return {"colony_ab": colony_ab(cfg.verdicts_dir)} if dimension == UNSALTED_DIMENSION else {}
 
 
 def ab_decide(arms: dict, *, incumbent: str, candidate: str, min_sample: int = MIN_SAMPLE,
@@ -536,10 +553,15 @@ def _flip_local(cfg: WeeklyConfig, keys: dict[str, str], version: str, *, local_
     """Apply a winner whose live value is a grid.env line and nothing else.
 
     The same three steps as `flip`, minus the middle one: set the live value, clear the
-    candidate, restart the relay. Because nothing here is remote, a failed restart leaves
-    NOTHING applied -- the running relay is still serving what it read at boot -- so both lines
-    must go back together. That is flip()'s own C1 rule and start_ab's N2: a file that claims a
-    new default the live relay has never read is the divergence only an operator can see.
+    candidate, restart the relay. Because nothing here is remote, a failed restart leaves nothing
+    APPLIED, so both lines go back together -- flip()'s own C1 rule and start_ab's N2: a file
+    claiming a default the live relay has never read is a divergence only an operator can see.
+
+    What a failed restart does NOT mean here is "the relay is still serving what it read at
+    boot". systemd was already asked to restart, so the old process is gone; and because odin's
+    registry loader fails closed, a value it refuses leaves the unit DOWN rather than merely
+    mislabelled -- which is why the revert is followed by another restart attempt, on the values
+    that were known to work.
 
     It also means `flip_failed` -- which means precisely "the remote tag copy failed" -- has no
     meaning on this path and is never returned. The outcomes are "ok" and "flip_incomplete".
@@ -559,6 +581,7 @@ def _flip_local(cfg: WeeklyConfig, keys: dict[str, str], version: str, *, local_
     if outcome != "ok":
         _env_restore(cfg.grid_env, keys["live"], before_live)
         _env_restore(cfg.grid_env, keys["candidate"], before_cand)
+        _restart_after_revert(local_run, "the flip")
     return outcome
 
 
@@ -623,6 +646,28 @@ def _restart_relay(local_run) -> str:
     return "flip_incomplete"
 
 
+def _restart_after_revert(local_run, what: str) -> None:
+    """Bring the PROCESS back in line with the file that was just put back.
+
+    Reverting alone is only half a repair, and the missing half is the dangerous one. By the time
+    a revert happens `_restart_relay` has already told systemd to restart, so the relay that was
+    running is gone: either a new one came up on the values being reverted away from, or -- when
+    those values are ones odin refuses at boot, an unknown variant or a candidate equal to the
+    incumbent -- no relay came up at all. In the first case the file says one thing and the live
+    process another, which is the divergence every guard in this module exists to prevent; in the
+    second the colony's mind is simply DOWN, and a correct grid.env does not bring it back.
+
+    Best effort, and it never changes what the caller reports: the experiment did not start (or
+    the flip did not apply) either way, so the outcome stays `flip_incomplete` and the operator
+    is still summoned by exit 3. This only decides whether they arrive to a running relay.
+    """
+    if _restart_relay(local_run) == "ok":
+        log.info("relay restarted on the values restored after %s", what)
+    else:
+        log.error("relay could not be restarted after reverting %s; grid.env is correct but the "
+                  "unit may be DOWN -- restart grid-odin.service by hand", what)
+
+
 def start_ab(cfg: WeeklyConfig, *, candidate: str, incumbent: str, dimension: str = UNSALTED_DIMENSION,
             local_run, dry_run: bool = False, now_ms: int | None = None) -> tuple[dict, str]:
     """Spec §8: probes passed, but a release is now a binding colony A/B, not a flip.
@@ -636,6 +681,15 @@ def start_ab(cfg: WeeklyConfig, *, candidate: str, incumbent: str, dimension: st
     ask would fail at the gateway, and the ledger would call it a prompt experiment throughout.
     """
     keys = _dimension_env(dimension)
+    # I1: odin refuses an A/B whose two arms are the same value, and it refuses it AT BOOT, so
+    # writing one here does not waste a week -- it takes the relay down and the revert below
+    # cannot argue it back up. `release` turns this case into an `unchanged` week before reaching
+    # here; this is the guard for every other caller, and it mirrors the relay's own so the two
+    # cannot drift. Note it is NOT covered by validating the name against the prompt registry:
+    # the incumbent's own id is a perfectly valid entry.
+    if candidate == incumbent:
+        raise ValueError(f"{dimension} A/B candidate and incumbent are both {candidate!r}; "
+                         "odin refuses that at boot, so starting it would leave the relay down")
     since = now_ms if now_ms is not None else int(time.time() * 1000)
     block = {"binding": True, "candidate": candidate, "incumbent": incumbent, "split": AB_SPLIT, "since_ts": since,
              "min_sample": MIN_SAMPLE, "tolerance": TOLERANCE, "weeks": 0, "arms": {}, "winner": None}
@@ -656,6 +710,10 @@ def start_ab(cfg: WeeklyConfig, *, candidate: str, incumbent: str, dimension: st
         # blanked. Writing nothing back at all would leave the new values in place.
         _env_set(cfg.grid_env, keys["candidate"], before_cand if before_cand is not None else "")
         _env_restore(cfg.grid_env, keys["split"], before_split)
+        # I2: the file is right again and the relay is not. systemd was already told to restart,
+        # so whatever is (or is not) running came up on the values just reverted away from -- and
+        # a candidate odin refuses at boot leaves NOTHING running. Try again on the restored ones.
+        _restart_after_revert(local_run, "the A/B start")
     return block, outcome
 
 
@@ -831,14 +889,38 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
         decision, reason = decide(candidate=(cand or {}).get("tag"), released=released, identity=True, validity=True)
         row = release_row(decision=decision, dimension=dimension, version=(cand or {}).get("tag"), previous=released,
                           adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
-                          evals={"colony_ab": colony_ab(cfg.verdicts_dir)}, spend_usd=0.0, reason=reason, **common)
+                          evals=_advisory_evals(cfg, dimension), spend_usd=0.0, reason=reason, **common)
+        return _ledger(versions, row, dry_run=dry_run)
+    if cand["tag"] == _live_arm(cfg, dimension):
+        # I1, and it is not the same case as `== released` above: a dimension that has never had
+        # a release through the gate still HAS an incumbent (the registry default variant; a
+        # hand-set MIND_MODEL_ALIAS), so `released` is None while the relay is serving this very
+        # name. odin refuses an A/B whose arms are equal AT BOOT, so starting it would take the
+        # relay down; and if traffic somehow accrued anyway, `arms` would have one key and
+        # `ab_decide` would compare an arm to itself and call it a win. Worse at MAX_WEEKS:
+        # `short_arms` returns [tag, tag], `set(short) - {tag}` is empty, and lost_tags would
+        # blacklist the live incumbent -- for prompt, the registry default, the one variant that
+        # must never be blacklisted. `unchanged`, the same reading `== released` gets, because it
+        # is the same fact: there is nothing here to test.
+        decision, reason = "unchanged", f"{cand['tag']} is already the live {dimension} incumbent"
+        row = release_row(decision=decision, dimension=dimension, version=cand["tag"], previous=released,
+                          adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
+                          evals=_advisory_evals(cfg, dimension), spend_usd=0.0, reason=reason, **common)
         return _ledger(versions, row, dry_run=dry_run)
     if cand["tag"] in lost_tags(versions, dimension=dimension):
         decision = "held"
-        reason = f"{cand['tag']} already lost/stuck the colony A/B; run `grid.weekly ab --forget {cand['tag']}` to retest"
+        # M2: `ab --forget` writes a MODEL forget, and lost_tags reads the forget row through the
+        # same dimension filter as the loss, so on a prompt row the bare command clears nothing.
+        # The model string stays verbatim; the other dimensions name themselves, in the flag
+        # Task 5 adds to this parser. Telling an operator to run a command that silently does
+        # nothing is worse than telling them nothing.
+        forget = f"grid.weekly ab --forget {cand['tag']}"
+        if dimension != UNSALTED_DIMENSION:
+            forget = f"{forget} --dimension {dimension}"
+        reason = f"{cand['tag']} already lost/stuck the colony A/B; run `{forget}` to retest"
         row = release_row(decision=decision, dimension=dimension, version=cand["tag"], previous=released,
                           adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
-                          evals={"colony_ab": colony_ab(cfg.verdicts_dir)}, spend_usd=0.0, reason=reason, **common)
+                          evals=_advisory_evals(cfg, dimension), spend_usd=0.0, reason=reason, **common)
         return _ledger(versions, row, dry_run=dry_run)
     if dimension == UNSALTED_DIMENSION:
         # I1: the probes ask the concrete candidate tag; the colony key may not list it yet if it
@@ -850,10 +932,10 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
             decision, reason = "held", f"candidate {cand['tag']} not on the colony key"
             row = release_row(decision=decision, dimension=dimension, version=cand["tag"], previous=released,
                               adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
-                              evals={"colony_ab": colony_ab(cfg.verdicts_dir)}, spend_usd=0.0, reason=reason, **common)
+                              evals=_advisory_evals(cfg, dimension), spend_usd=0.0, reason=reason, **common)
             return _ledger(versions, row, dry_run=dry_run)
         ask = ask_factory(cand["tag"])
-        evals = {"holdout_ppl": cand["manifest"].get("holdout_ppl", {}), "colony_ab": colony_ab(cfg.verdicts_dir)}
+        evals = {"holdout_ppl": cand["manifest"].get("holdout_ppl", {}), **_advisory_evals(cfg, dimension)}
         try:
             # C1: any probe failure (gateway error, timeout, malformed or empty completion) must
             # record `held`, never crash out of `release` (spec §7).
@@ -879,7 +961,7 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
         # gateway time for an answer that was never in doubt. The key check and the run hashes
         # are model facts too, and a variant id is on no key and in no run. The colony A/B,
         # which is where a prompt can actually be judged, is the whole test here.
-        evals = {"colony_ab": colony_ab(cfg.verdicts_dir)}
+        evals = _advisory_evals(cfg, dimension)
         spend = 0.0
         h = {"adapter_sha256": "", "gguf_sha256": "", "set_manifest_sha256": ""}
         decision, reason = "released", f"{dimension} candidate {cand['tag']}: no model probes to run"
@@ -1045,6 +1127,7 @@ def ab_forget(cfg: WeeklyConfig, tag: str, *, dimension: str = UNSALTED_DIMENSIO
     Dimensioned because `lost_tags` is: it reads the forget row through the same filter as the
     loss it undoes, so a forget written in the wrong dimension clears nothing and a prompt
     variant that lost once could never be retested at all -- a one-way memory."""
+    _dimension_env(dimension)                 # M4: the same refusal every other verb makes
     versions = Versions(cfg.releases_dir / "versions.jsonl")
     row = release_row(week=_iso_week(), decision="unchanged", dimension=dimension, version=tag,
                       previous=None, base="", run="",
@@ -1054,10 +1137,23 @@ def ab_forget(cfg: WeeklyConfig, tag: str, *, dimension: str = UNSALTED_DIMENSIO
 
 
 def rollback(cfg: WeeklyConfig, remote, *, to: str | None = None, local_run, dry_run: bool = False) -> dict:
+    """Move the alias back to an earlier MODEL release. Model-only, and scoped to say so.
+
+    C1: every ledger read here is filtered to the model dimension, because `rollback` copies a
+    tag onto `cfg.current_alias` on debain2 and writes MIND_MODEL_ALIAS. Read unfiltered, the
+    first `released` row a prompt A/B ever writes becomes "the last release": the default target
+    is then that row's `previous` -- `None` at first, so the emergency lever dies with "nothing
+    to roll back to", and a prompt VARIANT ID once two prompt releases have landed, at which
+    point this would run `ollama cp <variant-id> kannaka-brain-current` and point the live relay
+    at a model that does not exist. Nothing rolls back a prompt today: the prompt flip is one
+    grid.env line, so the operator route is `ab --forget` plus an edit, and inventing a prompt
+    rollback verb belongs with the rest of the CLI work.
+    """
     versions = Versions(cfg.releases_dir / "versions.jsonl")
-    last = versions.last_released()
+    last = _last_released(versions, dimension=UNSALTED_DIMENSION)
     if last is None:
         raise SystemExit("nothing has been released; nothing to roll back")
+    model_rows = [r for r in versions.rows() if dimension_of(r) == UNSALTED_DIMENSION]
     if to is None:
         # I2: `last["previous"]` is the version this release/rollback actually superseded;
         # `previous_released(before=...)` walks release-order and would return a version that
@@ -1066,10 +1162,10 @@ def rollback(cfg: WeeklyConfig, remote, *, to: str | None = None, local_run, dry
         prev_version = last.get("previous")
         if prev_version is None:
             raise SystemExit("nothing to roll back to")
-        matches = [r for r in versions.rows() if r["decision"] in ("released", "rolled_back") and r["version"] == prev_version]
+        matches = [r for r in model_rows if r["decision"] in ("released", "rolled_back") and r["version"] == prev_version]
         target = matches[-1] if matches else None
     else:
-        target = next((r for r in versions.rows() if r["decision"] == "released" and r["version"] == to), None)
+        target = next((r for r in model_rows if r["decision"] == "released" and r["version"] == to), None)
     if target is None:
         raise SystemExit(f"{to or 'the previous release'} was never released; refusing")
     # I1: only a running A/B needs ending -- otherwise this doubles the relay restart
@@ -1154,7 +1250,12 @@ def main(argv: list[str] | None = None) -> int:
     remote = Remote(cfg.debain2_host, dry_run=a.dry_run, log=lambda s: log.info("%s", s))
     if a.verb == "status":
         v = Versions(cfg.releases_dir / "versions.jsonl")
-        print(json.dumps({"released": (v.last_released() or {}).get("version"), "rows": len(v.rows()), "verify": v.verify(),
+        # C1: `released` here sits beside `candidate`, which is find_candidate's MODEL tag, so it
+        # has to be a model release too. Read unfiltered it would answer a question about the
+        # model with a prompt variant id. Every verb in this CLI is model-scoped until the
+        # dimension is threaded through it; each one now says so rather than assuming it.
+        print(json.dumps({"released": (_last_released(v, dimension=UNSALTED_DIMENSION) or {}).get("version"),
+                          "rows": len(v.rows()), "verify": v.verify(),
                           "candidate": find_candidate(remote, cfg), "ab": ab_state(v)}, indent=1, default=str))
         return 0
     local_run = (lambda cmd: (log.info("[dry-run] %s", " ".join(cmd)) or 0)) if a.dry_run else _local_run
@@ -1174,7 +1275,10 @@ def main(argv: list[str] | None = None) -> int:
             candidate = state["candidate"] if state is not None else env_candidate
             block = _ab_snapshot(cfg, state, candidate)
             outcome = end_ab(cfg, local_run=local_run, dry_run=a.dry_run)
-            last = versions.last_released()
+            # C1: this row is written with the default dimension, so its `previous` must name a
+            # model release. Unfiltered, an abort after any prompt release stamps a prompt
+            # variant id onto a model row -- a falsehood in a file that can never be corrected.
+            last = _last_released(versions, dimension=UNSALTED_DIMENSION)
             if outcome == "ok":
                 decision, reason = "held", "colony A/B aborted by operator"
             else:

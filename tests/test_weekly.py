@@ -1649,7 +1649,13 @@ async def test_an_unknown_dimension_is_refused_at_every_entry_point(tmp_path):
         # Mutation: default an unrecognised dimension to the model row of _DIMENSION_ENV -> a
         # typo runs the whole experiment on the model alias while every ledger row names it
         # something else, and nothing anywhere reports it.
-        with pytest.raises(ValueError, match="unknown dimension|dimension must be one of"):
+        #
+        # M4: the match is `unknown dimension` exactly -- _dimension_env's wording, not
+        # release_row's "dimension must be one of". ab_forget used to reach only the latter, so a
+        # dimension added to DIMENSIONS with no _DIMENSION_ENV row would have been accepted by
+        # that one verb and refused by every other. Mutation: drop the _dimension_env call from
+        # ab_forget -> the last entry raises the ledger's message instead and this goes RED.
+        with pytest.raises(ValueError, match="unknown dimension"):
             call()
     with pytest.raises(ValueError, match="unknown dimension"):
         await release(cfg, FakeRemote({}), ask_factory=lambda m: never, local_run=boom, dimension="modle")
@@ -1678,3 +1684,229 @@ async def test_release_refuses_a_candidate_it_would_otherwise_have_ignored(tmp_p
     with pytest.raises(ValueError, match="needs an explicit candidate"):
         await release(cfg, FakeRemote({}), ask_factory=lambda m: never, local_run=lambda c: 0,
                       week="W1", dimension="prompt")
+
+
+# --- Task 4, fix round 1: the CLI boundary, the self-A/B, and the half-repair ------------------
+
+def _mixed_ledger(tmp_path, name, *, prompt_releases):
+    """Two model releases, then `prompt_releases` prompt releases on top. Returns the cfg.
+
+    The shape that breaks the undimensioned read: ONE prompt release makes the last release a row
+    whose `previous` is None (so rollback finds nothing to roll back to); TWO give it a `previous`
+    that is another variant id (so rollback aims the model alias at a prompt variant).
+    """
+    from grid.versions import Versions, release_row
+    d = tmp_path / name
+    d.mkdir()
+    cfg = _cfg(d)
+    vs = Versions(cfg.releases_dir / "versions.jsonl")
+    kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
+              grid_examples={}, verdict_window={}, evals={}, spend_usd=0, rogue_ledger_ts=0, reason="")
+    vs.append(release_row(week="W1", decision="released", version="kannaka-brain-v3", previous=None, **kw))
+    vs.append(release_row(week="W2", decision="released", version="kannaka-brain-v4", previous="kannaka-brain-v3", **kw))
+    prev = None
+    for i, variant in enumerate(("v2-terse", "v3-curt")[:prompt_releases]):
+        vs.append(release_row(week=f"W{3+i}", decision="released", dimension="prompt",
+                              version=variant, previous=prev, **kw))
+        prev = variant
+    return cfg
+
+
+def test_a_prompt_release_does_not_break_or_misaim_the_model_rollback(tmp_path):
+    from grid.versions import Versions
+    from grid.weekly import _last_released
+    # C1. Mutation: restore `versions.last_released()` in rollback (and drop the model filter on
+    # its row scans). With ONE prompt release the last release is v2-terse, its `previous` is
+    # None, and rollback raises SystemExit("nothing to roll back to") -- the emergency lever dies
+    # the moment the ledger becomes interesting. With TWO it resolves to v2-terse and runs
+    # `ollama cp v2-terse kannaka-brain-current`, pointing the live relay at a model that does
+    # not exist, and writes MIND_MODEL_ALIAS=v2-terse.
+    for name, n in (("one", 1), ("two", 2)):
+        cfg = _mixed_ledger(tmp_path, name, prompt_releases=n)
+        r = FakeRemote({})
+        restarts = []
+        row = rollback(cfg, r, local_run=lambda c: restarts.append(c) or 0)
+        assert row["decision"] == "rolled_back" and row["dimension"] == "model"
+        assert row["version"] == "kannaka-brain-v3" and row["previous"] == "kannaka-brain-v4"
+        assert r.commands == ["ollama cp kannaka-brain-v3 kannaka-brain-current"]
+        assert "MIND_MODEL_ALIAS=kannaka-brain-v3" in (cfg.grid_env).read_text()
+        # ...and vice versa: however many times the model dimension rolls back, the prompt
+        # dimension's own last release is untouched by it.
+        vs = Versions(cfg.releases_dir / "versions.jsonl")
+        assert _last_released(vs, dimension="model")["version"] == "kannaka-brain-v3"
+        assert _last_released(vs, dimension="prompt")["version"] == ("v2-terse" if n == 1 else "v3-curt")
+
+
+def test_rollback_to_an_explicit_target_will_not_accept_a_prompt_variant(tmp_path):
+    # `--to` scans the ledger for a `released` row of that version. Unfiltered it would happily
+    # find a PROMPT release and copy a variant id onto the model alias. Mutation: drop the
+    # `dimension_of(r) == UNSALTED_DIMENSION` filter on `model_rows` -> no SystemExit, and
+    # `ollama cp v2-terse kannaka-brain-current` runs.
+    cfg = _mixed_ledger(tmp_path, "explicit", prompt_releases=2)
+    r = FakeRemote({})
+    with pytest.raises(SystemExit, match="was never released"):
+        rollback(cfg, r, to="v2-terse", local_run=lambda c: pytest.fail("the relay was restarted"))
+    assert r.commands == []
+    assert "MIND_MODEL_ALIAS=kannaka-brain-v3" in cfg.grid_env.read_text()   # never moved
+
+
+def test_the_cli_reports_and_writes_the_model_dimension_after_a_prompt_release(tmp_path, monkeypatch, capsys):
+    import grid.weekly as weekly_mod
+    from grid.versions import Versions, release_row
+    from grid.weekly import main
+    _ab_cli_env(tmp_path, monkeypatch,
+                "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_CANDIDATE=kannaka-brain-v4\nMIND_AB_SPLIT=0.2\n")
+    vs = Versions(tmp_path / "releases" / "versions.jsonl")
+    kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
+              grid_examples={}, verdict_window={}, evals={}, spend_usd=0, rogue_ledger_ts=0, reason="")
+    vs.append(release_row(week="W1", decision="released", version="kannaka-brain-v3", previous=None, **kw))
+    vs.append(release_row(week="W2", decision="released", dimension="prompt", version="v2-terse", previous=None, **kw))
+    _seed_started_ab(tmp_path, 1_000_000_000)          # a running MODEL A/B, to abort below
+    monkeypatch.setattr(weekly_mod, "find_candidate", lambda remote, cfg: None)   # no ssh in a test
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)
+    # `released` sits beside find_candidate's model tag in this payload, so it has to be a model
+    # release. Mutation: restore `v.last_released()` -> "v2-terse", a prompt variant reported as
+    # the released model, to the one command an operator runs to ask what is live.
+    assert main(["status"]) == 0
+    assert json.loads(capsys.readouterr().out)["released"] == "kannaka-brain-v3"
+    assert main(["ab", "--abort"]) == 0
+    row = json.loads(capsys.readouterr().out)
+    # Mutation: restore `versions.last_released()` in the abort branch -> `previous` is
+    # "v2-terse", a prompt variant id stamped onto a dimension:"model" row in an append-only,
+    # hash-chained file that can never be corrected.
+    assert row["dimension"] == "model" and row["previous"] == "kannaka-brain-v3"
+
+
+async def test_release_refuses_a_candidate_that_is_already_the_live_incumbent(tmp_path):
+    cfg = _cfg(tmp_path)
+    cfg.grid_env.write_text("MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_PROMPT_VARIANT=v1-sandbox\n")
+    before = cfg.grid_env.read_text()
+    async def never(p): raise AssertionError("the probes must not run for a no-op A/B")
+    boom = lambda c: pytest.fail("the relay was restarted to start an A/B against itself")
+    # I1, and NOT the same case as `== released`: a dimension that has never had a release
+    # through the gate still has a live incumbent (the registry default; a hand-set alias), so
+    # `released` is None while the relay is serving this very name. odin refuses two equal arms
+    # AT BOOT, so this would take the relay down; and at MAX_WEEKS `short_arms` would return
+    # [tag, tag], which lost_tags reads as fully attributed -- blacklisting the registry default.
+    # Mutation: drop the `_live_arm` comparison -> `ab_started`, MIND_PROMPT_CANDIDATE=v1-sandbox
+    # written, and `boom` fires.
+    row = await release(cfg, FakeRemote({}), ask_factory=lambda m: never, local_run=boom,
+                        week="W1", dimension="prompt", candidate="v1-sandbox")
+    assert row["decision"] == "unchanged" and row["reason"] == "v1-sandbox is already the live prompt incumbent"
+    assert cfg.grid_env.read_text() == before        # refused BEFORE anything is written
+    # M5: the model-keyed advisory summary does not belong on a prompt row. Mutation: restore
+    # `evals={"colony_ab": colony_ab(...)}` -> a by_alias block on a row about a variant.
+    assert row["evals"] == {}
+    # The model dimension has the same hole whenever MIND_MODEL_ALIAS was set outside the gate
+    # (set-mind-model.sh --relay-only), which is exactly when `released` disagrees with it.
+    ledger = json.dumps({"ts": 1.7e9, "event": "promotion", "model": "kannaka-brain-v3",
+                         "run": "gpu-a100-sxm-20260913-0305"}) + "\n"
+    r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v3\n", "/srv/rogue/ledger.jsonl": ledger,
+                    "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
+    row = await release(cfg, r, ask_factory=lambda m: never, local_run=boom, week="W2")
+    assert row["decision"] == "unchanged" and row["reason"] == "kannaka-brain-v3 is already the live model incumbent"
+    assert row["evals"]["colony_ab"]["advisory"] is True      # ...and a model row still carries it
+    assert cfg.grid_env.read_text() == before
+
+
+def test_start_ab_refuses_two_arms_with_the_same_value(tmp_path):
+    from grid.weekly import start_ab
+    cfg = _cfg(tmp_path)
+    before = cfg.grid_env.read_text()
+    # The guard `release` turns into an `unchanged` week, kept here too so no other caller can
+    # slip past it -- and worded after odin's own refusal in `Relay.__init__`, which is what
+    # makes this fatal rather than merely pointless. Mutation: drop it -> grid.env is written
+    # and the relay is restarted onto a configuration it will refuse to boot.
+    for dim in ("model", "prompt"):
+        with pytest.raises(ValueError, match="candidate and incumbent are both"):
+            start_ab(cfg, candidate="same-name", incumbent="same-name", dimension=dim,
+                     local_run=lambda c: pytest.fail("the relay was restarted"))
+    assert cfg.grid_env.read_text() == before
+
+
+def test_a_failed_restart_reverts_and_then_restarts_on_the_restored_values(tmp_path):
+    from grid.weekly import start_ab
+    cfg = _cfg(tmp_path)
+    cfg.grid_env.write_text("MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_PROMPT_VARIANT=v1-sandbox\n")
+    calls = []
+    # I2. Reverting alone is half a repair: systemd was already told to restart, so the relay
+    # that was running is gone -- and if the value it was restarted onto is one odin refuses at
+    # boot, NOTHING came up. A correct grid.env does not bring the colony's mind back.
+    # Mutation: drop the `_restart_after_revert` call -> 2 calls, not 3, and the unit systemd
+    # already stopped stays stopped underneath a file that reads perfectly.
+    fail_twice = lambda c: calls.append(c) or (1 if len(calls) <= 2 else 0)
+    block, outcome = start_ab(cfg, candidate="v2-terse", incumbent="v1-sandbox", dimension="prompt",
+                              local_run=fail_twice)
+    assert outcome == "flip_incomplete"          # the repair never changes what is REPORTED
+    assert calls == [["sudo", "-n", "systemctl", "restart", "grid-odin.service"]] * 3
+    env = cfg.grid_env.read_text()
+    assert "MIND_PROMPT_CANDIDATE=v2-terse" not in env and "MIND_PROMPT_AB_SPLIT" not in env
+    # The model start path has the same revert and gets the same repair -- this is not a
+    # prompt-only fix, and MIND_LLM_CANDIDATE left splitting is the N2 hole it closes.
+    calls.clear()
+    block, outcome = start_ab(cfg, candidate="kannaka-brain-v4", incumbent="kannaka-brain-v3",
+                              local_run=fail_twice)
+    assert outcome == "flip_incomplete" and len(calls) == 3
+    # ...and so does the local flip's revert.
+    cfg.grid_env.write_text("MIND_PROMPT_VARIANT=v1-sandbox\nMIND_PROMPT_CANDIDATE=v2-terse\n")
+    calls.clear()
+    assert flip(cfg, FakeRemote({}), "v2-terse", dimension="prompt", local_run=fail_twice) == "flip_incomplete"
+    assert len(calls) == 3
+    env = cfg.grid_env.read_text()
+    assert "MIND_PROMPT_VARIANT=v1-sandbox" in env and "MIND_PROMPT_CANDIDATE=v2-terse" in env
+    # A restart that cannot be brought back at all is reported, not swallowed: same outcome,
+    # and the operator is summoned by exit 3 either way.
+    calls.clear()
+    assert flip(cfg, FakeRemote({}), "v2-terse", dimension="prompt",
+                local_run=lambda c: calls.append(c) or 1) == "flip_incomplete"
+    assert len(calls) == 4                        # 2 that failed, 2 more that also failed
+
+
+def test_a_row_with_no_model_alias_never_forms_a_model_arm_either(tmp_path):
+    from grid.verdicts import Ledger
+    from grid.weekly import ab_arms
+    # M1: the model side had the same phantom-arm hole, guarded only at `_env_ab_view`'s
+    # `arms.pop("", None)` -- at one view rather than at the counter. An arm with no name is not
+    # an arm in either dimension. Mutation: restore
+    # `needs_attribution = dimension != UNSALTED_DIMENSION` -> the "" arm reads 3 settled, 3
+    # answered and births_per_proposal 9.0, and any reader that does not know to pop it prints
+    # those as somebody's numbers.
+    v = tmp_path / "v"; (v / "prompts").mkdir(parents=True)
+    led = Ledger(v / "verdicts.jsonl"); rows = []
+    for i in range(3):
+        rid = f"u{i}"
+        row = {"ts": 1_000_500 + i, "request_id": rid, "outcome": "proposed",
+               "parent_genome": ["a"], "prompt_path": f"prompts/{rid}.txt", "proposal": ["a"]}
+        assert "model_alias" not in row
+        rows.append(row)
+        led.append({"request_id": rid, "tier": "reproduced", "births": 9, "fitness": 9})
+    (v / "proposals.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    arms = ab_arms(v, since_ts=1_000_000, incumbent="", candidate="kannaka-brain-v4")
+    assert arms[""] == {"settled": 0, "reproduced": 0, "rate": 0.0, "births_per_proposal": 0.0,
+                        "answered": 0, "valid": 0, "unanswered": 0, "validity": 0.0}
+    assert set(arms) == {"", "kannaka-brain-v4"}          # and no third, phantom arm
+
+
+async def test_a_lost_tag_is_told_a_forget_command_that_will_actually_work(tmp_path):
+    cfg = _cfg(tmp_path)
+    cfg.grid_env.write_text("MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_PROMPT_VARIANT=v1-sandbox\n")
+    _seed_ab_row(tmp_path, dimension="prompt", version="v2-terse", decision="held",
+                 reason="colony A/B lost: 0.10 vs 0.20", short_arms=["v2-terse"])
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v4", decision="held",
+                 reason="colony A/B lost: 0.10 vs 0.20", short_arms=["kannaka-brain-v4"])
+    async def never(p): raise AssertionError("the probes must not run for a blacklisted tag")
+    prompt_row = await release(cfg, FakeRemote({}), ask_factory=lambda m: never, local_run=lambda c: 0,
+                               week="W5", dimension="prompt", candidate="v2-terse")
+    assert prompt_row["decision"] == "held"
+    # M2: `ab --forget` writes a MODEL forget, and lost_tags reads it through the same dimension
+    # filter as the loss, so the bare command clears nothing here. Mutation: emit the bare model
+    # string on both dimensions -> the operator runs it, nothing changes, and the same candidate
+    # is refused again next Sunday with the same advice.
+    assert "run `grid.weekly ab --forget v2-terse --dimension prompt` to retest" in prompt_row["reason"]
+    assert prompt_row["evals"] == {}                     # M5 again: no model-keyed advisory
+    r = FakeRemote({"/srv/rogue/current-model": "kannaka-brain-v4\n", "/srv/rogue/ledger.jsonl": ROGUE_LEDGER,
+                    "/home/nick/.kannaka-corpus/runs/gpu-a100-sxm-20260913-0305/train.manifest.json": MANIFEST})
+    model_row = await release(cfg, r, ask_factory=lambda m: never, local_run=lambda c: 0, week="W6")
+    # ...and the model wording is unchanged, byte for byte: no flag that does not exist yet.
+    assert model_row["reason"] == ("kannaka-brain-v4 already lost/stuck the colony A/B; "
+                                   "run `grid.weekly ab --forget kannaka-brain-v4` to retest")

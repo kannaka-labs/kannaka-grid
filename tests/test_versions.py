@@ -104,3 +104,25 @@ def test_a_row_written_before_the_key_existed_reads_as_a_model_row(tmp_path):
                          grid_examples={}, verdict_window={}, evals={}, spend_usd=0, rogue_ledger_ts=0, reason=""))
     assert v.verify() is True
     assert [dimension_of(r) for r in v.rows()] == ["model", "prompt"]
+
+
+def test_two_dimensions_do_not_collide_on_a_synthesised_request_id(tmp_path):
+    # `Versions.append` invents a request_id because verdict rows have one and version rows do
+    # not. Two dimensions can now decide the same thing about the same name in the same week --
+    # a model and a prompt `ab --forget` of one name is the concrete case -- so the dimension is
+    # part of it. Mutation: drop it from the format string -> both rows are
+    # "W1:unchanged:shared-name" and any Task 5/6 reader keying on it sees one decision, not two.
+    v = Versions(tmp_path / "versions.jsonl")
+    kw = dict(base="", run="", adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
+              grid_examples={}, verdict_window={}, evals={}, spend_usd=0, rogue_ledger_ts=0, reason="")
+    v.append(release_row(week="W1", decision="unchanged", version="shared-name", previous=None, **kw))
+    v.append(release_row(week="W1", decision="unchanged", dimension="prompt", version="shared-name",
+                         previous=None, **kw))
+    assert [r["request_id"] for r in v.rows()] == ["W1:model:unchanged:shared-name",
+                                                   "W1:prompt:unchanged:shared-name"]
+    # `dimension_of`, not `row["dimension"]`, so a row built without the key still gets an id.
+    # Mutation: subscript it -> KeyError on any hand-built row.
+    v.ledger.append({"week": "W2", "decision": "held", "version": "legacy", "request_id": "seeded"})
+    v.append(dict(release_row(week="W3", decision="held", version="v9", previous=None, **kw), dimension=None))
+    assert v.rows()[-1]["request_id"] == "W3:model:held:v9"
+    assert v.verify() is True
