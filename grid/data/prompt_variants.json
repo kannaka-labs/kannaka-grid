@@ -1,0 +1,21 @@
+{
+  "default": "v1-sandbox",
+  "variants": {
+    "v1-sandbox": {
+      "template_file": "prompts/v1-sandbox.md",
+      "sha256": "121474be5d32462d077119265b0e1662ac2d02b568da14410e97cf6b90f42741",
+      "temperature": 0.7,
+      "max_tokens": 400,
+      "recall": true,
+      "note": "The prompt as shipped 2026-09-05. Opens with the sandbox-context paragraph: without it the safety layer reads thegrid's directive plus opcodes named steal and corrupt as a request for self-replicating malware and returns an empty completion. A variant that drops it will fail the validity floor fast."
+    },
+    "v2-minimal-edit": {
+      "template_file": "prompts/v2-minimal-edit.md",
+      "sha256": "32068526080cc40d52428ed0ad92d9ee534bb7e4f0bed9a059afe69c3c067e00",
+      "temperature": 0.7,
+      "max_tokens": 400,
+      "recall": true,
+      "note": "Added 2026-09-07 as the first real arm to test v1-sandbox against. It keeps v1's sandbox-context paragraph verbatim, its recall, its sampling and its closing 'JSON array of instruction names and nothing else' line, so the ONLY difference between the two arms is the wording of the ask itself. What it changes: v1 says 'Propose ONE variant of the parent genome', which leaves the model free to re-author the whole list; v2 says the parent already replicates, forbids re-authoring, and bounds the edit to at most three substituted, inserted or deleted positions -- the classic point-mutation operator. Expected to WIN on the reproduced rate, because a genome one small step from a parent whose lineage already proved it can replicate is likelier to replicate itself, and because a bounded edit is easier to keep inside the ISA and under the genome cap. Expected to LOSE two ways, and either would show up first as answer quality: a near-copy is the shape most likely to come back byte-identical to the parent, which validate() rejects as 'proposal identical to parent' and the gate counts as an answered-but-invalid row against the validity floor; and if the colony is sitting in a local optimum that needs a large jump, three positions cannot reach it and the rate falls instead."
+    }
+  }
+}

@@ -12,3 +12,19 @@ EnvironmentFile=/srv/grid/grid.env
 EnvironmentFile=/home/nick/.kannaka-nats.env
 ExecStart=/srv/grid/venv/bin/python -m grid.verdicts
 ExecStartPost=/srv/grid/venv/bin/python -m grid.weekly ab --check
+# Explicit, and sized above the restart budget, because `ab --check` is a SAFETY path.
+# It reconciles both dimensions, and each one can pay for a `_restart_relay` (2 attempts)
+# and then a `_restart_after_revert` (2 more). Each attempt is now bounded by
+# grid-odin.service's own TimeoutStartSec=120 rather than returning in milliseconds, so
+# the worst case is 2 dimensions x 2 restarts x 2 attempts x 120 s = 960 s. A SIGTERM
+# partway through `end_ab` is the one thing worse than a slow nightly: grid.env would
+# have the candidate cleared with no ledger row written, which is exactly the env/ledger
+# divergence this whole path exists to prevent. 1800 leaves 840 s over that worst case
+# for the settle itself.
+#
+# Type=oneshot disables the start timeout by DEFAULT (systemd.service(5): "except when
+# Type=oneshot is used, in which case the timeout is disabled by default"), so this line
+# adds a bound rather than raising one. It is here so the bound is a decision in this
+# file instead of an inherited default that a DefaultTimeoutStartSec= in system.conf, or
+# a future change of Type=, would silently replace with 90 s.
+TimeoutStartSec=1800

@@ -39,7 +39,7 @@
 - `grid/proposal.py` — `render_prompt` renders a `Variant` instead of a hardcoded f-string.
 - `grid/odin.py` — per-dimension arm assignment; the chosen variant drives the render, the sampling and whether recall is called; the log records the variant.
 - `grid/mind.py` — `ask` accepts sampling parameters instead of hardcoding them.
-- `grid/verdicts.py` — `proposal_entry` gains `prompt_variant` and `prompt_sha256`.
+- `grid/proposal_log.py` — `proposal_entry` gains `prompt_variant` and `prompt_variant_sha256`. (It lives here, not in `grid/verdicts.py`. The template hash needs its own name: `prompt_sha256` already exists and hashes the RENDERED prompt.)
 - `grid/weekly.py` — validity counts and floor; dimensions; exclusivity; factorial; CLI.
 - `grid/versions.py` — the ledger row gains `dimension`.
 - `deploy/README.md`, `deploy/grid.env.example`, `deploy/skywave/verdict-receipts.sh` — operator documentation and the new environment keys.
@@ -55,6 +55,7 @@
 - Create: `grid/data/prompt_variants.json`
 - Create: `tests/test_variants.py`
 - Modify: `grid/proposal.py` (`SANDBOX_CONTEXT`, `render_prompt`)
+- Modify: `pyproject.toml` (`[tool.setuptools.package-data]`)
 - Modify: `tests/test_proposal.py`
 
 **Interfaces:**
@@ -86,7 +87,7 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'grid.variants'`.
 
 - [ ] **Step 3: Extract the template**
 
-Move the whole of today's prompt, including the `SANDBOX_CONTEXT` paragraph, into `grid/data/prompts/v1-sandbox.md` with these placeholders and no others: `{directive}`, `{isa_lines}`, `{ecology}`, `{parent}`, `{genome_count}`, `{genome_json}`, `{memory}`, `{genome_cap}`. Literal braces, if you ever add any, must be doubled. Keep `SANDBOX_CONTEXT` in `grid/proposal.py` as well: `grid/verdict_corpus.py` and the tests import it, and removing it is out of scope.
+Move the whole of today's prompt, including the `SANDBOX_CONTEXT` paragraph, into `grid/data/prompts/v1-sandbox.md` with these placeholders and no others: `{directive}`, `{isa_lines}`, `{ecology}`, `{parent}`, `{genome_count}`, `{genome_json}`, `{memory}`, `{genome_cap}`. Literal braces, if you ever add any, must be doubled. Keep `SANDBOX_CONTEXT` in `grid/proposal.py` as well: `tests/test_proposal.py` imports it and asserts the rendered prompt starts with it, which is a free guard on the byte-identical render. Removing it is out of scope.
 
 - [ ] **Step 4: Write the registry file**
 
@@ -136,15 +137,22 @@ Expected: PASS.
 
 One test per failure: a hash that does not match the file; a missing template file; a template using `{model}`, which is not in `PLACEHOLDERS`; a `default` naming an absent variant. Each asserts `VariantError` and that the message names the offending variant. Use `tmp_path` registries, never the shipped one.
 
+- [ ] **Step 9: Ship the templates in the package**
+
+`[tool.setuptools.package-data]` reads `grid = ["data/*.json", "data/*.jsonl"]`, which does not match
+`data/prompts/*.md`. A non-editable install would then ship without the templates and the fail-closed
+loader would raise at startup, which is the correct behaviour for the wrong reason. Add
+`"data/prompts/*.md"` to that list.
+
 - [ ] **Step 9: Run the full suite**
 
 Run: `.venv/Scripts/python.exe -m pytest tests -q -W error`
 Expected: 275 passed plus your new tests, 4 skipped.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
-git add grid/variants.py grid/data tests/test_variants.py grid/proposal.py tests/test_proposal.py
+git add grid/variants.py grid/data tests/test_variants.py grid/proposal.py tests/test_proposal.py pyproject.toml
 git commit -F <message-file>
 ```
 
@@ -155,14 +163,14 @@ git commit -F <message-file>
 **Files:**
 - Modify: `grid/odin.py` (`RelayConfig`, `Relay.__init__`, `Relay._handle`, `Relay._log`, `arm_for`)
 - Modify: `grid/mind.py` (`Mind.ask`, `_ask_direct`)
-- Modify: `grid/verdicts.py` (`proposal_entry`)
+- Modify: `grid/proposal_log.py` (`proposal_entry`)
 - Modify: `tests/test_odin.py`
 
 **Interfaces:**
 - Consumes from Task 1: `get_variant`, `Variant`.
 - Produces, for Tasks 3-6:
   - `assign(request_id: str, *, dimension: str, arms: list[str], weights: list[float]) -> str` in `grid/odin.py`, returning an arm label
-  - proposal log entries carrying `prompt_variant: str` and `prompt_sha256: str`
+  - proposal log entries carrying `prompt_variant: str` and `prompt_variant_sha256: str`
   - `RelayConfig` fields `prompt_variant: str` (from `MIND_PROMPT_VARIANT`, empty means the registry default) and `prompt_candidate: str` (from `MIND_PROMPT_CANDIDATE`, empty means no prompt A/B)
 
 - [ ] **Step 1: Write the failing test for dimension-salted independence**
@@ -233,7 +241,7 @@ Choose the variant before the recall call, because the variant decides whether r
 
 - [ ] **Step 7: Log the variant**
 
-`proposal_entry` gains `prompt_variant` and `prompt_sha256`, both defaulting to `""` so old log lines still parse. `Relay._log` passes the variant that produced the prompt, including on the deferred-bin rejection path, where the arm that could not answer is still the arm that was asked.
+`proposal_entry` gains `prompt_variant` and `prompt_variant_sha256`, both defaulting to `""` so old log lines still parse. `Relay._log` passes the variant that produced the prompt, including on the deferred-bin rejection path, where the arm that could not answer is still the arm that was asked.
 
 - [ ] **Step 8: Write the behavioural tests**
 
@@ -347,6 +355,8 @@ def test_a_prompt_ab_and_a_model_ab_keep_separate_state_and_memory(tmp_path):
 - [ ] **Step 3: Add `dimension` to the ledger row**
 
 `release_row` gains the key. Default it to `"model"` when absent so every row written before this change reads as a model row, which is what they all were. Add that default in the reader, not by rewriting the file.
+
+`tests/test_versions.py:26` asserts the exact key set of a release row. It will fail, and that is correct: add `dimension` to the expected set rather than loosening the assertion. An exact key set is a deliberate guard against a row quietly growing a field nobody reviewed.
 
 - [ ] **Step 4: Scope the state machine**
 

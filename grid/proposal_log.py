@@ -18,9 +18,35 @@ log = logging.getLogger("grid.proposal_log")
 REPLY_CAP = 2000        # a rejected reply is a training negative, not a transcript
 
 
+def variant_of(entry: dict) -> str:
+    """The prompt arm a log entry belongs to, "" when the row predates the registry.
+
+    Every reader must come through here. Rows written before the prompt registry have
+    no `prompt_variant` key at all (not an empty one), so `entry["prompt_variant"]`
+    raises KeyError on the existing corpus. `or ""` additionally normalises a null,
+    which json.loads yields for a JSON `null`.
+    """
+    return str(entry.get("prompt_variant") or "")
+
+
+def variant_sha256_of(entry: dict) -> str:
+    """The sha256 of that arm's TEMPLATE, "" when the row predates the registry.
+
+    Not to be confused with the entry's `prompt_sha256`, which hashes the rendered
+    prompt of one request and pairs with `prompt_path`.
+    """
+    return str(entry.get("prompt_variant_sha256") or "")
+
+
 def proposal_entry(*, req: Request, proposal: list[str] | None, outcome: str, reason: str | None,
                    epoch: int, tick: int, colony: str, mind: str, model_alias: str,
-                   prompt: str, ts_ms: int, reply: str | None = None) -> dict:
+                   prompt: str, ts_ms: int, reply: str | None = None,
+                   prompt_variant: str = "", prompt_variant_sha256: str = "") -> dict:
+    """The `prompt_variant*` defaults make this callable without them; they say NOTHING
+    about older log lines. A row written before the prompt registry existed does not
+    carry these keys as "" -- it does not carry them AT ALL, across the whole existing
+    Skywave corpus. Read them with variant_of()/variant_sha256_of() below, never by
+    indexing, or the first real corpus a reader touches raises KeyError."""
     isa = req.isa
     return {
         "ts": ts_ms, "colony": colony, "epoch": epoch, "tick": tick,
@@ -34,6 +60,13 @@ def proposal_entry(*, req: Request, proposal: list[str] | None, outcome: str, re
         "reply": reply[:REPLY_CAP] if reply is not None else None,
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
         "prompt_path": f"prompts/{req.request_id}.txt",
+        # Which prompt variant was asked. NOTE the two hashes are different things and
+        # are named apart on purpose: `prompt_sha256` above hashes the RENDERED prompt of
+        # this one request and pairs with `prompt_path`, while this one hashes the
+        # variant's TEMPLATE, so every row from the same arm shares it. Overloading the
+        # first name would have destroyed the input-side integrity check the corpus uses.
+        "prompt_variant": prompt_variant,
+        "prompt_variant_sha256": prompt_variant_sha256,
     }
 
 

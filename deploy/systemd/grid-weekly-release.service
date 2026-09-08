@@ -10,3 +10,18 @@ Group=nick
 WorkingDirectory=/srv/grid/kannaka-grid
 EnvironmentFile=/srv/grid/grid.env
 ExecStart=/srv/grid/venv/bin/python -m grid.weekly release
+# Explicit, and deliberately unbounded. Same reasoning as grid-verdicts.service -- a
+# SIGTERM partway through this unit's teardown leaves grid.env and the ledger disagreeing
+# -- but the arithmetic comes out the other way. The restart budget here is one dimension
+# (2 restarts x 2 attempts x grid-odin's 120 s = 480 s), and it is dwarfed by the probes
+# in front of it: identity is IDENTITY_PROBE_RUNS x 10 asks and validity another 10, each
+# bounded by PROBE_TIMEOUT_S (900 s by default), so the honest worst case is ~10 h. Any
+# finite value small enough to be a useful watchdog is small enough to kill a legitimate
+# release mid-teardown, which is the failure this line was asked for in order to prevent.
+# The real per-operation deadlines are PROBE_TIMEOUT_S, Remote.run's own 600 s and
+# grid-odin's TimeoutStartSec, so the job cannot hang on a network stall regardless.
+#
+# Type=oneshot disables the start timeout by default already; this states it, so the
+# behaviour is a decision in this file rather than an inherited default that a
+# DefaultTimeoutStartSec= in system.conf, or a future change of Type=, would replace.
+TimeoutStartSec=infinity

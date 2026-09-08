@@ -50,9 +50,15 @@ template, or a hash that does not match the file is a startup error, not a warni
 variant edited in place without a new id would silently invalidate a running A/B, so
 the hash is the guard against exactly that.
 
-The relay logs `prompt_variant` and `prompt_sha256` on every proposal entry, beside
-the `model_alias` it already records. The log already carries the prompt text, so the
-join costs nothing.
+The relay logs `prompt_variant` and `prompt_variant_sha256` on every proposal entry,
+beside the `model_alias` it already records. The log already carries the prompt text,
+so the join costs nothing.
+
+**Do not confuse the two hashes.** `prompt_sha256` already exists and hashes the
+*rendered* prompt of one request, pairing with `prompt_path`. `prompt_variant_sha256`
+hashes the *template* the variant was rendered from. Reusing the older name for the
+template hash would have silently changed what an existing field means, and an existing
+test asserts its length rather than its meaning, so nothing would have caught it.
 
 **Hazard to write into the registry note.** The shipped template opens with a sandbox
 context paragraph because without it the model's safety layer reads thegrid's own

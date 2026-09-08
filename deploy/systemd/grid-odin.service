@@ -9,10 +9,22 @@ StartLimitBurst=10
 Type=simple
 User=nick
 Group=nick
+# relay-ready.sh reads this start's journal, matched on _SYSTEMD_INVOCATION_ID.
+SupplementaryGroups=systemd-journal
 WorkingDirectory=/srv/grid/kannaka-grid
 EnvironmentFile=/srv/grid/grid.env
 EnvironmentFile=/home/nick/.kannaka-nats.env
 ExecStart=/srv/grid/venv/bin/python -m grid.odin
+# Type=simple calls the start job done as soon as the process is forked, so a
+# `systemctl restart` used to report success even when the relay died a second later on
+# a configuration it refuses -- and the weekly gate reads that exit code as "the relay
+# picked up the new values". ExecStartPost is what turns the job's result into the
+# truth: it waits for the relay to log that it is watching the queue, checks that the
+# model and prompt lines it logged are the ones this file just handed it, and exits
+# non-zero otherwise, which fails the start job and so the restart. Its deadline is
+# 60 s (RELAY_READY_TIMEOUT_S), hence TimeoutStartSec above it.
+ExecStartPost=/bin/bash /srv/grid/kannaka-grid/deploy/skywave/relay-ready.sh
+TimeoutStartSec=120
 Restart=always
 RestartSec=10
 

@@ -20,7 +20,7 @@ where = ["."]
 include = ["grid*"]
 
 [tool.setuptools.package-data]
-grid = ["data/*.json", "data/*.jsonl"]
+grid = ["data/*.json", "data/*.jsonl", "data/prompts/*.md", "data/prompts/**/*.md"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
