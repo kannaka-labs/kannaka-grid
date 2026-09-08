@@ -419,19 +419,42 @@ per cell: at `MIN_SAMPLE=100` a 2x2 run needs 50 settled per cell. `factorial` i
 the `ab_started` row either way, true or false, so a later reader can tell a week that
 deliberately crossed two dimensions from one that merely got confounded.
 
-**Judging a factorial week takes two commands, and the order does not matter.** `release` decides
-one dimension per call, and `grid-weekly-release.service` runs the bare `grid.weekly release`,
-i.e. the model leg only — so the other leg has to be run by hand on the same Sunday:
+**Judging a factorial week takes two commands, in the same session.** `release` decides one
+dimension per call, and `grid-weekly-release.service` runs the bare `grid.weekly release`, i.e.
+the model leg only — so the other leg has to be run by hand, on the same Sunday and soon after
+the timer fired:
 ```bash
 /srv/grid/venv/bin/python -m grid.weekly release --dimension prompt
 ```
-Whichever runs first ends its own leg, and the second one is still judged on its marginal: the
-partner lookup asks the ledger *was the other dimension splitting during this leg's window*, not
-*is it splitting right now*. The window both legs are tallied over is `[the later of the two
-starts, the moment the first leg closed)` — the interval in which both splits actually ran — and
-it comes out the same whichever command was typed first. Rows answered before the second split
-began, or after the first leg closed, are not part of the design and are excluded, as is any row
-that names only one of the two labels.
+**Between those two commands the order does not matter; the delay does.** Whichever runs first
+ends or freezes its own leg, and the second is still judged on its marginal: the partner lookup
+asks the ledger *which episode was splitting during this leg's window, and when was it last
+judged*, not *what is splitting right now*. The window both legs are tallied over is `[the later
+of the two starts, the moment the first leg was last judged)` — the interval in which both splits
+actually ran — and it comes out the same whichever command was typed first. Rows answered before
+the second split began, or after the first leg was judged, are not part of the design and are
+excluded, as is any row that names only one of the two labels. Note *judged*, not *closed*: an
+`ab_inconclusive` week freezes a leg's numbers without ending its split, and at `MIN_SAMPLE=100`
+that is the normal first result of a factorial run.
+
+What the window cannot fix is settlement. A verdict row carries no timestamp of its own, so
+proposals already inside the window go on settling while you are between the two commands, and
+the leg judged second counts more of them than the first could. Past **12 h**
+(`FACTORIAL_STALE_S`) that is enough to reverse a binding verdict, so the gate **refuses**:
+```
+grid.weekly: error: the model leg of this factorial run was judged 31.4 h ago, over the 12 h
+factorial window; verdicts have gone on settling since … Re-run both legs together, or pass
+--force-stale-partner …
+```
+It refuses **before writing any ledger row** and exits non-zero — nothing is recorded and nothing
+is flipped. That is deliberate: recording the week `ab_inconclusive` instead would, at
+`MAX_WEEKS=2`, write a `held` row whose reason the rejected-candidate memory matches on, so the
+guard would eventually blacklist a candidate for your scheduling rather than for its performance.
+Re-run both legs together, or, if the delay is unavoidable:
+```bash
+/srv/grid/venv/bin/python -m grid.weekly release --dimension prompt --force-stale-partner
+```
+which judges that leg **two-arm** and stamps the row with `factorial_judged: false` and the gap.
 
 **Run the two legs in one sitting, on the same Sunday.** The timer runs the model leg only, so
 the prompt leg is a hand-typed command and nothing makes you type it. The leg judged *first* is
@@ -461,8 +484,10 @@ is logged. A row never claims a marginal it did not compute.
 
 The keys a factorial week adds under `.evals.colony_ab`: `factorial` (on every `ab_started` row,
 true or false), `factorial_judged`, `factorial_with`, `factorial_since_ts`, `factorial_until_ts`
-(null on the leg judged first, which has no partner-close to bound it), `cells`, and
-`interaction`. Every A/B row in either mode also carries `other_dimensions` — an advisory record
+(null on the leg judged first, whose partner has not been judged yet and which therefore needs no
+bound), `cells`, and `interaction`. `factorial_judged` is on **every** A/B row — including the
+nightly `ab --check` stuck row and the `ab --abort` snapshot, both of which are two-arm over the
+leg's own window and say so. Every A/B row in either mode also carries `other_dimensions` — an advisory record
 of what else was splitting when the row was written, including a hand-started split with no
 ledger row of its own.
 
