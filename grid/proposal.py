@@ -100,14 +100,24 @@ def render_prompt(req: Request, recall: list[str], variant: Variant | None = Non
     `variant` selects which template from the prompt-variant registry
     (grid/data/prompt_variants.json) to render; None uses the registry's
     default, which today renders byte-identically to this function's prior,
-    hardcoded prompt.
+    hardcoded prompt. Callers on the request path pass a variant resolved once at
+    startup; None re-reads the registry, so it is for one-off rendering only.
+
+    A `{memory}` placeholder in a `recall: false` variant is legal and renders an
+    explicit "not consulted" line, never the empty-recall line.
     """
     if variant is None:
         variant = get_variant()
     isa_lines = "\n".join(f"- {i['name']} (cost {i.get('cost', '?')}): {i.get('effect', '')}"
                           for i in req.instruction_set)
     ecology = "\n".join(f"- {k}: {v}" for k, v in req.ecology.items())
-    memory = "\n".join(f"- {m}" for m in recall) or "- (nothing yet)"
+    if variant.recall:
+        memory = "\n".join(f"- {m}" for m in recall) or "- (nothing yet)"
+    else:
+        # A variant that never asks must not render "- (nothing yet)": that sentence
+        # claims recall RAN and came back empty, which is a different fact, and it is the
+        # one the model reads and the corpus records. Say what actually happened instead.
+        memory = "- (memory not consulted: this variant runs without recall)"
     parent = json.dumps(req.parent, sort_keys=True)
     return variant.template.format(
         directive=req.directive,

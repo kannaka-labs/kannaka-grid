@@ -2,7 +2,8 @@ import json
 from pathlib import Path
 
 from grid.proposal import Request
-from grid.proposal_log import REPLY_CAP, ProposalLog, proposal_entry
+from grid.proposal_log import (REPLY_CAP, ProposalLog, proposal_entry, variant_of,
+                                variant_sha256_of)
 
 ISA = [{"name": n, "cost": 0.1, "effect": n} for n in ("nop", "harvest", "copy", "fork")]
 
@@ -73,3 +74,37 @@ def test_read_all_stops_at_a_partial_trailing_line(tmp_path):
     with open(tmp_path / "proposals.jsonl", "a", encoding="utf-8") as f:
         f.write('{"request_id": "b", "truncated')          # crash mid-write
     assert [x["request_id"] for x in log.read_all()] == ["a"]
+
+
+def test_a_legacy_row_without_the_prompt_variant_keys_reads_as_empty():
+    # I1, verified against the live corpus: rows written before the prompt registry do not
+    # carry these keys as "" -- they do not carry them AT ALL, so entry["prompt_variant"]
+    # raises KeyError on real data. Mutation: make either accessor index instead of .get()
+    # -> KeyError here. This is the exact shape ProposalLog.read_all yields for such a line.
+    legacy = json.loads(json.dumps({
+        "ts": 1, "colony": "c", "epoch": 0, "tick": 0, "request_id": "old-1", "mind": "grid-c",
+        "model_alias": "agent-brain", "parent_genome": ["harvest"], "parent_genome_id": "abc",
+        "proposal": ["harvest", "fork"], "proposal_genome_id": "def", "outcome": "proposed",
+        "reason": None, "reply": None, "prompt_sha256": "0" * 64, "prompt_path": "prompts/old-1.txt"}))
+    assert "prompt_variant" not in legacy and "prompt_variant_sha256" not in legacy
+    assert variant_of(legacy) == "" and variant_sha256_of(legacy) == ""
+    # a null, which is what a hand-edited or partially-migrated row can hold, reads the same
+    assert variant_of({"prompt_variant": None}) == ""
+    assert variant_sha256_of({"prompt_variant_sha256": None}) == ""
+    # and a real row round-trips through the same readers
+    assert variant_of({"prompt_variant": "v1-sandbox"}) == "v1-sandbox"
+    assert variant_sha256_of({"prompt_variant_sha256": "a" * 64}) == "a" * 64
+
+
+def test_read_all_parses_a_legacy_line_written_before_the_registry(tmp_path):
+    # The end-to-end shape of the above: an old JSONL line still loads, and every reader
+    # of the new fields copes with what comes back.
+    vdir = tmp_path / "verdicts"
+    vdir.mkdir()
+    (vdir / "proposals.jsonl").write_text(
+        json.dumps({"ts": 1, "request_id": "old-1", "outcome": "proposed",
+                    "model_alias": "agent-brain", "prompt_path": "prompts/old-1.txt"}) + "\n",
+        encoding="utf-8")
+    [row] = ProposalLog(vdir).read_all()
+    assert "prompt_variant" not in row
+    assert variant_of(row) == "" and variant_sha256_of(row) == ""

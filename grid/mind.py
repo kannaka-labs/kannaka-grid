@@ -25,6 +25,10 @@ log = logging.getLogger("grid.mind")
 ASK_TIMEOUT_S = 180.0
 REMEMBER_MIN_INTERVAL_S = 300.0
 CALLER_ID = "kannaka-grid"
+# What the direct route has always sent, and what the serve daemon uses on the bus
+# route. A caller passing None for either means "whatever has always been sent".
+DEFAULT_TEMPERATURE = 0.7
+DEFAULT_MAX_TOKENS = 400
 
 
 class MindError(Exception):
@@ -105,10 +109,21 @@ class Mind:
         if self.llm is not None:
             return await self._ask_direct(text, timeout_s, temperature=temperature,
                                           max_tokens=max_tokens)
-        # kannaka's NATS ask contract has no field for sampling parameters -- the serve
-        # daemon owns them -- so a prompt variant's temperature and max_tokens apply on
-        # the direct route only. Inventing a payload key the daemon would ignore is worse
-        # than dropping them here: it would read as if they had been honoured.
+        # kannaka's NATS ask contract has no field for sampling parameters: the serve
+        # daemon owns them, and inventing a payload key it would ignore is worse than
+        # sending nothing, because it would read as if they had been honoured.
+        #
+        # So a caller that wants non-default sampling on this route gets an error, not a
+        # silent drop. Dropping them would let a prompt A/B whose two arms differ ONLY in
+        # temperature run two identical arms while every log row and ledger row claimed
+        # an A/B was running -- a confident wrong answer, which is worse than a failure.
+        if ((temperature is not None and temperature != DEFAULT_TEMPERATURE)
+                or (max_tokens is not None and max_tokens != DEFAULT_MAX_TOKENS)):
+            raise MindError(
+                f"{self.agent_id}: the NATS ask route cannot carry sampling parameters "
+                f"(asked for temperature={temperature}, max_tokens={max_tokens}); the serve "
+                f"daemon always uses {DEFAULT_TEMPERATURE}/{DEFAULT_MAX_TOKENS}. Set "
+                f"MIND_LLM_URL to use the direct route, or use a variant with default sampling.")
         payload = {"from": CALLER_ID, "text": text, "recall_query": recall_query,
                    "no_tools": True, "mode": "full_recall"}
         reply = await self.bus.request(f"KANNAKA.ask.{self.agent_id}", payload, timeout_s=timeout_s)
@@ -127,8 +142,8 @@ class Mind:
         if llm.api_key:
             headers["Authorization"] = f"Bearer {llm.api_key}"
         body = {"model": llm.model, "messages": [{"role": "user", "content": text}],
-                "temperature": 0.7 if temperature is None else temperature,
-                "max_tokens": 400 if max_tokens is None else max_tokens}
+                "temperature": DEFAULT_TEMPERATURE if temperature is None else temperature,
+                "max_tokens": DEFAULT_MAX_TOKENS if max_tokens is None else max_tokens}
         factory = self._http or (lambda: httpx.AsyncClient(timeout=httpx.Timeout(10, read=timeout_s)))
         try:
             async with factory() as client:

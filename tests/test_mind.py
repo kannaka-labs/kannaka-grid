@@ -160,3 +160,38 @@ async def test_recall_returns_contents_and_swallows_errors():
 
 def test_defaults_match_spec():
     assert REMEMBER_MIN_INTERVAL_S == 300.0 and ASK_TIMEOUT_S == 180.0
+
+
+async def test_a_bare_ask_still_sends_the_defaults_on_the_direct_route():
+    # I2: bridge.py and weekly_probe.py call ask() with no sampling kwargs, and the whole
+    # "no existing caller changes behaviour" constraint rests on the None fallback.
+    # Mutation: change _ask_direct's fallbacks to 0.9/999 -> this is the only test that fails.
+    from grid.mind import DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE
+    seen = {}
+
+    def handler(req):
+        seen.update(json.loads(req.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+    mind = Mind("m", FakeBus(), llm=DirectLlm("http://gw/v1", "kb"), http=_http(handler))
+    assert await mind.ask("q") == "ok"
+    assert seen["temperature"] == 0.7 and seen["max_tokens"] == 400
+    assert (seen["temperature"], seen["max_tokens"]) == (DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS)
+    # and an explicit None is the same as not passing it at all
+    seen.clear()
+    await mind.ask("q", temperature=None, max_tokens=None)
+    assert seen["temperature"] == 0.7 and seen["max_tokens"] == 400
+
+
+async def test_the_bus_route_refuses_sampling_it_cannot_carry():
+    # I4: the NATS ask contract has no field for these, so dropping them would let a
+    # prompt A/B whose arms differ only in temperature run two identical arms while the
+    # log claimed two. Mutation: delete the guard -> the ask succeeds and the payload
+    # silently carries neither parameter.
+    bus = FakeBus(reply={"from": "m", "text": "ok"})
+    mind = Mind("m", bus)
+    assert await mind.ask("q") == "ok"                                   # defaults: unaffected
+    assert await mind.ask("q", temperature=0.7, max_tokens=400) == "ok"  # explicit defaults too
+    for kwargs in ({"temperature": 0.9}, {"max_tokens": 999}, {"temperature": 0.2, "max_tokens": 50}):
+        with pytest.raises(MindError, match="cannot carry sampling parameters"):
+            await mind.ask("q", **kwargs)
+    assert len(bus.calls) == 2                     # the refused asks never reached the bus

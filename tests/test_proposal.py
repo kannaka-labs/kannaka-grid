@@ -155,3 +155,24 @@ def test_genome_id_of_rejects_unknown_name():
     from grid.proposal import genome_id_of
     with pytest.raises(ValueError):
         genome_id_of(["harvest", "teleport"], ["nop", "harvest"])
+
+
+def test_a_variant_without_recall_says_so_instead_of_claiming_an_empty_memory():
+    # Minor 4: "- (nothing yet)" asserts that recall RAN and came back empty. For a
+    # recall: false variant that is a different fact, and it is the one the model reads
+    # and the corpus records. Mutation: restore the single unconditional `memory = ...`
+    # line -> the recall: false render says "(nothing yet)".
+    import hashlib as _h
+    from grid.variants import Variant
+    tpl = "T {directive}\nMEM:\n{memory}\n"
+
+    def v(recall):
+        return Variant(id="v", template=tpl, sha256=_h.sha256(tpl.encode()).hexdigest(),
+                       temperature=0.7, max_tokens=400, recall=recall, note="")
+
+    off = render_prompt(req(), [], v(False))
+    assert "not consulted" in off and "nothing yet" not in off
+    on_empty = render_prompt(req(), [], v(True))
+    assert "- (nothing yet)" in on_empty and "not consulted" not in on_empty
+    on_full = render_prompt(req(), ["remembered a thing"], v(True))
+    assert "- remembered a thing" in on_full and "nothing yet" not in on_full

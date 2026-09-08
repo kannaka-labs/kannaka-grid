@@ -19,7 +19,8 @@ from typing import Awaitable, Callable
 import httpx
 
 from .envelope import envelope, now_ms, subject
-from .mind import ASK_TIMEOUT_S, REMEMBER_MIN_INTERVAL_S, DirectLlm, Mind, MindError, Throttle
+from .mind import (ASK_TIMEOUT_S, DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE,
+                   REMEMBER_MIN_INTERVAL_S, DirectLlm, Mind, MindError, Throttle)
 from .natsio import Bus, BusClosed, BusError, BusTimeout
 from .proposal import Rejection, parse_request, render_prompt, validate, write_proposal
 from .proposal_log import ProposalLog, proposal_entry
@@ -34,6 +35,16 @@ UNPARSEABLE_LIMIT = 3       # consecutive failed parses before the file is binne
 # request, which may hash to the other arm.
 DEFER_LIMIT = 4
 AB_SPLIT = 0.2
+
+# The one dimension that hashes the BARE request id, because arm_for has done exactly
+# that since sub-project 3 and a running model A/B must not reshuffle on deploy.
+UNSALTED_DIMENSION = "model"
+# An allowlist, not a convention: the whole guarantee above rests on one string compare,
+# so a typo ("modle") would silently salt the model dimension and re-randomise a live
+# experiment with no error anywhere. Task 4 makes dimensions first-class; until then a
+# name that is not here is a bug, and adding one is a deliberate edit. Keeping the names
+# short and colon-free also keeps the salted key below unambiguous.
+DIMENSIONS = frozenset({UNSALTED_DIMENSION, "prompt"})
 
 
 def arm_for(request_id: str, split: float) -> str:
@@ -59,11 +70,13 @@ def assign(request_id: str, *, dimension: str, arms: list[str], weights: list[fl
     `arms` is ORDERED: the buckets are cumulative, so arms[0] owns [0, weights[0]).
     Build a two-arm pair with two_arm() rather than by hand -- see the warning there.
     """
+    if dimension not in DIMENSIONS:
+        raise ValueError(f"unknown dimension {dimension!r}; known: {sorted(DIMENSIONS)}")
     if len(arms) != len(weights):
         # zip() would silently drop the tail, so an arm could become unreachable
         # while the A/B still looked like it was running.
         raise ValueError(f"{len(arms)} arms but {len(weights)} weights")
-    key = request_id if dimension == "model" else f"{dimension}:{request_id}"
+    key = request_id if dimension == UNSALTED_DIMENSION else f"{dimension}:{request_id}"
     h = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16) / 2**32
     upto = 0.0
     for arm, w in zip(arms, weights):
@@ -74,7 +87,13 @@ def assign(request_id: str, *, dimension: str, arms: list[str], weights: list[fl
 
 
 # Fixed ids, so the guard below is deterministic and costs one hash each, once per relay.
-_ORDER_PROBE_IDS = tuple(f"order-probe-{i}" for i in range(64))
+# The plain range spans h in [0.00459, 0.99944], and an inverted pair is invisible to the
+# probe for a split inside that margin. The two appended ids hash to 3.5e-09 and
+# 0.999999996, narrowing the blind window to splits no deployment can express.
+_ORDER_PROBE_IDS = tuple(f"order-probe-{i}" for i in range(64)) + (
+    "order-probe-1894579",      # h = 3.4924596548080444e-09
+    "order-probe-490918",       # h = 0.9999999958090484
+)
 
 
 def two_arm(candidate: str, incumbent: str, split: float) -> tuple[list[str], list[float]]:
@@ -93,7 +112,7 @@ def two_arm(candidate: str, incumbent: str, split: float) -> tuple[list[str], li
     arms, weights = [candidate, incumbent], [split, 1.0 - split]
     for rid in _ORDER_PROBE_IDS:
         expected = candidate if arm_for(rid, split) == "candidate" else incumbent
-        got = assign(rid, dimension="model", arms=arms, weights=weights)
+        got = assign(rid, dimension=UNSALTED_DIMENSION, arms=arms, weights=weights)
         if got != expected:
             raise ValueError(
                 f"two-arm ordering is inverted at split {split}: {rid} lands on {got!r} "
@@ -126,8 +145,14 @@ class Relay:
         self.candidate_mind = candidate_mind
         self.candidate_alias = candidate_alias
         self.split = split
-        # Variants, not ids: resolving the registry is run()'s job, so an unknown id is a
-        # startup error (fail closed, as Task 1's loader does) rather than a per-poll one.
+        # Variants, not ids, and resolved exactly ONCE -- here or, in production, in run().
+        # The request path renders from these objects and never re-reads the registry.
+        # That is deliberate: load_registry re-reads and re-hashes the template files on
+        # every call, so a template edited in place with its sha256 re-pinned would other-
+        # wise be adopted mid-experiment, silently changing what one arm says while the
+        # ledger row that opened the A/B still named the old bytes. Do NOT add a cache to
+        # make the re-read cheap; hold the resolved objects, as here. Resolving once also
+        # makes an unknown id a startup error, as the loader is, not a per-poll one.
         self.prompt_variant = get_variant() if prompt_variant is None else prompt_variant
         self.prompt_candidate = prompt_candidate
         self.prompt_split = prompt_split
@@ -316,6 +341,11 @@ class RelayConfig:
     candidate_llm: DirectLlm | None = None
     prompt_variant: str = ""        # MIND_PROMPT_VARIANT; empty means the registry default
     prompt_candidate: str = ""      # MIND_PROMPT_CANDIDATE; empty means no prompt A/B
+    # Its own knob, NOT ab_split: widening a model rollout must not move the prompt
+    # dimension bucket boundary and re-randomise which wording each request gets,
+    # mid-experiment, across a restart. The two dimensions are independent everywhere
+    # else; sharing one split would have been the only place they were not.
+    prompt_ab_split: float = AB_SPLIT   # MIND_PROMPT_AB_SPLIT
 
     @classmethod
     def from_env(cls) -> "RelayConfig":
@@ -348,7 +378,30 @@ class RelayConfig:
             candidate_llm=_candidate_llm(env),
             prompt_variant=env("MIND_PROMPT_VARIANT", "") or "",
             prompt_candidate=env("MIND_PROMPT_CANDIDATE", "") or "",
+            prompt_ab_split=float(env("MIND_PROMPT_AB_SPLIT") or AB_SPLIT),
         )
+
+
+def check_sampling_route(llm: DirectLlm | None, *variants: Variant | None) -> None:
+    """Refuse to start a variant whose sampling the configured route cannot deliver.
+
+    With no DirectLlm, asks go over NATS, and that contract has no field for temperature
+    or max_tokens -- the serve daemon owns them. Two arms differing ONLY in sampling would
+    then be identical on the wire while every log row and ledger row claimed an A/B was
+    running: a confident wrong answer, which is worse than a failure. Mind.ask raises for
+    the same reason, per ask; this makes it an immediate, readable start failure instead
+    of a slow defer-and-bin loop that only shows up as an unanswered-request count.
+    """
+    if llm is not None:
+        return
+    for v in variants:
+        if v is not None and (v.temperature != DEFAULT_TEMPERATURE or v.max_tokens != DEFAULT_MAX_TOKENS):
+            raise SystemExit(
+                f"variant {v.id!r} asks for temperature={v.temperature} "
+                f"max_tokens={v.max_tokens}, but with no MIND_LLM_URL the NATS ask route "
+                f"cannot carry them (the serve daemon always uses "
+                f"{DEFAULT_TEMPERATURE}/{DEFAULT_MAX_TOKENS}). Set MIND_LLM_URL, or use "
+                f"variants whose sampling is the default.")
 
 
 def _candidate_llm(env) -> DirectLlm | None:
@@ -385,10 +438,11 @@ async def run(cfg: RelayConfig) -> None:
     prompt_variant = get_variant(cfg.prompt_variant or None)
     prompt_candidate = get_variant(cfg.prompt_candidate) if cfg.prompt_candidate else None
     if prompt_candidate is not None:
-        # One split knob for now: Task 4 gives each dimension its own.
-        log.info("prompt A/B: %s vs %s at split %.2f", prompt_candidate.id, prompt_variant.id, cfg.ab_split)
+        log.info("prompt A/B: %s vs %s at split %.2f (MIND_PROMPT_AB_SPLIT)",
+                 prompt_candidate.id, prompt_variant.id, cfg.prompt_ab_split)
     else:
         log.info("prompt: %s (no A/B)", prompt_variant.id)
+    check_sampling_route(cfg.llm, prompt_variant, prompt_candidate)
     async with httpx.AsyncClient(timeout=2) as client:
         async def fetch_state() -> dict:
             r = await client.get(f"{cfg.colony_url}/api/state")
@@ -401,7 +455,7 @@ async def run(cfg: RelayConfig) -> None:
                       retry_after_s=cfg.retry_after_s,
                       candidate_mind=candidate_mind, candidate_alias=cfg.candidate_tag, split=cfg.ab_split,
                       prompt_variant=prompt_variant, prompt_candidate=prompt_candidate,
-                      prompt_split=cfg.ab_split)
+                      prompt_split=cfg.prompt_ab_split)
         log.info("watching %s for %s", cfg.queue, cfg.agent_id)
         while True:
             try:

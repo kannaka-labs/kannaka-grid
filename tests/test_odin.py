@@ -7,6 +7,7 @@ import pytest
 
 from grid.natsio import BusClosed, BusTimeout
 from grid.odin import Relay
+from grid.proposal_log import variant_of, variant_sha256_of
 from grid.variants import Variant
 
 ISA = [{"name": n, "cost": 0.1, "effect": n} for n in ("nop", "harvest", "copy", "fork")]
@@ -542,8 +543,8 @@ async def test_without_a_prompt_candidate_every_entry_logs_the_default_variant(t
     entries = plog.read_all()
     assert [e["outcome"] for e in entries] == ["proposed", "rejected", "rejected"]
     assert entries[-1]["reason"] == f"deferred {DEFER_LIMIT} times"
-    assert {e["prompt_variant"] for e in entries} == {default.id}
-    assert {e["prompt_variant_sha256"] for e in entries} == {default.sha256}
+    assert {variant_of(e) for e in entries} == {default.id}
+    assert {variant_sha256_of(e) for e in entries} == {default.sha256}
     assert mind.sampling[0] == (default.temperature, default.max_tokens)
 
 
@@ -567,11 +568,11 @@ async def test_a_prompt_candidate_splits_traffic_and_every_entry_matches_assign(
     expected = [assign(rid, dimension="prompt", arms=["v2-cand", "v1-inc"], weights=[0.2, 0.8])
                 for rid in ids]
     entries = plog.read_all()
-    assert [e["prompt_variant"] for e in entries] == expected
+    assert [variant_of(e) for e in entries] == expected
     assert set(expected) == {"v1-inc", "v2-cand"}            # both arms really got traffic
     assert 0 < expected.count("v2-cand") < len(ids) // 2     # and the candidate is the minority
     by_id = {"v1-inc": incumbent.sha256, "v2-cand": candidate.sha256}
-    assert [e["prompt_variant_sha256"] for e in entries] == [by_id[v] for v in expected]
+    assert [variant_sha256_of(e) for e in entries] == [by_id[v] for v in expected]
 
 
 async def test_a_variant_that_wants_no_recall_never_calls_recall(tmp_path):
@@ -633,3 +634,124 @@ def test_a_prompt_ab_against_itself_is_refused(tmp_path):
     with pytest.raises(ValueError, match="both"):
         Relay(tmp_path, colony="c", agent_id="grid-c", mind=FakeMind(), bus=FakeBus(),
               prompt_variant=a_variant("same"), prompt_candidate=a_variant("same"))
+
+
+def test_assign_rejects_an_unknown_dimension():
+    # I3: the model dimension's whole guarantee is one string compare, so `dimension="modle"`
+    # would silently salt it and re-randomise a RUNNING model A/B with no error anywhere.
+    # Mutation: drop the `dimension not in DIMENSIONS` check -> "modle" quietly returns an arm.
+    from grid.odin import DIMENSIONS, UNSALTED_DIMENSION, assign
+    assert UNSALTED_DIMENSION in DIMENSIONS and "prompt" in DIMENSIONS
+    for bad in ("modle", "Model", "", "models"):
+        with pytest.raises(ValueError, match="unknown dimension"):
+            assign("r1", dimension=bad, arms=["a", "b"], weights=[0.5, 0.5])
+
+
+def test_assign_rejects_mismatched_arms_and_weights():
+    # Minor 1: zip() truncates silently, so a missing weight would make the last arm
+    # unreachable while the A/B still looked like it was running.
+    # Mutation: drop the length check -> "c" never wins and no error is raised.
+    from grid.odin import assign
+    with pytest.raises(ValueError, match="3 arms but 2 weights"):
+        assign("r1", dimension="prompt", arms=["a", "b", "c"], weights=[0.4, 0.6])
+
+
+def test_the_two_arm_probe_catches_an_inversion_at_an_extreme_split():
+    # Minor 2: the plain 64-id probe spans h in [0.00459, 0.99944], so an inverted pair was
+    # invisible for split in (0, 0.000564) or (0.999436, 1). The splits below sit inside
+    # that old blind window, which is what makes this test non-vacuous.
+    # Mutation: drop the two appended extreme ids from _ORDER_PROBE_IDS -> `caught` goes
+    # False and both cases fail. (Choosing 0.001 / 0.999 instead would pass either way:
+    # those are already covered by the plain range, so they prove nothing.)
+    from grid.odin import _ORDER_PROBE_IDS, arm_for, assign, two_arm
+    plain = tuple(f"order-probe-{i}" for i in range(64))
+    for split in (0.0001, 0.9999):
+        assert two_arm("cand", "inc", split) == (["cand", "inc"], [split, 1.0 - split])
+        inverted, inv_w = ["inc", "cand"], [1.0 - split, split]
+
+        def disagrees(ids):
+            return any(assign(rid, dimension="model", arms=inverted, weights=inv_w)
+                       != ("cand" if arm_for(rid, split) == "candidate" else "inc")
+                       for rid in ids)
+
+        assert not disagrees(plain), f"split {split} was meant to be blind to the plain range"
+        assert disagrees(_ORDER_PROBE_IDS), f"the probe is blind to an inversion at {split}"
+
+
+def test_config_from_env_prompt_split_is_its_own_knob(monkeypatch):
+    # I5: MIND_AB_SPLIT widens a MODEL rollout; if it also moved the prompt boundary the
+    # prompt arms would re-randomise mid-experiment across the restart.
+    # Mutation: read prompt_ab_split from MIND_AB_SPLIT -> the 0.2 assertion below fails.
+    from grid.odin import AB_SPLIT, RelayConfig
+    monkeypatch.setenv("COLONY_SLUG", "colony-one")
+    for k in ("MIND_AB_SPLIT", "MIND_PROMPT_AB_SPLIT"):
+        monkeypatch.delenv(k, raising=False)
+    assert RelayConfig.from_env().prompt_ab_split == AB_SPLIT
+    monkeypatch.setenv("MIND_AB_SPLIT", "0.6")
+    assert RelayConfig.from_env().prompt_ab_split == AB_SPLIT   # untouched by the model knob
+    monkeypatch.setenv("MIND_PROMPT_AB_SPLIT", "0.35")
+    c = RelayConfig.from_env()
+    assert c.prompt_ab_split == 0.35 and c.ab_split == 0.6      # and the two are independent
+    monkeypatch.setenv("MIND_PROMPT_AB_SPLIT", "")              # the gate reverts by blanking
+    assert RelayConfig.from_env().prompt_ab_split == AB_SPLIT
+
+
+def test_the_bus_route_refuses_to_start_a_variant_it_cannot_sample(tmp_path):
+    # I4: with no DirectLlm the NATS route drops temperature/max_tokens, so two arms that
+    # differ ONLY in sampling would be identical on the wire while every log and ledger row
+    # claimed an A/B was running. Mutation: make check_sampling_route return immediately
+    # -> no SystemExit, and the run boots into two indistinguishable arms.
+    from grid.mind import DirectLlm
+    from grid.odin import check_sampling_route
+    default = a_variant("v1")
+    hot = a_variant("v2", temperature=0.9)
+    longer = a_variant("v3", max_tokens=999)
+    check_sampling_route(None, default, None)                        # defaults: fine
+    check_sampling_route(DirectLlm("http://gw/v1", "kb"), default, hot)   # direct route: fine
+    for bad in (hot, longer):
+        with pytest.raises(SystemExit, match="cannot carry them"):
+            check_sampling_route(None, default, bad)
+        with pytest.raises(SystemExit, match=bad.id):
+            check_sampling_route(None, bad)
+
+
+async def test_editing_the_registry_after_the_relay_starts_changes_nothing(tmp_path):
+    # Carried over from task 1's review: load_registry re-reads and re-hashes on every
+    # call, so a template edited in place with its sha256 re-pinned would be adopted
+    # mid-experiment -- silently changing what one arm says while the ledger row that
+    # opened the A/B still names the old bytes. The relay resolves ONCE and holds the
+    # objects. Mutation: re-resolve inside variant_for with get_variant(self.prompt_variant.id,
+    # path=...) -> the second prompt carries "EDITED" and the sha256 changes.
+    import json as _json
+    from grid.proposal_log import ProposalLog, variant_sha256_of
+    from grid.variants import get_variant
+    data = tmp_path / "reg"
+    (data / "prompts").mkdir(parents=True)
+    template = "ORIGINAL {genome_json}"
+
+    def write_registry(text):
+        (data / "prompts" / "v.md").write_bytes(text.encode())
+        (data / "prompt_variants.json").write_text(_json.dumps({
+            "default": "v", "variants": {"v": {
+                "template_file": "prompts/v.md",
+                "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                "temperature": 0.7, "max_tokens": 400, "recall": False, "note": "t"}}}))
+
+    write_registry(template)
+    resolved = get_variant(path=data / "prompt_variants.json")       # resolved once, as run() does
+    plog = ProposalLog(tmp_path / "verdicts")
+    mind = FakeMind(answer='["harvest","fork"]')
+    r = Relay(tmp_path / "q", colony="c", agent_id="grid-c", mind=mind, bus=FakeBus(), clock=Clock(),
+              state_fetch=lambda: state_of(1, 10), proposal_log=plog, prompt_variant=resolved)
+    write_request(tmp_path / "q", "a1")
+    assert await r.poll_once() == "proposed"
+    (tmp_path / "q" / "proposal.json").unlink()
+
+    write_registry("EDITED {genome_json}")      # re-pinned hash: the loader would accept it
+    write_request(tmp_path / "q", "a2")
+    assert await r.poll_once() == "proposed"
+
+    assert [m.startswith("ORIGINAL") for m in mind.asked] == [True, True]
+    assert all(not m.startswith("EDITED") for m in mind.asked)
+    sha = {variant_sha256_of(e) for e in plog.read_all()}
+    assert sha == {hashlib.sha256(template.encode()).hexdigest()}
