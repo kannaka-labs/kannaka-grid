@@ -104,7 +104,9 @@ def render_prompt(req: Request, recall: list[str], variant: Variant | None = Non
     startup; None re-reads the registry, so it is for one-off rendering only.
 
     A `{memory}` placeholder in a `recall: false` variant is legal and renders an
-    explicit "not consulted" line, never the empty-recall line.
+    explicit "not consulted" line, never the empty-recall line. Passing a NON-empty
+    `recall` to such a variant is a ValueError rather than a silent discard: the variant
+    would win either way, but the caller should learn that their argument was ignored.
     """
     if variant is None:
         variant = get_variant()
@@ -114,6 +116,17 @@ def render_prompt(req: Request, recall: list[str], variant: Variant | None = Non
     if variant.recall:
         memory = "\n".join(f"- {m}" for m in recall) or "- (nothing yet)"
     else:
+        if recall:
+            # Refused, not silently dropped. The variant does win -- it is the thing the
+            # A/B is measuring -- but a caller that went and fetched memories is working
+            # from a different belief about this render than the variant is, and quietly
+            # discarding their argument is how someone later spends an afternoon on a
+            # prompt that does not contain what they passed it. The relay never trips
+            # this: it skips the recall call entirely and passes [].
+            raise ValueError(
+                f"variant {variant.id!r} declares recall: false, so it cannot render the "
+                f"{len(recall)} recalled item(s) passed to render_prompt; pass [] "
+                f"(and do not pay for the lookup) when the variant declines recall")
         # A variant that never asks must not render "- (nothing yet)": that sentence
         # claims recall RAN and came back empty, which is a different fact, and it is the
         # one the model reads and the corpus records. Say what actually happened instead.

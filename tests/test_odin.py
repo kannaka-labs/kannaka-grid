@@ -755,3 +755,91 @@ async def test_editing_the_registry_after_the_relay_starts_changes_nothing(tmp_p
     assert all(not m.startswith("EDITED") for m in mind.asked)
     sha = {variant_sha256_of(e) for e in plog.read_all()}
     assert sha == {hashlib.sha256(template.encode()).hexdigest()}
+
+
+# Both split knobs, so the range check cannot be added to one and forgotten on the other.
+SPLIT_KEYS = ("MIND_AB_SPLIT", "MIND_PROMPT_AB_SPLIT")
+
+
+def _split_of(key, cfg):
+    return cfg.ab_split if key == "MIND_AB_SPLIT" else cfg.prompt_ab_split
+
+
+@pytest.mark.parametrize("key", SPLIT_KEYS)
+def test_a_split_outside_zero_to_one_is_refused_at_load(monkeypatch, key):
+    # N1: 0, 1, 2 and -1 all parse and then run a ONE-ARMED experiment that every log row
+    # and every ledger row still calls an A/B, until the weekly gate declares a winner from
+    # a comparison that never happened. MIND_AB_SPLIT was unchecked from the previous
+    # sub-project and is deployed that way today.
+    # Mutation: drop the `0.0 < value < 1.0` check in _split -> every rejected case below
+    # loads happily. Clamping instead of raising fails here too, which is the point.
+    from grid.odin import RelayConfig
+    monkeypatch.setenv("COLONY_SLUG", "colony-one")
+    for other in SPLIT_KEYS:
+        monkeypatch.delenv(other, raising=False)
+    for bad in ("0", "1", "0.0", "1.0", "2", "-1", "-0.2", "1.0001"):
+        monkeypatch.setenv(key, bad)
+        with pytest.raises(SystemExit) as e:
+            RelayConfig.from_env()
+        assert key in str(e.value) and bad in str(e.value)      # names the key AND the value
+        assert "strictly between 0 and 1" in str(e.value)
+    for bad in ("abc", "0.2x", "nan-ish"):
+        monkeypatch.setenv(key, bad)
+        with pytest.raises(SystemExit) as e:
+            RelayConfig.from_env()
+        assert key in str(e.value) and "not a number" in str(e.value)
+
+
+@pytest.mark.parametrize("key", SPLIT_KEYS)
+def test_a_split_just_inside_the_boundaries_is_accepted(monkeypatch, key):
+    # The complement of the test above: the check must reject the boundaries without
+    # rejecting the usable range next to them. Mutation: tighten _split to `0.01 < v < 0.99`
+    # -> the 0.001 and 0.999 cases raise.
+    from grid.odin import AB_SPLIT, RelayConfig
+    monkeypatch.setenv("COLONY_SLUG", "colony-one")
+    for other in SPLIT_KEYS:
+        monkeypatch.delenv(other, raising=False)
+    for good in ("0.001", "0.2", "0.5", "0.999"):
+        monkeypatch.setenv(key, good)
+        assert _split_of(key, RelayConfig.from_env()) == float(good)
+    monkeypatch.setenv(key, "")             # the gate reverts by blanking, never deleting
+    assert _split_of(key, RelayConfig.from_env()) == AB_SPLIT
+    monkeypatch.setenv(key, "  0.35  ")     # a stray space in a unit file is not a crash
+    assert _split_of(key, RelayConfig.from_env()) == 0.35
+
+
+@pytest.mark.parametrize("key", SPLIT_KEYS)
+def test_one_bad_split_does_not_take_the_other_knob_with_it(monkeypatch, key):
+    # The two dimensions stay independent through validation too: a bad value on one knob
+    # must be reported as that knob, not silently attributed to the other.
+    from grid.odin import RelayConfig
+    other = next(k for k in SPLIT_KEYS if k != key)
+    monkeypatch.setenv("COLONY_SLUG", "colony-one")
+    monkeypatch.setenv(other, "0.4")
+    monkeypatch.setenv(key, "0")
+    with pytest.raises(SystemExit) as e:
+        RelayConfig.from_env()
+    assert key in str(e.value) and other not in str(e.value)
+    monkeypatch.setenv(key, "0.4")
+    assert _split_of(key, RelayConfig.from_env()) == 0.4
+
+
+def test_a_zero_split_is_refused_before_the_sampling_guard_is_ever_consulted(monkeypatch):
+    # N2: the report of a candidate "parked at split 0" crash-looping through
+    # check_sampling_route assumed a zero split could be configured. After N1 it cannot,
+    # so rather than adding dead defensive code inside the guard -- which takes no split
+    # and should not -- this pins the reason it is unreachable: from_env raises first, so
+    # no RelayConfig carrying a zero split can ever exist to hand to the guard.
+    # Mutation: drop the range check -> from_env returns a cfg with prompt_ab_split 0.0
+    # and the assertion that no such cfg exists fails.
+    import inspect
+    from grid.odin import RelayConfig, check_sampling_route, run
+    monkeypatch.setenv("COLONY_SLUG", "colony-one")
+    monkeypatch.setenv("MIND_PROMPT_AB_SPLIT", "0")
+    with pytest.raises(SystemExit, match="MIND_PROMPT_AB_SPLIT"):
+        RelayConfig.from_env()
+    # and the guard genuinely has no split to consult, so there is nothing to defend
+    assert "split" not in inspect.signature(check_sampling_route).parameters
+    # run() consults the guard only after cfg exists, i.e. after the check above has fired
+    body = inspect.getsource(run)
+    assert "check_sampling_route" in body and "def run(cfg: RelayConfig)" in body

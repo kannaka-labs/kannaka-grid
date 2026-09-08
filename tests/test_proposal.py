@@ -176,3 +176,28 @@ def test_a_variant_without_recall_says_so_instead_of_claiming_an_empty_memory():
     assert "- (nothing yet)" in on_empty and "not consulted" not in on_empty
     on_full = render_prompt(req(), ["remembered a thing"], v(True))
     assert "- remembered a thing" in on_full and "nothing yet" not in on_full
+
+
+def test_recall_passed_to_a_variant_that_declines_it_is_refused_not_dropped():
+    # N5: the variant wins either way -- it is the thing the A/B measures -- but a caller
+    # that went and fetched memories holds a different belief about this render than the
+    # variant does, and quietly discarding their argument is how someone later spends an
+    # afternoon on a prompt that does not contain what they passed it.
+    # Mutation: delete the `if recall: raise` branch -> the first case below renders the
+    # "not consulted" line and silently loses the memory.
+    import hashlib as _h
+    from grid.variants import Variant
+    tpl = "T {directive}\nMEM:\n{memory}\n"
+
+    def v(recall):
+        return Variant(id="no-recall", template=tpl, sha256=_h.sha256(tpl.encode()).hexdigest(),
+                       temperature=0.7, max_tokens=400, recall=recall, note="")
+
+    with pytest.raises(ValueError, match="declares recall: false"):
+        render_prompt(req(), ["a remembered thing"], v(False))
+    with pytest.raises(ValueError, match="no-recall"):        # the message names the variant
+        render_prompt(req(), ["one", "two"], v(False))
+    # [] is not a discard: nothing is lost, and this is the path the relay actually takes
+    assert "not consulted" in render_prompt(req(), [], v(False))
+    # and a variant that wants recall is untouched
+    assert "- a remembered thing" in render_prompt(req(), ["a remembered thing"], v(True))

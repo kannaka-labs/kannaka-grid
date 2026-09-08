@@ -385,12 +385,44 @@ class RelayConfig:
             retry_after_s=float(env("ODIN_RETRY_S") or 60),
             llm=DirectLlm.from_env(env),
             candidate_tag=env("MIND_LLM_CANDIDATE", "") or "",
-            ab_split=float(env("MIND_AB_SPLIT") or AB_SPLIT),
+            ab_split=_split(env, "MIND_AB_SPLIT"),
             candidate_llm=_candidate_llm(env),
             prompt_variant=env("MIND_PROMPT_VARIANT", "") or "",
             prompt_candidate=env("MIND_PROMPT_CANDIDATE", "") or "",
-            prompt_ab_split=float(env("MIND_PROMPT_AB_SPLIT") or AB_SPLIT),
+            prompt_ab_split=_split(env, "MIND_PROMPT_AB_SPLIT"),
         )
+
+
+def _split(env, key: str) -> float:
+    """Read one traffic split, validated at load. BOTH split knobs come through here.
+
+    Strictly between 0 and 1. A split of 0 or 1 -- or 2, or -1 -- parses fine and then
+    runs a ONE-ARMED experiment that every log row and every ledger row still calls an
+    A/B, until the weekly gate declares a winner from a comparison that never happened.
+    Nothing downstream can tell the difference, which is exactly why it has to be caught
+    here. MIND_AB_SPLIT was unchecked from the previous sub-project and is deployed that
+    way today; it is validated now for the same reason as the prompt one.
+
+    Refusing, never clamping: a clamped split is the same confident wrong answer, just
+    quieter, and the operator never learns the value they set was ignored.
+
+    Blank falls back to the default, because the gate reverts by blanking a line rather
+    than deleting it, and float("") would crash-loop the relay into its StartLimit.
+    """
+    raw = (env(key) or "").strip()
+    if not raw:
+        return AB_SPLIT
+    try:
+        value = float(raw)
+    except ValueError:
+        raise SystemExit(f"{key}={raw!r} is not a number; it must be strictly "
+                         f"between 0 and 1") from None
+    if not 0.0 < value < 1.0:
+        raise SystemExit(
+            f"{key}={raw} is out of range: a split must be strictly between 0 and 1. "
+            f"0 and 1 are not 'no A/B' -- they are a one-armed run that every log and "
+            f"ledger row would still call an A/B.")
+    return value
 
 
 def check_sampling_route(llm: DirectLlm | None, *variants: Variant | None) -> None:
