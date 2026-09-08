@@ -159,7 +159,13 @@ log "§2 receipt: colony up ($HEAT) · $(curl -fs 127.0.0.1:8787/api/state | pyt
 # ---- §3 bridge + relay ---------------------------------------------------------
 sudo cp $CHECKOUT/deploy/systemd/grid-bridge.service $CHECKOUT/deploy/systemd/grid-odin.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now grid-bridge.service grid-odin.service
+# `|| log`, not a bare call: grid-odin.service now has an ExecStartPost readiness gate, so
+# `enable --now` returns non-zero whenever the relay does not come back -- and under
+# `set -e` that aborted the script with a bare exit 1, three lines before the `die` that
+# prints WHICH unit failed and the journal saying why. That is the one failure mode where
+# the operator most needs the excerpt, so the non-zero is noted here and diagnosed below.
+sudo systemctl enable --now grid-bridge.service grid-odin.service \
+  || log "enable --now returned non-zero (grid-odin's readiness gate is one way it can); the per-unit check below reports which unit and why"
 sleep 5
 for u in grid-bridge grid-odin; do
   systemctl is-active --quiet $u.service || die "$u.service not active: $(journalctl -u $u -n 8 --no-pager)" 6

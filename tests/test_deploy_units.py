@@ -1,5 +1,12 @@
+import os
+import re
+import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
+
+import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 UNITS = REPO / "deploy" / "systemd"
@@ -177,11 +184,13 @@ def test_the_readiness_probe_looks_for_lines_grid_odin_actually_logs():
     assert '"%(asctime)s %(name)s %(levelname)s %(message)s"' in odin
     for fmt, wanted in (
         ('log.info("watching %s for %s"', "grid.odin INFO watching "),
-        ('log.info("A/B: none")', '"A/B: none"'),
-        ('log.info("A/B: candidate %s at split %.2f"', "A/B: candidate ${MIND_LLM_CANDIDATE} at split"),
-        ('log.info("prompt: %s (no A/B)"', "prompt: ${MIND_PROMPT_VARIANT} (no A/B)"),
+        ('log.info("A/B: none")', 'want_model="grid.odin INFO A/B: none"'),
+        ('log.info("A/B: candidate %s at split %.2f"',
+         'want_model="grid.odin INFO A/B: candidate ${MIND_LLM_CANDIDATE} at split "'),
+        ('log.info("prompt: %s (no A/B)"',
+         'want_prompt="grid.odin INFO prompt: ${live_variant} (no A/B)"'),
         ('log.info("prompt A/B: %s vs %s at split %.2f (MIND_PROMPT_AB_SPLIT)"',
-         "prompt A/B: ${MIND_PROMPT_CANDIDATE} vs ${MIND_PROMPT_VARIANT} at split"),
+         'want_prompt="grid.odin INFO prompt A/B: ${MIND_PROMPT_CANDIDATE} vs ${live_variant} at split "'),
     ):
         assert fmt in odin, f"grid/odin.py no longer logs {fmt}"
         assert wanted in probe, f"relay-ready.sh no longer checks for {wanted}"
@@ -268,3 +277,255 @@ def test_the_receipt_names_the_candidate_arm_when_a_prompt_ab_is_running(tmp_pat
     assert "prompt_candidate v2-minimal-edit" in out and "prompt_split 0.2" in out
     assert "arm v1-sandbox (incumbent) answered=3 valid=3" in out
     assert "arm v2-minimal-edit (candidate) answered=3 valid=3" in out
+
+
+# --- the units that PAY for the restart must outlive it -------------------------------------
+
+def restart_budget_s() -> int:
+    """Worst-case seconds one gate verb can spend inside `systemctl restart grid-odin.service`.
+
+    Derived, never typed: the readiness gate turned a restart from a milliseconds-long fork into
+    something bounded by grid-odin's own start timeout, and this budget has to move when any of
+    the three numbers it is built from moves.
+
+    dimensions x {the restart, the restart after the revert} x attempts x grid-odin's ceiling.
+    Each `systemctl restart` is bounded by grid-odin's TimeoutStartSec (systemd kills the start
+    job there), `_restart_relay` makes that many attempts, `_restart_after_revert` calls it a
+    second time on the failure path, and `ab --check` reconciles every dimension in turn.
+    """
+    from grid.odin import DIMENSIONS
+    odin_ceiling = int(re.search(r"(?m)^TimeoutStartSec=(\d+)$", unit("grid-odin.service")).group(1))
+    weekly = (REPO / "grid" / "weekly.py").read_text(encoding="utf-8")
+    attempts = len(re.search(r"for attempt in \(([^)]*)\):", weekly).group(1).split(","))
+    return len(DIMENSIONS) * 2 * attempts * odin_ceiling
+
+
+def start_timeout_s(name: str) -> float:
+    m = re.search(r"(?m)^TimeoutStartSec=(\S+)$", unit(name))
+    assert m, f"{name} has no TimeoutStartSec="
+    return float("inf") if m.group(1) == "infinity" else float(m.group(1))
+
+
+def test_the_oneshot_units_outlive_the_restarts_they_now_pay_for():
+    """`ab --check` and `release` both call `_restart_relay`, and a restart used to return in
+    milliseconds. It can now block for the readiness gate's whole deadline, twice per attempt
+    pair. A SIGTERM partway through `end_ab` is the worst outcome available on this path:
+    grid.env would have the candidate cleared with NO ledger row written, which is precisely the
+    env/ledger divergence the gate exists to prevent, arriving through the timeout side door.
+
+    Asserted as "larger than the worst case", not "present": a `TimeoutStartSec=` that is merely
+    there is what a future bump of RELAY_READY_TIMEOUT_S or of the attempt count would quietly
+    outgrow. `infinity` is accepted for the weekly, where the probes in front of the restart run
+    for hours and any finite watchdog would kill a legitimate release mid-teardown.
+
+    Mutation: TimeoutStartSec=300 on grid-verdicts -> RED (300 < the 960 s budget). Remove either
+    line -> RED. Raise grid-odin's own TimeoutStartSec to 900 -> RED, because the budget grows
+    with it and 1800 no longer covers it.
+    """
+    budget = restart_budget_s()
+    assert budget >= 480, f"the derived restart budget collapsed to {budget}s; check the regexes"
+    for name in ("grid-verdicts.service", "grid-weekly-release.service"):
+        assert start_timeout_s(name) > budget, (
+            f"{name} can be killed mid-teardown: TimeoutStartSec is not above the {budget}s "
+            f"worst-case relay-restart budget")
+
+
+# --- the readiness probe, EXECUTED ----------------------------------------------------------
+
+BASH = shutil.which("bash")
+needs_bash = pytest.mark.skipif(BASH is None, reason="the readiness probe is a bash script")
+
+READY_LINE = ("2026-09-08 12:00:01 grid.odin INFO watching "
+              "/srv/grid/colony-one/state/operator for grid-colony-one")
+NO_AB = "2026-09-08 12:00:01 grid.odin INFO A/B: none"
+
+
+def journal_of(*lines: str) -> str:
+    return "".join(line + "\n" for line in lines)
+
+
+@pytest.fixture(scope="module")
+def live_pid(tmp_path_factory):
+    """A pid the probe's own `kill -0` calls alive, in the shell's OWN pid namespace.
+
+    A pid taken from Python is a Windows pid on the dev box and msys's `kill` does not know it,
+    so the holder shell reports its own `$$` and the stub `systemctl` hands that back. On Linux
+    the two numbers are the same and this is a no-op.
+    """
+    pidfile = tmp_path_factory.mktemp("holder") / "pid"
+    proc = subprocess.Popen([BASH, "-c", f'echo $$ > "{pidfile.as_posix()}"; sleep 120'])
+    try:
+        for _ in range(200):
+            if pidfile.is_file() and pidfile.read_text().strip():
+                break
+            time.sleep(0.05)
+        else:
+            pytest.skip("the holder shell never reported its pid")
+        yield pidfile.read_text().strip()
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def run_probe(tmp_path, *, journal: str, mainpid: str, invocation: str = "0123456789abcdef",
+              env: dict | None = None, timeout_s: str = "2"):
+    """Run the SHIPPED probe with journalctl and systemctl replaced by stubs.
+
+    The `journalctl` stub behaves like the real one in the one way that matters: an
+    `_SYSTEMD_INVOCATION_ID=` match returns the fixture only when the id is the fixture's own,
+    while a `-u <unit>` read returns it regardless -- which is what makes a probe that abandoned
+    the scoping visibly pass on the previous start's evidence, instead of quietly seeing nothing.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "journalctl").write_bytes(
+        b'#!/bin/sh\n'
+        b'case "$1" in\n'
+        b'  "_SYSTEMD_INVOCATION_ID=$JOURNAL_INVOCATION") cat "$JOURNAL_FIXTURE" ;;\n'
+        b'  -u) cat "$JOURNAL_FIXTURE" ;;\n'
+        b'esac\n'
+        b'exit 0\n')
+    (bin_dir / "systemctl").write_bytes(b'#!/bin/sh\necho "$FAKE_MAINPID"\n')
+    for stub in ("journalctl", "systemctl"):
+        (bin_dir / stub).chmod(0o755)
+    fixture = tmp_path / "journal.txt"
+    fixture.write_bytes(journal.encode("utf-8"))
+    e = {k: v for k, v in os.environ.items()
+         if k not in ("MIND_PROMPT_VARIANT", "MIND_PROMPT_CANDIDATE", "MIND_LLM_CANDIDATE")}
+    e.update({"PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+              "INVOCATION_ID": invocation,
+              "JOURNAL_INVOCATION": "0123456789abcdef",
+              "JOURNAL_FIXTURE": fixture.as_posix(),
+              "FAKE_MAINPID": mainpid,
+              "RELAY_READY_TIMEOUT_S": timeout_s,
+              "RELAY_READY_PYTHON": sys.executable})
+    e.update(env or {})
+    return subprocess.run([BASH, (SKYWAVE / "relay-ready.sh").as_posix()],
+                          cwd=str(REPO), env=e, capture_output=True, text=True)
+
+
+def test_deploy_sh_keeps_the_informative_failure_on_a_failed_relay_start():
+    """`enable --now grid-odin.service` can now return non-zero, because the readiness gate can
+    fail the start job. Under `set -euo pipefail` a bare call aborts the script with a naked
+    exit 1 three lines before the `die` that names the unit and prints the journal - and a failed
+    relay start is the single failure where the operator most needs that excerpt.
+
+    Mutation: delete the `|| log ...` handler -> RED.
+    """
+    text = (SKYWAVE / "deploy.sh").read_text(encoding="utf-8")
+    assert "set -euo pipefail" in text                       # the reason the handler is needed
+    joined = text.replace("\\\n", " ")
+    enable = [ln for ln in joined.splitlines()
+              if "systemctl enable --now" in ln and "grid-odin.service" in ln]
+    assert enable, "deploy.sh no longer enables grid-odin.service"
+    for ln in enable:
+        assert "||" in ln, ("a bare `enable --now grid-odin.service` under set -e aborts before "
+                            "the per-unit die that prints the journal")
+    # ...and the diagnosis it defers to is still there
+    assert 'die "$u.service not active: $(journalctl -u $u -n 8 --no-pager)" 6' in text
+
+
+@needs_bash
+def test_the_probe_is_syntactically_valid():
+    # The four coupling tests above read the script as text and would pass on a file that bash
+    # cannot even parse. Mutation: delete a `fi` -> RED.
+    assert subprocess.run([BASH, "-n", (SKYWAVE / "relay-ready.sh").as_posix()],
+                          capture_output=True, text=True).returncode == 0
+
+
+@needs_bash
+def test_the_probe_passes_when_the_relay_is_up_on_this_configuration(tmp_path, live_pid):
+    # Blank MIND_PROMPT_VARIANT is the shipped default, and it must resolve through the registry
+    # to the id odin logs. Mutation: point RELAY_READY_PYTHON at a broken interpreter -> the probe
+    # fails closed instead of skipping the comparison.
+    r = run_probe(tmp_path, mainpid=live_pid,
+                  journal=journal_of(NO_AB,
+                                     "2026-09-08 12:00:01 grid.odin INFO prompt: v1-sandbox (no A/B)",
+                                     READY_LINE))
+    assert r.returncode == 0, r.stderr
+    assert "is up and serving the configuration" in r.stderr
+
+
+@needs_bash
+def test_the_probe_fails_when_a_blank_variant_resolves_to_a_different_id(tmp_path, live_pid):
+    """The defect this replaced: with MIND_PROMPT_VARIANT blank the expectation was the bare
+    string `prompt: `, and `grep -F` is a substring match, so a relay serving ANY variant passed.
+    Blank is not an edge case - it is the shipped default and the state through every
+    gate-started prompt experiment, because `start_ab` writes only the candidate and the split.
+
+    Mutation: drop the registry resolution and go back to `want_prompt="prompt: "` -> this test
+    goes GREEN-when-it-should-be-RED, i.e. exit 0 on a relay serving v99-something-else.
+    """
+    r = run_probe(tmp_path, mainpid=live_pid,
+                  journal=journal_of(NO_AB,
+                                     "2026-09-08 12:00:01 grid.odin INFO prompt: v99-something-else (no A/B)",
+                                     READY_LINE))
+    assert r.returncode == 1
+    assert "did not hand it" in r.stderr
+    assert "grid.odin INFO prompt: v1-sandbox (no A/B)" in r.stderr      # names what it wanted
+
+
+@needs_bash
+def test_the_probe_checks_the_incumbent_of_a_running_prompt_ab_too(tmp_path, live_pid):
+    # Same substring hole on the A/B branch: `prompt A/B: <cand> vs ` left the incumbent
+    # unverified. Mutation: drop ` at split ` from want_prompt -> a relay splitting against the
+    # wrong incumbent passes.
+    r = run_probe(tmp_path, mainpid=live_pid,
+                  env={"MIND_PROMPT_CANDIDATE": "v2-minimal-edit"},
+                  journal=journal_of(
+                      NO_AB,
+                      "2026-09-08 12:00:01 grid.odin INFO prompt A/B: v2-minimal-edit vs "
+                      "v99-something-else at split 0.20 (MIND_PROMPT_AB_SPLIT)",
+                      READY_LINE))
+    assert r.returncode == 1 and "did not hand it" in r.stderr
+
+
+@needs_bash
+def test_the_probe_fails_when_the_relay_never_came_up(tmp_path):
+    # The case the whole gate exists for: a configuration odin refuses. It must not wait out the
+    # deadline. Mutation: remove the in-loop `relay_alive` check -> the probe still fails, but
+    # only after the deadline, so a nightly reconcile pays 60 s per attempt for nothing.
+    r = run_probe(tmp_path, mainpid="0", timeout_s="30", journal=journal_of(
+        NO_AB, "grid.variants.VariantError: unknown variant 'v2-tesre'"))
+    assert r.returncode == 1
+    assert "exited during start" in r.stderr
+    assert "unknown variant 'v2-tesre'" in r.stderr      # the refusal itself is echoed
+
+
+@needs_bash
+def test_the_probe_fails_when_the_relay_dies_after_logging_ready(tmp_path):
+    """Reaching `watching` is not the same as staying up: the first poll can hit BusClosed and
+    exit 75. A probe that stopped checking at the ready line would report that relay as started.
+
+    Mutation: delete the `relay_alive ||` re-check after the config greps -> exit 0 on a relay
+    that is gone.
+    """
+    r = run_probe(tmp_path, mainpid="0", journal=journal_of(
+        NO_AB, "2026-09-08 12:00:01 grid.odin INFO prompt: v1-sandbox (no A/B)", READY_LINE,
+        "2026-09-08 12:00:02 grid.odin ERROR nats gave up: closed; exiting for systemd to restart"))
+    assert r.returncode == 1
+    assert "watching the queue and then exited" in r.stderr
+
+
+@needs_bash
+def test_the_probe_cannot_pass_on_a_previous_starts_log_line(tmp_path, live_pid):
+    # The single most important decision in the script. The fixture is a PERFECTLY healthy start
+    # -- filed under a different invocation id. Mutation: drop the `_SYSTEMD_INVOCATION_ID=`
+    # match and read the unit's recent journal instead -> exit 0, green over a dead relay.
+    r = run_probe(tmp_path, mainpid=live_pid, invocation="ffffffffffffffff",
+                  journal=journal_of(NO_AB,
+                                     "2026-09-08 12:00:01 grid.odin INFO prompt: v1-sandbox (no A/B)",
+                                     READY_LINE))
+    assert r.returncode == 1
+    assert "has not logged 'watching'" in r.stderr
+
+
+@needs_bash
+def test_the_probe_refuses_a_start_it_cannot_scope(tmp_path, live_pid):
+    # No INVOCATION_ID means no way to tell this start from the last, and the fallback that would
+    # restore the check (a time window) is exactly what must not happen. Mutation: default it to
+    # a `--since` window -> exit 0 on the previous start's evidence.
+    e = {k: v for k, v in os.environ.items() if k != "INVOCATION_ID"}
+    r = subprocess.run([BASH, (SKYWAVE / "relay-ready.sh").as_posix()], cwd=str(REPO),
+                       env={**e, "INVOCATION_ID": ""}, capture_output=True, text=True)
+    assert r.returncode == 1 and "INVOCATION_ID is unset" in r.stderr

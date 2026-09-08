@@ -94,30 +94,55 @@ recorded `ab_started` over a relay that was not running.
 
 The unit's `ExecStartPost=` closes that: `deploy/skywave/relay-ready.sh` waits for the relay to
 log `watching <queue> for <agent>` (emitted only after the env parsed, the variants resolved,
-the sampling route was accepted and the bus connected) and then checks that the `A/B:` and
-`prompt:` lines it logged name the values this unit's `EnvironmentFile` just handed it. It is
-not a `sleep`: it polls for that evidence, scoped to this start's `_SYSTEMD_INVOCATION_ID` so a
-line from the *previous* start can never pass it, and it gives up at once — without waiting out
-its 60 s deadline — if the main process is already gone. Reading the journal is why the unit
-carries `SupplementaryGroups=systemd-journal`.
+the sampling route was accepted and the bus connected), checks that the `A/B:` and `prompt:`
+lines it logged name the values this unit's `EnvironmentFile` just handed it, and then checks
+that the relay is *still* alive. It is not a `sleep`: it polls for that evidence, scoped to this
+start's `_SYSTEMD_INVOCATION_ID` so a line from the *previous* start can never pass it, and it
+gives up at once — without waiting out its 60 s deadline — if the main process is already gone.
+Reading the journal is why the unit carries `SupplementaryGroups=systemd-journal`.
+
+Both expected lines are matched whole, prefix (`grid.odin INFO …`) and suffix, so a substring
+cannot satisfy them — and a blank `MIND_PROMPT_VARIANT` is resolved through the registry before
+the comparison, not left as a bare `prompt: ` prefix. That case is not exotic: the line is blank
+on a fresh host and stays blank through every gate-started prompt experiment, because
+`start_ab` writes only the candidate and the split. Without the resolution the prompt half of
+the check would pass for a relay serving any variant at all, in the default configuration.
 
 **What an operator sees when the check fails.** `systemctl restart` (or `deploy.sh`, or the
 gate) exits non-zero with `Job for grid-odin.service failed because the control process exited
 with error code.` `systemctl status grid-odin` shows the failed `relay-ready.sh` control
 process, and `journalctl -u grid-odin -n 40` carries one `relay-ready:` line saying which of the
-three things went wrong, above the relay's own last twenty lines:
+following went wrong, above the relay's own last twenty lines:
 - `the relay exited during start: it read /srv/grid/grid.env and refused it` — the fail-closed
   case. The refusal itself (`VariantError: unknown variant 'v2-tesre'`, `MIND_PROMPT_AB_SPLIT=1.0
   is out of range`, …) is in the lines printed above it. Fix `grid.env` and restart. When the
   weekly gate provoked it, the gate has already put `grid.env` back and restarted onto the
   restored values, and reported `flip_incomplete` with exit 3.
 - `the relay is still alive after 60s but has not logged 'watching'` — it is stuck before that
-  point, almost always retrying a NATS connect. If the bus is merely slow, raise
-  `RELAY_READY_TIMEOUT_S` (an environment override, default 60; `TimeoutStartSec=120` is the
-  ceiling above it). `Restart=always` keeps retrying in the background either way, so the relay
-  still comes up on its own once the bus does.
+  point, almost always retrying a NATS connect (the relay's own backoff is 1, 2, 4, 8, 16, 32 s,
+  so 60 s allows about six attempts). **What this does to the host during a long bus outage:** an
+  `ExecStartPost` failure makes systemd fail and *stop* the unit, so the relay is killed, not left
+  waiting. `Restart=always` then starts it again after `RestartSec=10`, and the next start runs
+  the probe again — a roughly 70 s kill-and-retry cycle for as long as the bus is down, which
+  never trips `StartLimitIntervalSec=300`/`StartLimitBurst=10`, so the relay does come back on its
+  own once the bus returns. It is not sitting patiently in its own backoff: each cycle discards
+  that backoff and any in-flight ask. To raise the deadline, use a drop-in — it is read from the
+  unit's environment, so `export` will not reach it:
+  ```bash
+  sudo systemctl edit grid-odin.service      # [Service]
+                                             # Environment=RELAY_READY_TIMEOUT_S=110
+  ```
+  `TimeoutStartSec=120` in the unit is the ceiling above whatever is set there; raise it too if
+  you go past it. `RELAY_READY_UNIT` and `RELAY_READY_PYTHON` are set the same way.
 - `the relay came up on a configuration this unit did not hand it` — the process answering is
-  not serving `/srv/grid/grid.env`. Expect this only after an edit that raced a restart.
+  not serving `/srv/grid/grid.env`. The message names the exact line it expected. Expect this
+  only after an edit that raced a restart.
+- `the relay logged that it was watching the queue and then exited before this check finished` —
+  it started cleanly and died immediately afterwards. The reachable case is the bus dropping on
+  the first poll (`nats gave up: …; exiting for systemd to restart`, exit 75).
+- `MIND_PROMPT_VARIANT is blank and the registry default could not be resolved` — the probe could
+  not read the prompt registry, so it has no id to compare against. The relay's own start fails on
+  the same registry; the Python error is on the same line. Run the loader one-liner from §6.
 
 Receipts (acceptance criteria, spec §12):
 1. `journalctl -u grid-bridge -f` shows no `dropped` lines; from the operator seat, `kannaka swarm tail --subject 'GRID.>'` (or the nats app's capture) shows `GRID.colony-one.event.epoch.started` then `.state` every 60 s.
@@ -407,6 +432,26 @@ starts, the moment the first leg closed)` — the interval in which both splits 
 it comes out the same whichever command was typed first. Rows answered before the second split
 began, or after the first leg closed, are not part of the design and are excluded, as is any row
 that names only one of the two labels.
+
+**Run the two legs in one sitting, on the same Sunday.** The timer runs the model leg only, so
+the prompt leg is a hand-typed command and nothing makes you type it. The leg judged *first* is
+tallied with **no upper bound** (`factorial_until_ts: null`) — its window ends wherever that
+command happened to run — and the second leg is bounded at the first leg's close. Back to back,
+those are the same instant and both legs are tallied over the same interval. Left for later they
+are not: the second leg's split keeps taking its share of live traffic in the meantime, and every
+one of those rows falls after the first leg's close, so they are outside the factorial window and
+decide nothing. You are spending the colony's traffic on an experiment that has already stopped
+counting it.
+
+Three things then happen to a leg left running, in the order you will meet them:
+1. The nightly `ab --check` applies the stuck rule `STUCK_AFTER_S` (48 h) after the start. A leg
+   still open at that point can be closed as stuck — a `held` row, and a **stuck abort is
+   remembered**, so the candidate goes into `lost_tags` and cannot be retested until someone runs
+   `ab --forget <id> --dimension prompt`.
+2. Next Sunday's `release` sees it still splitting and refuses to start anything in either
+   dimension (the one-experiment interlock), so a forgotten leg costs the following week too.
+3. At `MAX_WEEKS` it is held on the two-week cap, with a reason blaming sample size rather than
+   the fact that nobody judged it.
 
 If for some reason a leg cannot be judged factorially — its partner had already closed before it
 started, the other running experiment is a dimension this gate cannot cross, or an `ab_started`
