@@ -97,6 +97,20 @@ def _validate_candidate(dimension: str, name: str) -> None:
                      "to write a name the relay may refuse at boot")
 
 
+def _refuse_given_model_candidate(dimension: str, candidate: str | None) -> None:
+    """The model dimension discovers its own candidate; a given one is refused, not ignored.
+
+    One function, two callers, because the rule and its wording must not drift: `release` refuses
+    it at the top of the Sunday run (an A/B week returns long before the start path, so a guard
+    down there would ignore the argument in exactly the case an operator is most likely to have
+    got wrong), and `main` refuses it before it consults the ledger at all -- whether an argument
+    is legal cannot depend on what some other experiment happens to be doing.
+    """
+    if dimension == UNSALTED_DIMENSION and candidate is not None:
+        raise ValueError("the model dimension discovers its own candidate from Rogue's promotion "
+                         f"state; refusing to silently ignore the given {candidate!r}")
+
+
 @dataclass(frozen=True)
 class WeeklyConfig:
     debain2_host: str
@@ -530,6 +544,49 @@ def ab_state(versions: Versions, *, dimension: str = UNSALTED_DIMENSION) -> dict
             "weeks": weeks, "started_row": started}
 
 
+def _blocking_experiments(cfg: WeeklyConfig, versions: Versions, dimension: str) -> list[tuple[str, str]]:
+    """Every OTHER dimension splitting live traffic right now, as (dimension, what is running).
+
+    The interlock's evidence. Two experiments splitting at once do not merely crowd each other:
+    a model verdict collected while a prompt A/B is running was measured across two different
+    wordings, and a prompt verdict collected during a model A/B across two different sets of
+    weights. Either is recorded as BINDING -- it flips the alias, or blacklists the loser for
+    good -- so a confounded week is not a slow week, it is a confident wrong answer written into
+    an append-only file.
+
+    TWO sources, and the second is not a nicety. `ab_state` reads the ledger, and an A/B started
+    the spec-§7 way -- by editing grid.env and restarting the relay -- has no `ab_started` row by
+    construction. That state is first-class everywhere else in this module (`_env_ab_view`,
+    `ENV_AB_NOTE`, `ab --abort`'s N2 branch, and the reconciler's hand-start exemption, which
+    exists precisely so the nightly leaves one alone), and it has genuinely occurred on Skywave
+    -- see deploy/receipts/receipts-ab-20260907T142020Z. An interlock blind to it would let the
+    gate start a second split on top of a live one, which is the whole failure it exists to stop.
+    The env line is the same read `ab --abort` and `_ab_view` already do.
+
+    The two cases are named apart in the reason. "hand-started: no ledger row" tells the operator
+    that `ab --abort` on that dimension will clear it and that no Sunday will ever judge it,
+    which is a different next action from waiting out a tracked A/B.
+    """
+    open_elsewhere = []
+    for other in sorted(DIMENSIONS):
+        if other == dimension:
+            continue
+        state = ab_state(versions, dimension=other)
+        if state is not None:
+            open_elsewhere.append((other, str(state["candidate"])))
+            continue
+        env_candidate = _env_get(cfg.grid_env, _dimension_env(other)["candidate"])
+        if env_candidate:
+            open_elsewhere.append((other, f"{env_candidate}, hand-started: no ledger row"))
+    return open_elsewhere
+
+
+def _interlock_reason(blocking: list[tuple[str, str]], dimension: str) -> str:
+    """One wording for the refusal, shared by `release` and the CLI so the two cannot drift."""
+    return ("; ".join(f"{d} A/B already running ({c})" for d, c in blocking)
+            + f"; refusing to start a {dimension} experiment whose verdict it would confound")
+
+
 def lost_tags(versions: Versions, *, dimension: str = UNSALTED_DIMENSION) -> set[str]:
     """A tag is lost iff its most recent lost/stuck/inconclusive-at-max row comes after
     its most recent operator-forget `unchanged` row (spec §8): forgetting makes it
@@ -789,9 +846,7 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
     # A/B week returns long before that path, so a guard placed there would ignore the argument
     # in exactly the case the operator is most likely to be confused about. (The mirror guard --
     # a non-model dimension REQUIRING one -- has to stay below, because a judging week needs none.)
-    if dimension == UNSALTED_DIMENSION and candidate is not None:
-        raise ValueError("the model dimension discovers its own candidate from Rogue's promotion "
-                         f"state; refusing to silently ignore the given {candidate!r}")
+    _refuse_given_model_candidate(dimension, candidate)
     week = week or _iso_week()
     versions = Versions(cfg.releases_dir / "versions.jsonl")
     last = _last_released(versions, dimension=dimension)
@@ -920,6 +975,20 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
         cand = {"tag": candidate, "run": "", "rogue_ts": 0.0, "manifest": {}}
     common = dict(week=week, base=(cand or {}).get("manifest", {}).get("base", ""), run=(cand or {}).get("run", ""),
                   grid_examples={}, verdict_window=_window(cfg.verdicts_dir), rogue_ledger_ts=(cand or {}).get("rogue_ts", 0.0))
+    # THE INTERLOCK, at the point the gate is about to start an experiment rather than judge one:
+    # everything above this line either returned an A/B week's binding verdict or resolved a
+    # challenger, and `state is None` up there already established that this dimension has no A/B
+    # of its own. `main` refuses this too, and must -- the CLI's candidate-less case has to become
+    # a recorded row rather than the raise above, which is a decision only the argument layer can
+    # make. This copy is the guard for every OTHER caller, the same reason `start_ab` keeps its own
+    # copy of the equal-arms refusal and `_validate_candidate` is checked twice.
+    blocking = _blocking_experiments(cfg, versions, dimension)
+    if blocking:
+        row = release_row(decision="unchanged", dimension=dimension, version=(cand or {}).get("tag"),
+                          previous=released, adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
+                          evals=_advisory_evals(cfg, dimension), spend_usd=0.0,
+                          reason=_interlock_reason(blocking, dimension), **common)
+        return _ledger(versions, row, dry_run=dry_run)
     if cand is None or cand["tag"] == released:
         decision, reason = decide(candidate=(cand or {}).get("tag"), released=released, identity=True, validity=True)
         row = release_row(decision=decision, dimension=dimension, version=(cand or {}).get("tag"), previous=released,
@@ -1203,6 +1272,23 @@ def rollback(cfg: WeeklyConfig, remote, *, to: str | None = None, local_run, dry
         target = next((r for r in model_rows if r["decision"] == "released" and r["version"] == to), None)
     if target is None:
         raise SystemExit(f"{to or 'the previous release'} was never released; refusing")
+    # Deliberately NOT interlocked. This is the emergency lever, and refusing it because an
+    # experiment is running would trade a recoverable confound for an unrecoverable outage; unlike
+    # `release` it writes no binding colony verdict of its own -- the confounded verdict is NEXT
+    # Sunday's, which the operator can still pre-empt with `ab --abort`. But the fact that a week
+    # was confounded must not survive only in whoever was at the keyboard: swapping the weights
+    # under a running prompt A/B invalidates every proposal that arm has produced, and the ledger
+    # is the only place a reader will look for that months later. Recorded, and warned about now.
+    #
+    # Read BEFORE the flip, which changes what the env says, and spliced BEFORE the outcome:
+    # D5's exit-code contract keys on the reason ENDING in ": flip_failed", so anything appended
+    # after it would silently turn a rollback that did not roll back into exit 0.
+    blocking = _blocking_experiments(cfg, versions, UNSALTED_DIMENSION)
+    for d, what in blocking:
+        log.warning("rollback with a %s A/B open (%s): its arms have been answered by two different "
+                    "models and its verdict is confounded; `grid.weekly ab --abort --dimension %s`",
+                    d, what, d)
+    confound = "".join(f"; {d} A/B {what} was open and is now confounded" for d, what in blocking)
     # I1: only a running A/B needs ending -- otherwise this doubles the relay restart
     # and appends a spurious empty MIND_LLM_CANDIDATE= line on every rollback.
     if _env_get(cfg.grid_env, "MIND_LLM_CANDIDATE"):
@@ -1213,7 +1299,8 @@ def rollback(cfg: WeeklyConfig, remote, *, to: str | None = None, local_run, dry
                       version=target["version"], previous=last["version"], base=target.get("base", ""), run=target.get("run", ""),
                       adapter_sha256=target.get("adapter_sha256", ""), gguf_sha256=target.get("gguf_sha256", ""),
                       set_manifest_sha256=target.get("set_manifest_sha256", ""), grid_examples={}, verdict_window=_window(cfg.verdicts_dir),
-                      evals={}, spend_usd=0.0, rogue_ledger_ts=0.0, reason=f"rollback from {last['version']}: {outcome}")
+                      evals={}, spend_usd=0.0, rogue_ledger_ts=0.0,
+                      reason=f"rollback from {last['version']}{confound}: {outcome}")
     return _ledger(versions, row, dry_run=dry_run)
 
 
@@ -1285,26 +1372,6 @@ def _ab_view(cfg: WeeklyConfig, versions: Versions, dimension: str) -> dict | No
     return {**state, "arms": arms}
 
 
-def _blocking_experiments(versions: Versions, dimension: str) -> list[tuple[str, str]]:
-    """Every OTHER dimension with an A/B open right now, as (dimension, candidate).
-
-    The interlock's evidence. Two experiments splitting live traffic at once do not merely
-    crowd each other: a model verdict collected while a prompt A/B is running was measured
-    across two different wordings, and a prompt verdict collected during a model A/B across
-    two different sets of weights. Either is recorded as BINDING -- it flips the alias, or
-    blacklists the loser for good -- so a confounded week is not a slow week, it is a
-    confident wrong answer written into an append-only file.
-    """
-    open_elsewhere = []
-    for other in sorted(DIMENSIONS):
-        if other == dimension:
-            continue
-        state = ab_state(versions, dimension=other)
-        if state is not None:
-            open_elsewhere.append((other, str(state["candidate"])))
-    return open_elsewhere
-
-
 def _exit_code(row: dict) -> int:
     """N6: one contract for `release`, `ab --check`, `ab --abort` and `rollback`. 3 means the
     verb did not do what it says: grid.env and the live relay disagree and a human must restart
@@ -1350,13 +1417,27 @@ def main(argv: list[str] | None = None) -> int:
     remote = Remote(cfg.debain2_host, dry_run=a.dry_run, log=lambda s: log.info("%s", s))
     if a.verb == "status":
         v = Versions(cfg.releases_dir / "versions.jsonl")
-        # C1: `released` here sits beside `candidate`, which is find_candidate's MODEL tag, so it
-        # has to be a model release too. Read unfiltered it would answer a question about the
-        # model with a prompt variant id. Every verb in this CLI is model-scoped until the
-        # dimension is threaded through it; each one now says so rather than assuming it.
-        print(json.dumps({"released": (_last_released(v, dimension=UNSALTED_DIMENSION) or {}).get("version"),
-                          "rows": len(v.rows()), "verify": v.verify(),
-                          "candidate": find_candidate(remote, cfg), "ab": ab_state(v)}, indent=1, default=str))
+        out = {"rows": len(v.rows()), "verify": v.verify()}
+        if a.dimension:
+            # Scoped. Silently ignoring the flag would be worse than refusing it: `status
+            # --dimension prompt` printing the model's answers is a wrong answer to a precise
+            # question. `candidate` is find_candidate's Rogue promotion state -- a MODEL fact,
+            # and no other dimension has one -- so it is left off rather than faked.
+            out["released"] = (_last_released(v, dimension=a.dimension) or {}).get("version")
+            if a.dimension == UNSALTED_DIMENSION:
+                out["candidate"] = find_candidate(remote, cfg)
+            out["ab"] = _ab_view(cfg, v, a.dimension)
+        else:
+            # C1: bare `status` answers "what is live", and `released` sits beside `candidate`,
+            # which is a model tag -- read unfiltered it would answer a question about the model
+            # with a prompt variant id, so both stay model facts and say so.
+            out["released"] = (_last_released(v, dimension=UNSALTED_DIMENSION) or {}).get("version")
+            out["candidate"] = find_candidate(remote, cfg)
+            # ...but the A/B block is every dimension, mirroring bare `ab`. Model-only, this is
+            # the one command an operator runs to ask what is going on and it would not mention a
+            # prompt experiment splitting live traffic at all.
+            out["ab"] = {d: _ab_view(cfg, v, d) for d in sorted(DIMENSIONS)}
+        print(json.dumps(out, indent=1, default=str))
         return 0
     local_run = (lambda cmd: (log.info("[dry-run] %s", " ".join(cmd)) or 0)) if a.dry_run else _local_run
     if a.verb == "ab":
@@ -1441,34 +1522,43 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(row, default=str))
         return _exit_code(row)          # N6: same contract as release and --check
     versions = Versions(cfg.releases_dir / "versions.jsonl")
+    # ARGUMENTS BEFORE THE LEDGER. Whether a candidate NAME is one this dimension can act on is a
+    # fact about the argument, and must not depend on what some other experiment happens to be
+    # doing: checked after the interlock, `release --candidate <a tag Rogue never promoted>` and
+    # `release --dimension prompt --candidate <typo>` stop being usage errors and become exit-0
+    # `unchanged` rows carrying that fabricated version into an append-only, hash-chained file,
+    # on exactly the weeks an operator is most likely to have typed something wrong.
+    #
+    # The PRESENCE rule stays below the interlock, and only there: a week the interlock refuses
+    # starts nothing, so it needs no candidate -- and the brief's contract is that such a week is
+    # a recorded row at exit 0, not a usage error.
+    try:
+        _refuse_given_model_candidate(dimension, a.candidate)
+        if a.candidate is not None:
+            # Before the argument is accepted, and again in start_ab before it is written.
+            _validate_candidate(dimension, a.candidate)
+    except ValueError as e:
+        ap.error(str(e))
     # The interlock, and only on a Sunday that would START one: a dimension with its own A/B
     # already open is being JUDGED today, and refusing that would leave both experiments running
     # forever with nothing able to close either.
-    blocking = (_blocking_experiments(versions, dimension)
+    blocking = (_blocking_experiments(cfg, versions, dimension)
                 if ab_state(versions, dimension=dimension) is None else [])
     if blocking:
         # A RECORDED row, not a printed message. `unchanged` is the ledger's word for "the gate
         # ran and moved nothing", and without the row a Sunday that did nothing is indistinguishable
         # from a Sunday the timer never fired -- which is exactly the question an operator asks
         # when they come back to an experiment that never started.
-        why = ("; ".join(f"{d} A/B already running ({c})" for d, c in blocking)
-               + f"; refusing to start a {dimension} experiment whose verdict it would confound")
         last = _last_released(versions, dimension=dimension)
         row = _ledger(versions, release_row(
             week=a.week or _iso_week(), decision="unchanged", dimension=dimension, version=a.candidate,
             previous=last["version"] if last else None, base="", run="", adapter_sha256="", gguf_sha256="",
             set_manifest_sha256="", grid_examples={}, verdict_window=_window(cfg.verdicts_dir),
-            evals=_advisory_evals(cfg, dimension), spend_usd=0.0, rogue_ledger_ts=0.0, reason=why),
-            dry_run=a.dry_run)
+            evals=_advisory_evals(cfg, dimension), spend_usd=0.0, rogue_ledger_ts=0.0,
+            reason=_interlock_reason(blocking, dimension)), dry_run=a.dry_run)
     else:
-        if dimension != UNSALTED_DIMENSION:
-            if not a.candidate:
-                ap.error(f"a {dimension} release needs --candidate; nothing discovers one")
-            try:
-                # Before the argument is accepted, and again in start_ab before it is written.
-                _validate_candidate(dimension, a.candidate)
-            except ValueError as e:
-                ap.error(str(e))
+        if dimension != UNSALTED_DIMENSION and not a.candidate:
+            ap.error(f"a {dimension} release needs --candidate; nothing discovers one")
         # Model-only: the key exists to authenticate the identity and validity PROBES at the
         # gateway, and those measure weights. A prompt release runs none of them, so a host
         # whose colony key is missing must not die reading a file this run never uses.

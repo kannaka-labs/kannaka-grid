@@ -2071,6 +2071,13 @@ def test_a_failure_in_one_dimension_is_not_masked_by_a_success_in_another(tmp_pa
     # -- the unit would exit 0 and the model's still-splitting relay would be announced to
     # nobody, every night. Mutation: `code = _exit_code(row)` instead of the running max -> 0.
     import grid.weekly as weekly_mod
+    from grid.odin import DIMENSIONS
+    # The construction below is "the FIRST dimension reconciled fails, the SECOND succeeds" --
+    # that is what makes last-wins distinguishable from `max`. It depends on the loop's order,
+    # which is `sorted(DIMENSIONS)`, so pin that here rather than leaving it to how the names
+    # happen to sort: a dimension added later that sorts before "model" would silently reorder
+    # the run and this test would quietly stop testing what its comment says.
+    assert sorted(DIMENSIONS)[:2] == ["model", "prompt"]
     grid_env = _ab_cli_env(tmp_path, monkeypatch,
                            "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_CANDIDATE=kannaka-brain-v4\n"
                            "MIND_AB_SPLIT=0.2\nMIND_PROMPT_VARIANT=v1-sandbox\n"
@@ -2196,3 +2203,193 @@ def test_rollback_refuses_a_dimension_it_cannot_roll_back(tmp_path, monkeypatch)
     with pytest.raises(SystemExit, match="no prompt rollback"):
         weekly_mod.main(["rollback", "--dimension", "prompt"])
     assert grid_env.read_text() == before
+
+
+# --- Task 5, fix round 1: the hand-started split, argument order, and the deeper guard ---------
+
+async def test_the_interlock_is_not_blind_to_a_hand_started_split(tmp_path, monkeypatch, capsys):
+    # IMPORTANT 1. `ab_state` reads the LEDGER, and a spec-7 hand-started A/B -- edit grid.env,
+    # restart the relay -- has no `ab_started` row by construction. Skywave has actually been in
+    # that state (deploy/receipts/receipts-ab-20260907T142020Z), and the reconciler has a whole
+    # exemption branch for it. An interlock that consults only the ledger therefore starts a
+    # SECOND live split on top of the first, which is the one thing it exists to stop.
+    #
+    # Mutation: drop the `_env_get(... ["candidate"])` fallback in `_blocking_experiments` ->
+    # `ab_started`, MIND_PROMPT_CANDIDATE=v2-terse written, and `boom` fires.
+    from grid.weekly import main
+    _prompt_registry(monkeypatch)
+    cfg = _cfg(tmp_path)
+    cfg.grid_env.write_text("MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_CANDIDATE=kannaka-brain-v4\n"
+                            "MIND_AB_SPLIT=0.2\nMIND_PROMPT_VARIANT=v1-sandbox\n")   # no ledger row at all
+    before = cfg.grid_env.read_text()
+    async def never(p): raise AssertionError("the probes must not run for a refused week")
+    boom = lambda c: pytest.fail("the relay was restarted to start a second live split")
+    row = await release(cfg, FakeRemote({}), ask_factory=lambda m: never, local_run=boom,
+                        week="W1", dimension="prompt", candidate="v2-terse")
+    assert row["decision"] == "unchanged" and row["dimension"] == "prompt"
+    # The two cases are named apart, because they need different next actions: a hand-started
+    # split is cleared with `ab --abort` and no Sunday will ever judge it. Mutation: report it
+    # with the tracked wording -> the operator waits for a verdict that cannot come.
+    assert row["reason"] == ("model A/B already running (kannaka-brain-v4, hand-started: no ledger "
+                             "row); refusing to start a prompt experiment whose verdict it would confound")
+    assert cfg.grid_env.read_text() == before
+
+    # ...and the same through the command line, which is where the Sunday timer enters.
+    _release_cli_env(tmp_path, monkeypatch, before)
+    assert main(["release", "--dimension", "prompt", "--candidate", "v2-terse"]) == 0
+    assert "hand-started: no ledger row" in _last_row(tmp_path)["reason"]
+    capsys.readouterr()
+
+
+async def test_release_itself_refuses_a_second_experiment_not_only_the_cli(tmp_path, monkeypatch):
+    # The interlock now lives in BOTH places, for the reason `start_ab` keeps its own copy of the
+    # equal-arms refusal: the command line is not the only caller, and the invariant belongs next
+    # to the code that acts on it. The CLI copy is still required -- only the argument layer can
+    # turn the candidate-less case into a recorded row at exit 0 -- so neither replaces the other.
+    #
+    # Mutation: drop the `_blocking_experiments` block in `release()` -> "ab_started",
+    # MIND_PROMPT_CANDIDATE written, and `boom` fires.
+    _prompt_registry(monkeypatch)
+    cfg = _cfg(tmp_path)
+    cfg.grid_env.write_text("MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_PROMPT_VARIANT=v1-sandbox\n")
+    before = cfg.grid_env.read_text()
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v4", decision="ab_started",
+                 incumbent="kannaka-brain-v3")
+    async def never(p): raise AssertionError("the probes must not run for a refused week")
+    boom = lambda c: pytest.fail("the relay was restarted to start a second experiment")
+    row = await release(cfg, FakeRemote({}), ask_factory=lambda m: never, local_run=boom,
+                        week="W1", dimension="prompt", candidate="v2-terse")
+    assert row["decision"] == "unchanged"
+    assert row["reason"] == ("model A/B already running (kannaka-brain-v4); refusing to start a "
+                             "prompt experiment whose verdict it would confound")
+    assert cfg.grid_env.read_text() == before
+    # ...and it still never refuses a JUDGING week: the pre-existing prompt A/B week tests all
+    # run with a model release in the same ledger and must keep reaching their verdict.
+    assert row["version"] == "v2-terse" and row["evals"] == {}      # M5: no model-keyed advisory
+
+
+def test_an_illegal_candidate_is_refused_whatever_the_ledger_says(tmp_path, monkeypatch, capsys):
+    # IMPORTANT 2. The interlock used to run first, so an argument's validity depended on whether
+    # some unrelated experiment happened to be open: with one running, a tag Rogue never promoted
+    # -- or a variant id no registry holds -- was ledgered as an `unchanged` row carrying that
+    # fabricated version, at exit 0, into an append-only hash-chained file.
+    #
+    # Mutation: move the `_refuse_given_model_candidate` / `_validate_candidate` block back below
+    # the interlock branch -> both calls below return 0 and write a row.
+    import grid.weekly as weekly_mod
+    from grid.versions import Versions
+    from grid.weekly import main
+    _prompt_registry(monkeypatch)
+    _release_cli_env(tmp_path, monkeypatch,
+                     "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_PROMPT_VARIANT=v1-sandbox\n"
+                     "MIND_PROMPT_CANDIDATE=v2-terse\nMIND_PROMPT_AB_SPLIT=0.2\n")
+    _seed_ab_row(tmp_path, dimension="prompt", version="v2-terse", decision="ab_started",
+                 incumbent="v1-sandbox")               # ...so the interlock WOULD fire
+    monkeypatch.setattr(weekly_mod, "find_candidate",
+                        lambda remote, cfg: pytest.fail("Rogue was read for a rejected argument"))
+    rows_before = len(Versions(tmp_path / "releases" / "versions.jsonl").rows())
+
+    # A model candidate is DISCOVERED, never given, and the model dimension is interlocked by the
+    # open prompt A/B -- so before this fix the given tag became the `version` of an exit-0 row.
+    with pytest.raises(SystemExit) as e:
+        main(["release", "--candidate", "kannaka-brain-v9"])
+    assert e.value.code == 2
+
+    # And the mirror: a prompt id no registry holds, with the model dimension interlocked.
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v4", decision="ab_started",
+                 incumbent="kannaka-brain-v3")
+    with pytest.raises(SystemExit) as e:
+        main(["release", "--dimension", "prompt", "--candidate", "v2-tesre"])
+    assert e.value.code == 2
+
+    # Neither refusal left a row, and neither invented a version. `rows_before` is counted after
+    # the seeds because `_seed_ab_row` writes through the real ledger.
+    rows = Versions(tmp_path / "releases" / "versions.jsonl").rows()
+    assert len(rows) == rows_before + 1                      # only the model ab_started seed above
+    assert not [r for r in rows if r["version"] in ("kannaka-brain-v9", "v2-tesre")]
+    capsys.readouterr()
+
+
+def test_the_candidate_check_refuses_a_dimension_it_has_no_rule_for(tmp_path, monkeypatch):
+    # The fail-closed branch of `_validate_candidate`, claimed as a design property in round 1
+    # with nothing behind it. Unreachable today -- both known dimensions have a rule -- but it is
+    # exactly the line that gets deleted or inverted the day a third dimension is added, which is
+    # the day it starts mattering: an unverified name in grid.env is a relay that will not boot.
+    # Mutation: `return` instead of the final `raise` -> neither refusal below happens, and
+    # start_ab writes MIND_ADAPTER_CANDIDATE and restarts the relay onto it.
+    import grid.weekly as weekly_mod
+    monkeypatch.setattr(weekly_mod, "DIMENSIONS", frozenset({"model", "prompt", "adapter"}))
+    monkeypatch.setitem(weekly_mod._DIMENSION_ENV, "adapter",
+                        {"live": "MIND_ADAPTER", "candidate": "MIND_ADAPTER_CANDIDATE",
+                         "split": "MIND_ADAPTER_AB_SPLIT"})
+    with pytest.raises(ValueError, match="no candidate check for dimension 'adapter'"):
+        weekly_mod._validate_candidate("adapter", "whatever")
+    cfg = _cfg(tmp_path)
+    before = cfg.grid_env.read_text()
+    with pytest.raises(ValueError, match="no candidate check for dimension 'adapter'"):
+        weekly_mod.start_ab(cfg, candidate="whatever", incumbent="something-else", dimension="adapter",
+                            local_run=lambda c: pytest.fail("the relay was restarted"))
+    assert cfg.grid_env.read_text() == before
+
+
+def test_rollback_records_the_experiments_it_confounded(tmp_path, monkeypatch):
+    # Rollback stays UNINTERLOCKED on purpose: it is the emergency lever, it writes no binding
+    # colony verdict, and refusing it because an experiment is running would trade a recoverable
+    # confound for an unrecoverable outage. But swapping the weights under a running prompt A/B
+    # invalidates every proposal that arm has produced, and the ledger is the only place a reader
+    # will look for that months later. Mutation: drop `confound` from the reason -> the fact that
+    # a week was confounded survives only in whoever was at the keyboard.
+    from grid.versions import Versions, release_row
+    from grid.weekly import rollback
+    cfg = _cfg(tmp_path)
+    cfg.grid_env.write_text("MIND_MODEL_ALIAS=kannaka-brain-v4\nMIND_PROMPT_VARIANT=v1-sandbox\n"
+                            "MIND_PROMPT_CANDIDATE=v2-terse\nMIND_PROMPT_AB_SPLIT=0.2\n")
+    vs = Versions(cfg.releases_dir / "versions.jsonl")
+    kw = dict(base="b", run="r", adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
+              grid_examples={}, verdict_window={}, evals={}, spend_usd=0, rogue_ledger_ts=0, reason="")
+    vs.append(release_row(week="W1", decision="released", version="kannaka-brain-v3", previous=None, **kw))
+    vs.append(release_row(week="W2", decision="released", version="kannaka-brain-v4",
+                          previous="kannaka-brain-v3", **kw))
+    _seed_ab_row(tmp_path, dimension="prompt", version="v2-terse", decision="ab_started",
+                 incumbent="v1-sandbox")
+    row = rollback(cfg, FakeRemote({}), local_run=lambda c: 0)
+    assert row["decision"] == "rolled_back"
+    assert row["reason"] == ("rollback from kannaka-brain-v4; prompt A/B v2-terse was open and is "
+                             "now confounded: ok")
+
+    # D5: the exit-code contract keys on the reason ENDING in ": flip_failed", so the note must be
+    # spliced BEFORE the outcome, never appended after it. Mutation: append the note at the end
+    # instead -> a rollback that did not roll back exits 0 and the operator is never summoned.
+    r = FakeRemote({}, fail={"ollama cp"})
+    row = rollback(cfg, r, local_run=lambda c: 0)
+    assert row["reason"].endswith(": flip_failed") and "now confounded" in row["reason"]
+    from grid.weekly import _exit_code
+    assert _exit_code(row) == 3
+
+
+def test_status_scopes_to_its_dimension_and_never_hides_a_prompt_experiment(tmp_path, monkeypatch, capsys):
+    # `--dimension` is a parser-wide argument, so `status --dimension prompt` parsed, exited 0 and
+    # printed the MODEL's answers -- a wrong answer to a precise question -- and bare `status`,
+    # the one command an operator runs to ask what is going on, did not mention a prompt A/B
+    # splitting live traffic at all. Mutation: restore `"ab": ab_state(v)` -> the prompt entry is
+    # gone from the bare form and `--dimension prompt` reports the model's A/B as its own.
+    import grid.weekly as weekly_mod
+    from grid.weekly import main
+    _ab_cli_env(tmp_path, monkeypatch, "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_PROMPT_VARIANT=v1-sandbox\n")
+    monkeypatch.setattr(weekly_mod, "find_candidate", lambda remote, cfg: None)   # no ssh in a test
+    _seed_started_ab(tmp_path, 1_000_000_000)                      # a running MODEL A/B
+    _seed_ab_row(tmp_path, dimension="prompt", version="v2-terse", decision="ab_started",
+                 incumbent="v1-sandbox")                           # ...and a running PROMPT one
+    assert main(["status"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["released"] is None and "candidate" in out          # both still MODEL facts
+    assert out["ab"]["model"]["candidate"] == "kannaka-brain-v4"
+    assert out["ab"]["prompt"]["candidate"] == "v2-terse"
+
+    assert main(["status", "--dimension", "prompt"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ab"]["candidate"] == "v2-terse"
+    # `candidate` is Rogue's promotion state, a model fact no other dimension has: left off
+    # rather than faked. Mutation: report it regardless of dimension -> a model tag on a prompt
+    # answer, which is the falsehood every dimension filter in this module exists to prevent.
+    assert "candidate" not in out

@@ -218,16 +218,29 @@ To run a hand-started A/B test: set `MIND_LLM_CANDIDATE=<model-tag>` and `MIND_A
 `/srv/grid/grid.env` (the default split is 0.2 = 20% candidate, 80% incumbent), then restart
 `grid-odin.service` to begin routing requests. Monitor the relay's proposal log with `journalctl -u grid-odin`
 and check that both arms are represented: `grep -o 'model_alias":"[^"]*' <proposal-log>` shows both the
-incumbent and candidate labels. Run `python -m grid.weekly ab` from `/srv/grid/kannaka-grid` to print both
-arms' identities and their verdict counts so far. When done, run `python -m grid.weekly ab --abort` to
-clear the candidate and discard the A/B test, then restart `grid-odin.service`.
+incumbent and candidate labels. Run `python -m grid.weekly ab --dimension model` from
+`/srv/grid/kannaka-grid` to print both arms' identities and their verdict counts so far (bare
+`ab` prints the same block one level down, under `.ab.model`, alongside every other dimension).
+When done, run `python -m grid.weekly ab --abort` to clear the candidate and discard the A/B
+test, then restart `grid-odin.service`.
+
+**Dimensions.** The gate can run an A/B on which MODEL answers or on which PROMPT wording is
+used, and `--dimension {model,prompt}` selects which. It defaults to `model` on `release`,
+`rollback`, `ab --abort` and `ab --forget`; omitting it on `ab` and `ab --check` means *every*
+dimension (the display prints one entry per dimension, and the check reconciles each in turn and
+exits with the loudest code any of them produced). Only one experiment may run at a time: a
+`release` that would start one while another dimension is splitting — whether that split is in
+the ledger or hand-started in `grid.env` — records `unchanged: <other> A/B already running (…);
+refusing to start a … experiment whose verdict it would confound` and exits 0.
 
 Manual commands from `/srv/grid/kannaka-grid`:
 ```bash
-/srv/grid/venv/bin/python -m grid.weekly ab               # show both arms' identities and verdict counts
-/srv/grid/venv/bin/python -m grid.weekly ab --check       # nightly reconcile + stuck check; exit codes below
-/srv/grid/venv/bin/python -m grid.weekly ab --abort       # discard an in-flight A/B test
-/srv/grid/venv/bin/python -m grid.weekly ab --forget <tag>  # append a row lifting the block on a tag
+/srv/grid/venv/bin/python -m grid.weekly ab                      # every dimension, keyed by dimension
+/srv/grid/venv/bin/python -m grid.weekly ab --dimension model    # just the model A/B's arms and counts
+/srv/grid/venv/bin/python -m grid.weekly ab --check              # nightly reconcile + stuck check, all dimensions
+/srv/grid/venv/bin/python -m grid.weekly ab --abort              # discard an in-flight A/B test (model)
+/srv/grid/venv/bin/python -m grid.weekly ab --forget <tag>       # append a row lifting the block on a tag
+/srv/grid/venv/bin/python -m grid.weekly ab --forget <id> --dimension prompt   # ...the prompt dimension's memory
 ```
 `ab` also reports an A/B that exists only in `grid.env` with no ledger row (a hand-started one, as
 above) as `"source": "env"`; its arms then cover all recorded history, since there is no `since_ts`.
