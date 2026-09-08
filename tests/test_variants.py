@@ -340,6 +340,55 @@ def test_load_registry_rejects_non_string_note(tmp_path):
         load_registry(registry_path)
 
 
+def test_load_registry_rejects_a_variant_id_carrying_the_cell_separator(tmp_path):
+    # A factorial cell key is "<model>|<variant>", so an id carrying that character would make a
+    # key two different pairs of arms could spell. `cell_key` refuses it -- but only on the first
+    # factorial Sunday, by which time the loader had accepted "v2|weird", the relay had served
+    # it, and a week of traffic had been logged under it; the refusal then arrived as a raw
+    # ValueError out of `release()`. Refused at LOAD, before any of that.
+    #
+    # Mutation: drop the check in `_load_variant` -> the registry loads and the id is live.
+    from grid.variants import VariantError, load_registry
+    template_path = _write_template(tmp_path, "t.md", "hello {directive}")
+    entry = _valid_entry(template_path, tmp_path)
+    registry_path = _write_registry(tmp_path, default="ok", variants={"ok": entry, "v2|weird": entry})
+    with pytest.raises(VariantError, match=r"may not contain"):
+        load_registry(registry_path)
+    # The message names the character, because "an id may not contain that" is unactionable.
+    with pytest.raises(VariantError, match=r"\|"):
+        load_registry(registry_path)
+
+
+def test_the_refused_character_is_the_one_the_gate_actually_joins_cells_with():
+    # Two modules, one character, and the dependency can only run one way (`grid.weekly` imports
+    # `grid.variants`), so the constant is duplicated. Pinned here so the copies cannot drift:
+    # a separator changed in one place and not the other re-opens exactly the hole above.
+    # Mutation: change either constant -> RED.
+    from grid.variants import CELL_SEP as loader_sep
+    from grid.weekly import CELL_SEP as gate_sep
+    assert loader_sep == gate_sep == "|"
+
+
+def test_load_registry_rejects_a_non_string_default(tmp_path):
+    # `{"default": ["a"]}` reached `default_id not in variants` and raised a raw
+    # `TypeError: unhashable type: 'list'`, which is precisely what this module's docstring
+    # promises cannot escape -- a caller's `except VariantError` misses it, and the relay's
+    # fail-closed loader comes down with a traceback naming neither the file nor the key.
+    #
+    # Mutation: drop the isinstance check -> TypeError, not VariantError, so `pytest.raises`
+    # never sees it. (An unhashable value is the reachable case; a hashable non-string such as
+    # `7` merely fell through to the "not in the registry" message, naming the wrong fault.)
+    from grid.variants import VariantError, load_registry
+    template_path = _write_template(tmp_path, "t.md", "hello {directive}")
+    entry = _valid_entry(template_path, tmp_path)
+    for bad in (["a"], {"a": 1}, 7, None):
+        registry_path = tmp_path / "registry.json"
+        registry_path.write_text(json.dumps({"default": bad, "variants": {"ok": entry}}),
+                                 encoding="utf-8")
+        with pytest.raises(VariantError, match="'default' must be a string"):
+            load_registry(registry_path)
+
+
 # --- the SHIPPED registry, which is what the relay actually serves --------------------------
 
 def test_the_shipped_registry_has_something_to_test_the_default_against():

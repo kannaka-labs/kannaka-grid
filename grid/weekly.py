@@ -22,7 +22,7 @@ from pathlib import Path
 from .odin import DEFER_BIN_REASON_RE, DIMENSIONS, UNSALTED_DIMENSION
 from .proposal_log import ProposalLog, variant_of
 from .remote import Remote, RemoteError
-from .variants import get_variant
+from .variants import VariantError, get_variant
 from .verdicts import GENESIS, Ledger, chain_hash
 from .versions import Versions, decide, dimension_of, release_row
 from .weekly_probe import chat, run_identity, run_validity
@@ -40,6 +40,18 @@ STUCK_AFTER_S = 48 * 3600
 STUCK_INCUMBENT_MIN = 50
 VALIDITY_MIN = 0.5
 VALIDITY_MIN_ANSWERED = 20
+#: `evals[UNRESOLVED] = True` marks a row the gate wrote to SAY something is wrong that it could
+#: not put right, and `_exit_code` is its only reader.
+#:
+#: It exists because the two properties such a row needs are otherwise in conflict. It must not
+#: count toward the week cap and must not be able to blacklist anything, which leaves `unchanged`
+#: as the only decision available (`ab_inconclusive` spends a week; everything else in
+#: `_AB_JUDGING` closes an episode; `held`/`flip_incomplete` re-arm the nightly reconciler into
+#: restarting a live relay for nothing). And `unchanged` is exit 0 -- the reading that made C2
+#: dangerous rather than merely wrong. An EXPLICIT key, never a sniff of the reason prose, for
+#: the reason `lost_tags` gives: the reason is already load-bearing for a prefix match and must
+#: not become load-bearing twice.
+UNRESOLVED = "unresolved"
 POSITIVE_TIERS = ("reproduced", "growing", "enduring", "established")
 EXCLUDED_TIERS = ("preexisting", "unknown", "rejected")
 
@@ -907,9 +919,15 @@ def _episode_span(episode: dict) -> tuple[int, int | None, dict | None]:
 
     The two are different things and answer different questions: `ended_ms` decides whether an
     episode OVERLAPPED this leg, while the judging row is what BOUNDS a leg judged afterwards --
-    and it is handed back whole rather than reduced to a timestamp, because two of its fields do
-    that bounding: its `week` (which judging cycle it belongs to) and its `verdict_window`
-    (the verdict ledger's exact prefix at the instant it was judged).
+    and it is handed back whole rather than reduced to a timestamp, because the bound is read off
+    it in two parts: its `ts`, the instant the partner's numbers were frozen, and its
+    `verdict_window`, the verdict ledger's exact prefix at that instant.
+
+    NOT its `week`. An earlier build used the ISO-week label as a proxy for "the same judging
+    cycle"; that proxy was deleted because the calendar rolls over at Monday 00:00 while a cycle
+    starts Sunday 06:00, so a second leg run the next morning read as a new round and was tallied
+    unbounded. Whether the bound applies is decided by `judgings` counts in `_judge_ab`, and
+    nothing here reads `week` at all.
     """
     state = _episode_state(episode)
     return int(state["since_ts"]), state["ended_ms"], episode.get("judged")
@@ -1044,13 +1062,15 @@ def _partner_bound(versions: Versions, dimension: str, since_ts: int,
     a factorial run.
 
     The row is returned whole because the bound is read off two of its fields, in `_judge_ab`:
-    `week` says whether that verdict belongs to the cycle now being judged (a partner judged LAST
-    Sunday bounds nothing -- it is behind this leg, not ahead of it), and `verdict_window` names
-    the verdict ledger's exact prefix at that instant.
+    `ts`, the instant the partner's numbers were frozen, and `verdict_window`, the verdict
+    ledger's exact prefix at that instant. WHETHER it binds is a separate question, and the
+    answer is not on this row: `_judge_ab` compares the two episodes' `judgings` counts, so a
+    partner judged LAST Sunday bounds nothing because by now this leg has caught it up. The
+    `week` label is not consulted -- it was the deleted ISO-week proxy, and it was wrong.
 
     An ABANDONED episode -- superseded by a later `ab_started` without ever being judged -- is
     still eligible as a partner if it overlapped, because it really was splitting traffic then;
-    but its `judged_ms` is None, so it can never date a window it was never measured over.
+    but its judging row is None, so it can never date a window it was never measured over.
     """
     for episode in reversed(_ab_episodes(versions, dimension)):
         started_ms, ended_ms, judging_row = _episode_span(episode)
@@ -1231,7 +1251,8 @@ def lost_tags(versions: Versions, *, dimension: str = UNSALTED_DIMENSION) -> set
     return {tag for tag, ts in lost_at.items() if ts > forgotten_at.get(tag, float("-inf"))}
 
 
-def _flip_local(cfg: WeeklyConfig, keys: dict[str, str], version: str, *, local_run, dry_run: bool) -> str:
+def _flip_local(cfg: WeeklyConfig, keys: dict[str, str], version: str, *, local_run, dry_run: bool,
+                note: dict | None = None) -> str:
     """Apply a winner whose live value is a grid.env line and nothing else.
 
     The same three steps as `flip`, minus the middle one: set the live value, clear the
@@ -1263,12 +1284,18 @@ def _flip_local(cfg: WeeklyConfig, keys: dict[str, str], version: str, *, local_
     if outcome != "ok":
         _env_restore(cfg.grid_env, keys["live"], before_live)
         _env_restore(cfg.grid_env, keys["candidate"], before_cand)
-        _restart_after_revert(local_run, "the flip")
+        # 3b: `note` is the `colony_ab` block the caller is about to ledger. An out-parameter
+        # rather than a richer return value because `flip`'s two-string outcome is read by
+        # `release` and `rollback` in five branches, and widening it to carry a second, unrelated
+        # fact is how those branches come to disagree about the first.
+        after = _restart_after_revert(local_run, "the flip")
+        if note is not None:
+            note["relay_after_revert"] = after
     return outcome
 
 
 def flip(cfg: WeeklyConfig, remote, version: str, *, dimension: str = UNSALTED_DIMENSION,
-         local_run, dry_run: bool = False) -> str:
+         local_run, dry_run: bool = False, note: dict | None = None) -> str:
     """Spec §7 order: local env, remote tag copy, relay restart.
 
     `dry_run` performs no real mutation: `remote.run` is already a no-op when the Remote
@@ -1279,10 +1306,14 @@ def flip(cfg: WeeklyConfig, remote, version: str, *, dimension: str = UNSALTED_D
     Only the `model` dimension has a remote step at all: a model tag has to be copied onto the
     alias on debain2 and that copy can fail. Every other dimension is a line in grid.env, so it
     goes to `_flip_local`, `remote` is never touched, and `flip_failed` cannot come back.
+
+    `note`, when given, is a dict the local path stamps `relay_after_revert` onto (3b). Only the
+    local path reverts-and-restarts: the model path never restarts the relay on a failed tag copy
+    at all, so there is nothing there for it to answer.
     """
     keys = _dimension_env(dimension)
     if dimension != UNSALTED_DIMENSION:
-        return _flip_local(cfg, keys, version, local_run=local_run, dry_run=dry_run)
+        return _flip_local(cfg, keys, version, local_run=local_run, dry_run=dry_run, note=note)
     before = _env_get(cfg.grid_env, "MIND_MODEL_ALIAS")
     before_cand = _env_get(cfg.grid_env, "MIND_LLM_CANDIDATE")
     if dry_run:
@@ -1328,7 +1359,14 @@ def _restart_relay(local_run) -> str:
     return "flip_incomplete"
 
 
-def _restart_after_revert(local_run, what: str) -> None:
+#: What `_restart_after_revert` answers, as it lands on a ledger row and in a reason. The two
+#: readings are "a human must restart grid-odin" and "the colony's mind is off", and until this
+#: was recorded a reader of versions.jsonl could not tell them apart at all -- the two rows were
+#: byte-identical. The journal carries it; the journal is not the ledger.
+RELAY_DOWN_NOTE = "; the relay did not come back and may be DOWN -- restart grid-odin.service"
+
+
+def _restart_after_revert(local_run, what: str) -> str:
     """Bring the PROCESS back in line with the file that was just put back.
 
     Reverting alone is only half a repair, and the missing half is the dangerous one. By the time
@@ -1342,12 +1380,18 @@ def _restart_after_revert(local_run, what: str) -> None:
     Best effort, and it never changes what the caller reports: the experiment did not start (or
     the flip did not apply) either way, so the outcome stays `flip_incomplete` and the operator
     is still summoned by exit 3. This only decides whether they arrive to a running relay.
+
+    3b: it RETURNS that answer, `"ok"` or `"down"`, instead of throwing it away. The readiness
+    gate made `systemctl restart`'s exit code truthful, which is what makes the answer worth
+    keeping; both callers put it on the row they cause, so `versions.jsonl` alone can tell a
+    revert the relay survived from one that left the colony's mind off.
     """
     if _restart_relay(local_run) == "ok":
         log.info("relay restarted on the values restored after %s", what)
-    else:
-        log.error("relay could not be restarted after reverting %s; grid.env is correct but the "
-                  "unit may be DOWN -- restart grid-odin.service by hand", what)
+        return "ok"
+    log.error("relay could not be restarted after reverting %s; grid.env is correct but the "
+              "unit may be DOWN -- restart grid-odin.service by hand", what)
+    return "down"
 
 
 def start_ab(cfg: WeeklyConfig, *, candidate: str, incumbent: str, dimension: str = UNSALTED_DIMENSION,
@@ -1413,7 +1457,8 @@ def start_ab(cfg: WeeklyConfig, *, candidate: str, incumbent: str, dimension: st
         # I2: the file is right again and the relay is not. systemd was already told to restart,
         # so whatever is (or is not) running came up on the values just reverted away from -- and
         # a candidate odin refuses at boot leaves NOTHING running. Try again on the restored ones.
-        _restart_after_revert(local_run, "the A/B start")
+        # 3b: and record which of those two it was, on the block this call's row carries.
+        block["relay_after_revert"] = _restart_after_revert(local_run, "the A/B start")
     return block, outcome
 
 
@@ -1568,7 +1613,18 @@ def _judge_ab(cfg: WeeklyConfig, versions: Versions, state: dict, dimension: str
         verdict, reason = ab_decide(arms, incumbent=state["incumbent"], candidate=state["candidate"])
         block: dict = {"factorial_judged": False}
         if _is_factorial(state):
-            degraded = degraded or "no other dimension was splitting during this window"
+            # N-c/I5: ONE read of `_neighbours`, feeding both the prose and the marker. Written
+            # as two independent statements -- `degraded or "no other dimension was splitting"`
+            # above a separate `_neighbours` test below -- the row could say "no other dimension
+            # was splitting during this window" in English while carrying `remember: False`,
+            # whose entire meaning is that one was. One row, two contradictory claims, one for a
+            # human and one for a machine, in a programme whose premise is that a row describes
+            # what was computed.
+            neighbours = _neighbours(cfg, versions, dimension, int(state["since_ts"]))
+            if not degraded:
+                degraded = (f"{', '.join(neighbours)} was splitting alongside it but no leg was "
+                            "marked --factorial, so there is no design to cross" if neighbours
+                            else "no other dimension was splitting during this window")
             log.warning("colony A/B: %s was started as a factorial run but is being judged "
                         "two-arm: %s", dimension, degraded)
             reason = f"{reason} [factorial run, judged two-arm: {degraded}]"
@@ -1579,7 +1635,8 @@ def _judge_ab(cfg: WeeklyConfig, versions: Versions, state: dict, dimension: str
             # enter the permanent rejected list. With NO neighbour the leg really was an ordinary
             # single-dimension A/B for its whole window, the tally is complete and correct, and
             # remembering a loss is right -- so the flag is set only when a neighbour was live.
-            if _neighbours(cfg, versions, dimension, int(state["since_ts"])):
+            # Same `neighbours` the reason above was derived from, so the two cannot diverge.
+            if neighbours:
                 block["remember"] = False
         return verdict, reason, arms, block
     other, other_state, _ = partner
@@ -1651,6 +1708,16 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
         # traffic for a week. Refused rather than ignored, per the same rule as `--candidate`.
         raise ValueError(f"there is already a {dimension} A/B open; --factorial starts a "
                          "factorial run, it does not change how a running one is judged")
+    if candidate is not None and state is not None:
+        # C1's other half. A judging Sunday has no use for a challenger -- the one being judged
+        # was fixed by the `ab_started` row a week ago -- so a given one is REFUSED, not ignored.
+        # Ignored, `release --dimension prompt --candidate v1-sandbox` judged v2-minimal-edit and
+        # printed a row saying so: the operator named one variant and the ledger bound another.
+        # Paired with `main`'s copy for the same reason every rule in this module is paired: the
+        # CLI turns it into a usage error, this is the guard for every other caller.
+        raise ValueError(f"there is already a {dimension} A/B open on {state['candidate']!r}; "
+                         f"today is its binding verdict, so --candidate {candidate!r} would be "
+                         "silently ignored -- a challenger is chosen on the week that STARTS one")
     if state is not None:
         # A colony A/B is running: this Sunday is the binding verdict, not a probe day
         # (spec §8) — no candidate discovery, no key check, no probes.
@@ -1727,7 +1794,8 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
                               evals={"colony_ab": block}, reason=reason, **common)
         elif verdict == "win":
             block["winner"] = state["candidate"]
-            outcome = flip(cfg, remote, state["candidate"], dimension=dimension, local_run=local_run, dry_run=dry_run)
+            outcome = flip(cfg, remote, state["candidate"], dimension=dimension, local_run=local_run,
+                           dry_run=dry_run, note=block)
             if outcome == "ok":
                 decision, why = "released", reason
             elif outcome == "flip_failed":
@@ -1759,6 +1827,12 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
                 # colony decided), and flip_incomplete is what exits 3 and asks for a human.
                 decision, why = "flip_incomplete", (f"colony A/B won but the relay restart failed twice; "
                                                     f"{keys['live']} unchanged")
+                # 3b: APPENDED, never prepended -- `lost_tags` matches the reason's prefix and
+                # `_exit_code` matches its `": flip_failed"` suffix, which this reason does not
+                # carry. Two rows that were byte-identical now say which of the two things
+                # happened: a human must restart grid-odin, or the colony's mind is off.
+                if block.get("relay_after_revert") == "down":
+                    why = f"{why}{RELAY_DOWN_NOTE}"
             row = release_row(decision=decision, dimension=dimension, version=state["candidate"], previous=released,
                               evals={"colony_ab": block}, reason=why, **common)
         else:
@@ -1819,10 +1893,36 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
         # blacklist the live incumbent -- for prompt, the registry default, the one variant that
         # must never be blacklisted. `unchanged`, the same reading `== released` gets, because it
         # is the same fact: there is nothing here to test.
-        decision, reason = "unchanged", f"{cand['tag']} is already the live {dimension} incumbent"
-        row = release_row(decision=decision, dimension=dimension, version=cand["tag"], previous=released,
+        #
+        # C2: ...but only when the ledger and the world AGREE that there is nothing to test, and
+        # here they need not. `cand["tag"] == released` returned above, so reaching this line with
+        # a `released` that is set means the gate HAS released in this dimension before and the
+        # relay is now serving some LATER name that no `released` row records. That is the state a
+        # won A/B leaves when the alias copy succeeded and the relay restart did not: the release
+        # was applied to the world and never written down. Read as "nothing to test" it is exit 0
+        # with a benign sentence, every Sunday forever, while `status` reports the superseded
+        # version and `rollback` -- the emergency lever -- targets the wrong row or refuses
+        # outright. The base commit re-started an A/B here instead, which was wrong but noisy;
+        # this branch made it wrong and quiet, which is strictly worse.
+        #
+        # `released is None` is the ORIGINAL case and stays benign: a dimension that has never had
+        # a release through the gate still has an incumbent (the registry default, a hand-set
+        # MIND_MODEL_ALIAS), and nothing is being contradicted.
+        #
+        # Still `unchanged`, because nothing was tested and nothing may be spent or blacklisted on
+        # it -- the exit code carries the alarm instead. The nightly reconciler closes this gap for
+        # real when it can prove the flip applied; this is what speaks up until it does.
+        evals = _advisory_evals(cfg, dimension)
+        if released is None:
+            reason = f"{cand['tag']} is already the live {dimension} incumbent"
+        else:
+            reason = (f"{cand['tag']} is the live {dimension} incumbent but the ledger's last "
+                      f"{dimension} release is {released}: a release was applied and never "
+                      f"recorded, so `status` and `rollback` are reading a superseded version")
+            evals = {**evals, UNRESOLVED: True}
+        row = release_row(decision="unchanged", dimension=dimension, version=cand["tag"], previous=released,
                           adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
-                          evals=_advisory_evals(cfg, dimension), spend_usd=0.0,
+                          evals=evals, spend_usd=0.0,
                           reason=_factorial_note(factorial, reason), **common)
         return _ledger(versions, row, dry_run=dry_run)
     if cand["tag"] in lost_tags(versions, dimension=dimension):
@@ -1909,6 +2009,9 @@ async def release(cfg: WeeklyConfig, remote, *, ask_factory, local_run, week: st
                 "probes passed but the relay restart failed twice starting the colony A/B"
                 if dimension == UNSALTED_DIMENSION
                 else f"the relay restart failed twice starting the {dimension} colony A/B")
+            # 3b, the other revert path, worded identically because it is the same question.
+            if block.get("relay_after_revert") == "down":
+                reason = f"{reason}{RELAY_DOWN_NOTE}"
     row = release_row(decision=decision, dimension=dimension, version=cand["tag"], previous=released, evals=evals,
                       spend_usd=spend, reason=reason, **h, **common)
     return _ledger(versions, row, dry_run=dry_run)
@@ -1965,6 +2068,7 @@ def ab_reconcile(cfg: WeeklyConfig, *, dimension: str = UNSALTED_DIMENSION, loca
         log.warning("colony A/B: %s is split in %s with no ledger row; hand-started, leaving it alone",
                     env_candidate, cfg.grid_env)
         return None
+    last = None
     if state is not None:
         if env_candidate:
             return None                     # ledger open, env splitting: consistent
@@ -1982,19 +2086,70 @@ def ab_reconcile(cfg: WeeklyConfig, *, dimension: str = UNSALTED_DIMENSION, loca
                if stale else
                f"colony A/B reconciled: {candidate} is split in {cfg.grid_env.name} but the "
                "ledger closed its A/B")
+    last_rel = _last_released(versions, dimension=dimension)
+    applied = _unrecorded_release(cfg, dimension, last, last_rel)
+    if applied:
+        # C2, the half that actually CLOSES the gap rather than shouting about it. A won A/B whose
+        # alias copy succeeded and whose relay restart did not leaves the release applied to the
+        # world and absent from the ledger, and the reconciler is the one thing that runs nightly
+        # and can see both. `_unrecorded_release` will only say yes to evidence that no other path
+        # can produce, so this records a release that demonstrably happened -- it never invents one.
+        why = (f"colony A/B reconciled: {candidate} was flipped live but the relay restart failed, "
+               f"so the release was applied and never recorded; recording it now (was {last_rel['version']})")
     outcome = end_ab(cfg, dimension=dimension, local_run=local_run, dry_run=dry_run)
     if outcome != "ok":
         why = f"{why}; relay restart failed clearing the A/B"
-    last_rel = _last_released(versions, dimension=dimension)
-    row = release_row(week=_iso_week(), decision="held" if outcome == "ok" else "flip_incomplete",
+    # A repair that could not restart the relay is still `flip_incomplete` and is still retried
+    # tomorrow night -- including the recording, which must not be written on a run that left env
+    # and the live relay disagreeing about the very value it is recording.
+    decision = "flip_incomplete" if outcome != "ok" else ("released" if applied else "held")
+    row = release_row(week=_iso_week(), decision=decision,
                       dimension=dimension, version=candidate, previous=last_rel["version"] if last_rel else None,
                       base="", run="", adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
                       grid_examples={}, verdict_window=_window(cfg.verdicts_dir),
                       evals={"colony_ab": {"reconciled": True, "binding": False, "candidate": candidate,
-                                           "winner": None, "short_arms": [],
+                                           "winner": candidate if applied and outcome == "ok" else None,
+                                           "short_arms": [],
                                            "other_dimensions": _other_dimensions(cfg, versions, dimension)}},
                       spend_usd=0.0, rogue_ledger_ts=0.0, reason=why)
     return _ledger(versions, row, dry_run=dry_run)
+
+
+def _unrecorded_release(cfg: WeeklyConfig, dimension: str,
+                        last: dict | None, last_rel: dict | None) -> bool:
+    """Did this stale `flip_incomplete` row APPLY a release the ledger never recorded? (C2)
+
+    Three facts have to line up, and no path other than the one this exists for can produce all
+    three. `last` is the standing `flip_incomplete`:
+
+    - it recorded a WINNER equal to its own version, so the colony judged that name and the gate
+      went on to flip it. Nothing else in the module sets `winner`: a reconciler row, an abort
+      snapshot, a stuck row and every start-path failure all carry `winner: None`;
+    - the live grid.env line IS that name today. This is what separates a flip that applied from
+      one that did not. `flip()`'s tag-copy failure reverts both env lines, and `_flip_local`
+      reverts both lines too, so on either of those paths the live line still holds the incumbent
+      -- only the model path where `ollama cp` succeeded and the restart failed leaves the winner
+      there. Read RAW rather than through `_live_arm`, deliberately: `_live_arm` resolves a blank
+      MIND_PROMPT_VARIANT through the registry, and this runs inside the nightly reconciler, so
+      going through it would let a broken registry (I1) stop a MODEL repair that has nothing to
+      do with prompts. The two readings cannot differ here anyway -- they differ only when the
+      line is blank, and a blank line is not a winner's id;
+    - and no `released`/`rolled_back` row in this dimension names it, so the ledger really is
+      behind rather than merely repeating itself.
+
+    A `rollback` whose restart failed reaches the first and second but writes `evals: {}` and so
+    has no winner at all -- deliberately, because the row that repairs it would have to be
+    `rolled_back`, and manufacturing a `released` row for a rollback target is how the emergency
+    lever would come to point one release too far back.
+    """
+    if last is None or last["decision"] != "flip_incomplete":
+        return False
+    version = last.get("version")
+    if not version or (last_rel or {}).get("version") == version:
+        return False
+    if ((last.get("evals") or {}).get("colony_ab") or {}).get("winner") != version:
+        return False
+    return _env_get(cfg.grid_env, _dimension_env(dimension)["live"]) == version
 
 
 def ab_check(cfg: WeeklyConfig, *, dimension: str = UNSALTED_DIMENSION, now_ms: int | None = None,
@@ -2156,6 +2311,43 @@ def rollback(cfg: WeeklyConfig, remote, *, to: str | None = None, local_run, dry
     return _ledger(versions, row, dry_run=dry_run)
 
 
+def _registry_fault_row(cfg: WeeklyConfig, dimension: str, verb: str, err: Exception,
+                        *, week: str | None = None, dry_run: bool = False) -> dict:
+    """I1: a variant registry that will not load, recorded as a NON-DECISION row.
+
+    `_live_arm` resolves a blank MIND_PROMPT_VARIANT through the registry, so an unloadable
+    registry raises `VariantError` out of the middle of a prompt Sunday -- and out of the middle
+    of the nightly's per-dimension loop. Uncaught it is a Python traceback from a systemd timer:
+    no row saying why the week did nothing, and, in the nightly, the other dimension's repair
+    written to the ledger but never printed and its exit code replaced by 1.
+
+    THE ROW MUST DECIDE NOTHING. `unchanged` is the only decision that neither spends a week
+    against MAX_WEEKS nor closes an episode, and the reason deliberately starts with neither
+    "colony A/B lost/stuck/inconclusive" (which `lost_tags` would read as a rejection of a
+    candidate that was never even asked) nor "operator forgot" (which would clear one). Nothing
+    here is a verdict: the registry did not load, so no arm has a label and no tally exists.
+
+    `version` is None for the same reason -- there is no candidate to name, and inventing one
+    would put a fabricated name into an append-only, hash-chained file.
+
+    It carries UNRESOLVED, so the unit still fails: the relay's own loader fails closed on the
+    same file, which means the colony's mind is refusing to boot too, and that must not be
+    reported at exit 0 because the row went in cleanly.
+    """
+    log.error("%s: the %s variant registry did not load: %s", verb, dimension, err)
+    versions = Versions(cfg.releases_dir / "versions.jsonl")
+    last = _last_released(versions, dimension=dimension)
+    row = release_row(week=week or _iso_week(), decision="unchanged", dimension=dimension, version=None,
+                      previous=last["version"] if last else None, base="", run="", adapter_sha256="",
+                      gguf_sha256="", set_manifest_sha256="", grid_examples={},
+                      verdict_window=_window(cfg.verdicts_dir),
+                      evals={UNRESOLVED: True, "variant_registry_error": str(err)}, spend_usd=0.0,
+                      rogue_ledger_ts=0.0,
+                      reason=(f"the {dimension} variant registry did not load, so nothing could be "
+                              f"decided in this dimension: {err}"))
+    return _ledger(versions, row, dry_run=dry_run)
+
+
 def _local_run(cmd: list[str]) -> int:
     return subprocess.run(cmd, check=False).returncode
 
@@ -2245,7 +2437,14 @@ def _exit_code(row: dict) -> int:
     only machine-readable channel it has. A rollback that did not roll back must not exit 0.
     (`release`'s C2 win-but-copy-failed row stays 0 on purpose: `end_ab` ran, env, relay and
     ledger agree, `held` is that verb's normal terminal state, and the gate retries on Sunday.)
+
+    The third case is `evals[UNRESOLVED]`, and it is why that marker exists: a fault the gate can
+    only REPORT -- the ledger disagreeing with the live world, or a registry that will not load --
+    has to be recorded as `unchanged` to stay out of the week cap and the blacklist, and
+    `unchanged` would otherwise exit 0. A gate that is wrong must never also be quiet.
     """
+    if (row.get("evals") or {}).get(UNRESOLVED):
+        return 3
     return 3 if row["decision"] == "flip_incomplete" or str(row.get("reason", "")).endswith(": flip_failed") else 0
 
 
@@ -2365,13 +2564,42 @@ def main(argv: list[str] | None = None) -> int:
             # dimension that was fine would say the night was fine.
             rows, code = [], 0
             for d in dimensions:
-                row = ab_check(cfg, dimension=d, local_run=local_run, dry_run=a.dry_run)
+                try:
+                    row = ab_check(cfg, dimension=d, local_run=local_run, dry_run=a.dry_run)
+                except VariantError as e:
+                    # I1: PER DIMENSION, inside the loop, so one dimension's registry fault
+                    # cannot stop the others being reconciled -- which is exactly when the relay
+                    # is down and grid.env is most likely to have diverged -- and cannot swallow
+                    # a repair another dimension already wrote. Only VariantError: every other
+                    # exception is a fault in the gate itself and must still reach the operator
+                    # as a traceback rather than as a tidy row saying the registry was to blame.
+                    row = _registry_fault_row(cfg, d, "ab --check", e, dry_run=a.dry_run)
                 if row is not None:
                     rows.append(row)
                     code = max(code, _exit_code(row))
             if not rows:
-                running = any(ab_state(versions, dimension=d) is not None for d in dimensions)
-                print("not stuck" if running else "no A/B running"); return 0
+                # I2: "no A/B running" was a falsehood in the one case the reconciler
+                # deliberately walks away from. A split hand-started the spec-§7 way has no
+                # ledger row, so `ab_state` sees nothing and nothing needed repairing -- but a
+                # fifth of live traffic is going to an untracked candidate, which `ab`'s
+                # read-only view reports honestly as `"source": "env"` while this, the view
+                # wired to the nightly timer, denied it. Leaving it alone is still right; saying
+                # nothing is there is not. Both facts are printed when both are true, because a
+                # healthy tracked A/B in one dimension is no answer about an untracked split in
+                # the other.
+                open_by_dim = {d: ab_state(versions, dimension=d) is not None for d in dimensions}
+                # `ab_state is None` is what makes it untracked: a dimension whose A/B the ledger
+                # DOES know about carries the same env line, and calling that hand-started would
+                # replace one false statement with another.
+                untracked = sorted(d for d in dimensions if not open_by_dim[d]
+                                   and _env_get(cfg.grid_env, _dimension_env(d)["candidate"]))
+                notes = []
+                if any(open_by_dim.values()):
+                    notes.append("not stuck")
+                if untracked:
+                    notes.append(f"hand-started split in {cfg.grid_env.name} ({', '.join(untracked)}), "
+                                 "untracked by the ledger; nothing to reconcile")
+                print("; ".join(notes) if notes else "no A/B running"); return 0
             for row in rows:                # one JSON object per line: two dimensions can both act
                 print(json.dumps(row, default=str))
             # I1: this runs as grid-verdicts' ExecStartPost, where a non-zero exit marks the
@@ -2426,6 +2654,14 @@ def main(argv: list[str] | None = None) -> int:
     if a.factorial and open_here:
         ap.error(f"there is already a {dimension} A/B open; --factorial starts a factorial run, "
                  "it does not change how a running one is judged")
+    if a.candidate is not None and open_here:
+        # Mirrored from `release()`, exactly like the two `--factorial` guards above and for the
+        # same reason. A judging week's challenger was fixed when the A/B started; a flag this
+        # week has no use for is REFUSED, not ignored -- the rule this parser states twelve lines
+        # above the place C1 broke it.
+        ap.error(f"there is already a {dimension} A/B open; today is its binding verdict, so "
+                 f"--candidate {a.candidate!r} would be silently ignored -- a challenger is "
+                 "chosen on the week that STARTS an A/B")
     if a.factorial and (fault := _factorial_pair_fault(blocking, dimension)):
         ap.error(fault)
     if blocking and not a.factorial:
@@ -2441,7 +2677,13 @@ def main(argv: list[str] | None = None) -> int:
             evals=_interlock_evals(cfg, versions, dimension), spend_usd=0.0, rogue_ledger_ts=0.0,
             reason=_interlock_reason(blocking, dimension)), dry_run=a.dry_run)
     else:
-        if dimension != UNSALTED_DIMENSION and not a.candidate:
+        # ...and only on a week that would START one. C1: this rule is `release()`'s own, and
+        # `release()` places it inside the start path precisely because "a judging week needs
+        # none" -- its comment says so. Copied here without `open_here`, it made the single
+        # documented command for judging a prompt A/B (`release --dimension prompt`) exit 2,
+        # while the identical in-process call succeeded. The duplication is deliberate; the
+        # divergence was not, and it was invisible because nothing tested judging through main().
+        if dimension != UNSALTED_DIMENSION and not open_here and not a.candidate:
             ap.error(f"a {dimension} release needs --candidate; nothing discovers one")
         # Model-only: the key exists to authenticate the identity and validity PROBES at the
         # gateway, and those measure weights. A prompt release runs none of them, so a host
@@ -2461,6 +2703,13 @@ def main(argv: list[str] | None = None) -> int:
             # is detectable, and there is no reading of a detected rewrite that does not need a
             # human -- so this is the one fault the gate refuses rather than degrades.
             ap.error(str(e))
+        except VariantError as e:
+            # I1: the WHOLE run for this dimension, not one guard around one call. `_live_arm` is
+            # reached from three places in `release` and `_validate_candidate` from a fourth, and
+            # a registry that will not load fails at whichever comes first -- so guarding one of
+            # them would only move the traceback. A Sunday that decided nothing gets a row saying
+            # why, and the unit still fails.
+            row = _registry_fault_row(cfg, dimension, "release", e, week=a.week, dry_run=a.dry_run)
     print(json.dumps({k: row[k] for k in ("week", "decision", "version", "previous", "reason", "spend_usd", "over_budget")}, default=str))
     return _exit_code(row)
 

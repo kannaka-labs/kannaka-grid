@@ -310,14 +310,30 @@ above) as `"source": "env"`; its arms then cover all recorded history, since the
 
 Exit codes — `release`, `rollback`, `ab --check` and `ab --abort` share one contract, and `ab --check`
 runs as `grid-verdicts.service`'s `ExecStartPost`, so a non-zero exit marks that nightly unit failed:
-- `0` — nothing needed doing (no A/B running, or one running and not stuck), or the work was done
-  cleanly (a `held` row printed: the A/B was stuck, or reconciled, and the relay restarted).
-- `3` — the verb did not do what it says. Either the row is `flip_incomplete` (the candidate was
-  cleared in `grid.env` but the relay restart failed twice, so the live relay is still splitting to a
-  candidate the ledger has closed): run `sudo systemctl restart grid-odin.service` and check
-  `journalctl -u grid-odin` for `A/B: none` — the nightly reconciler retries this, so the unit stays
-  failed until it is fixed. Or the reason ends `: flip_failed` (a `rollback` whose `ollama cp` failed,
-  so the alias was never moved): check debain2's ollama and re-run it.
+- `0` — nothing needed doing, or the work was done cleanly (a `held` row printed: the A/B was
+  stuck, or reconciled, and the relay restarted). `ab --check` says which "nothing needed doing"
+  it means: `no A/B running`, `not stuck`, or `hand-started split in grid.env (<dimension>),
+  untracked by the ledger; nothing to reconcile` — that last one is a split someone started by
+  editing `grid.env`, which the reconciler deliberately leaves alone (see above) and which
+  `ab` reports as `"source": "env"`. It is still taking its share of live traffic.
+- `3` — the verb did not do what it says, in one of three ways.
+  - The row is `flip_incomplete` (the candidate was cleared in `grid.env` but the relay restart
+    failed twice, so the live relay is still splitting to a candidate the ledger has closed): run
+    `sudo systemctl restart grid-odin.service` and check `journalctl -u grid-odin` for
+    `A/B: none` — the nightly reconciler retries this, so the unit stays failed until it is
+    fixed. If the reason also ends `the relay did not come back and may be DOWN — restart
+    grid-odin.service`, the revert's own restart failed too: `grid.env` is correct and the unit
+    is not running, so the colony has no mind until you restart it.
+  - The reason ends `: flip_failed` (a `rollback` whose `ollama cp` failed, so the alias was never
+    moved): check debain2's ollama and re-run it.
+  - The row is `unchanged` and carries `"evals": {"unresolved": true}` — the gate found something
+    wrong that it could not put right, and recorded it without deciding anything (no week spent,
+    nothing blacklisted). Two shapes: *"a release was applied and never recorded"* means the live
+    `MIND_MODEL_ALIAS` is a later version than the ledger's last `released` row, so `status` and
+    `rollback` are reading a superseded version — the next `ab --check` records the release for
+    real if it can prove the flip happened, otherwise reconcile it by hand; and *"the prompt
+    variant registry did not load"* means `grid/data/prompt_variants.json` is broken, which also
+    stops `grid-odin` booting — fix the file, then re-run.
 
 Never put a comment after a value in `grid.env` (`ODIN_RETRY_S=60   # 900 on a CPU model`): systemd's
 `EnvironmentFile` keeps it *in the value*, `float()` on it kills the relay at boot, and neither the

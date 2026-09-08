@@ -1222,7 +1222,10 @@ def test_reconciler_exemption_survives_the_receipts_own_abort(tmp_path, monkeypa
 
     grid_env.write_text(hand)                               # receipt run 2, same tag
     assert weekly_mod.main(["ab", "--check"]) == 0
-    assert "no A/B running" in capsys.readouterr().out
+    # I2: the check leaves the hand-started split alone -- and SAYS so. It used to print
+    # "no A/B running" here while a fifth of live traffic went to an untracked candidate.
+    out = capsys.readouterr().out
+    assert "no A/B running" not in out and "hand-started split in grid.env (model)" in out
     assert grid_env.read_text() == hand                     # byte-identical: nothing touched
     assert not restarts
 
@@ -1319,7 +1322,8 @@ def test_env_ab_view_does_not_credit_unattributed_rows_to_a_missing_incumbent(tm
 # --- Task 4: dimensions in the gate, the memory rule and the ledger ---------------------------
 
 def _seed_ab_row(tmp_path, *, dimension, version, decision, reason="", short_arms=None,
-                 incumbent=None, since_ts=1_000_000_000, previous=None, ts=None, factorial=None):
+                 incumbent=None, since_ts=1_000_000_000, previous=None, ts=None, factorial=None,
+                 winner=None):
     """One versions row in one dimension. Appends through the real ledger, so every row these
     tests read has been through the same hash chain the gate writes.
 
@@ -1335,6 +1339,10 @@ def _seed_ab_row(tmp_path, *, dimension, version, decision, reason="", short_arm
         ab["short_arms"] = short_arms
     if factorial is not None:
         ab["factorial"] = factorial
+    if winner is not None:
+        # The marker `_unrecorded_release` keys on: only a week the colony DECIDED sets it, so a
+        # start-path or abort failure can never be mistaken for a flip that applied.
+        ab["winner"] = winner
     extra = {} if ts is None else {"ts": ts}
     vs.append(release_row(week="W", decision=decision, dimension=dimension, version=version, previous=previous,
                           base="", run="", adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
@@ -2657,6 +2665,41 @@ def test_the_interaction_is_reported_and_never_decides_anything(tmp_path):
     # few of them there are. Mutation: drop `by_cell` -> KeyError.
     assert set(inter["by_cell"]) == {"m0|p0", "m0|p1", "m1|p0", "m1|p1"}
     assert inter["by_cell"]["m1|p0"] == {"settled": 60, "rate": 0.5}
+
+
+def test_the_interaction_cannot_decide_in_EITHER_direction(tmp_path):
+    # The guard above is single-signed: its one fixture estimates exactly -0.8, and the whole
+    # suite contained no fixture producing a POSITIVE interaction on a decision path. A three-way
+    # sign probe found it -- "let the interaction decide, gated on a positive estimate" SURVIVED
+    # all 445 tests while the negative and the any-non-zero mutations were killed. The code
+    # genuinely does not read the interaction, but "nothing reads it, and no caller may" is
+    # stated in the module as a hard rule, and a guard that fires for one sign is not a guard on
+    # the rule.
+    #
+    # Pinned STRUCTURALLY rather than by adding a second case: three tallies whose four marginals
+    # are identical arm for arm, whose interactions are -0.8, 0.0 and +0.8, must produce
+    # byte-identical verdicts AND reason strings. Holding a+b, c+d, a+c and b+d fixed while
+    # moving `a` is the only degree of freedom the four cells have, and it moves the interaction
+    # by 4/60 a step -- so these three are the same experiment as far as any marginal can tell.
+    #
+    # Mutations, each run and each RED with this test: let the interaction override a verdict
+    # gated on `estimate < -0.5`; on `estimate > 0.5`; and on `abs(estimate) > 0.5`.
+    from grid.weekly import ab_decide_factorial
+    out = {}
+    for a, expected in ((6, -0.8), (18, 0.0), (30, 0.8)):
+        b, c, d = 36 - a, 36 - a, a
+        arms = _seed_factorial(tmp_path / str(a),
+                               cells={("m0", "p0"): (60, a), ("m0", "p1"): (60, b),
+                                      ("m1", "p0"): (60, c), ("m1", "p1"): (60, d)})
+        r = ab_decide_factorial(arms, model=("m0", "m1"), prompt=("p0", "p1"))
+        assert abs(r["interaction"]["estimate"] - expected) < 1e-12
+        # ...on identical marginals: same arms, same rates, same settled counts.
+        assert all(m["rate"] == 0.3 and m["settled"] == 120
+                   for dim in ("model", "prompt") for m in r["marginals"][dim].values())
+        out[expected] = (r["model"], r["prompt"])
+    assert out[-0.8] == out[0.0] == out[0.8]
+    assert out[0.0] == (("win", "candidate rate 0.300 >= 0.270 (incumbent 0.300 x 0.9)"),
+                        ("win", "candidate rate 0.300 >= 0.270 (incumbent 0.300 x 0.9)"))
 
 
 def test_ab_arms_refuses_to_mix_cells_with_a_single_dimension(tmp_path):
@@ -4036,7 +4079,10 @@ def test_a_rewritten_verdict_ledger_refuses_the_week_instead_of_deciding_it(tmp_
     vpath.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
     before = len(Versions(cfg.releases_dir / "versions.jsonl").rows())
     with pytest.raises(SystemExit) as e:
-        main(["release", "--dimension", "prompt", "--candidate", "p1"])
+        # C1: the judging command, exactly as deploy/README.md §6 gives it. It used to need a
+        # meaningless `--candidate` to get past the argument layer at all, and that candidate was
+        # then silently ignored; now the flag is refused here and the week is judged without it.
+        main(["release", "--dimension", "prompt"])
     assert e.value.code == 2
     err = capsys.readouterr().err
     assert "no longer hashes to its own chain value" in err
@@ -4156,3 +4202,532 @@ async def test_an_abandoned_partner_is_bounded_where_it_stopped_and_the_row_says
     assert row["reason"].endswith("[factorial marginal, pooled over model, "
                                   "up to the moment that leg was superseded unjudged]")
     assert lost_tags(Versions(cfg.releases_dir / "versions.jsonl"), dimension="prompt") == set()
+
+# --- Final fix wave: the CLI's judging path, and a gate that cannot be wrong and quiet --------
+
+
+def _cli_env_for(tmp_path, monkeypatch):
+    """Point `main` at a fixture that `_cfg(tmp_path)` already built, without rewriting grid.env.
+
+    `_release_cli_env` writes the file; the factorial fixtures write their own and their contents
+    ARE the state under test, so this sets only the four variables and the colony key.
+    """
+    monkeypatch.setenv("RELEASES_DIR", str(tmp_path / "releases"))
+    monkeypatch.setenv("VERDICTS_DIR", str(tmp_path / "v"))
+    monkeypatch.setenv("GRID_ENV", str(tmp_path / "grid.env"))
+    monkeypatch.setenv("DEBAIN2_HOST", "debain2")
+    key = tmp_path / "key"
+    if not key.exists():
+        key.write_text("k\n")
+    monkeypatch.setenv("MIND_LLM_KEY_FILE", str(key))
+
+
+def test_the_cli_judges_a_prompt_ab_with_the_documented_command(tmp_path, monkeypatch, capsys):
+    # C1. `release --dimension prompt` is the single command deploy/README.md section 6 gives an
+    # operator for judging a prompt A/B, twice. It exited 2 -- `a prompt release needs
+    # --candidate; nothing discovers one` -- while the identical in-process `release()` call
+    # succeeded, because `main` applied `release()`'s candidate-PRESENCE rule without consulting
+    # `open_here`, and `release()` places that rule inside the start path precisely because a
+    # judging week needs no candidate. Six pairs of duplicated rules agreed; this one did not,
+    # and nothing noticed because no test judged through the CLI at all.
+    #
+    # Mutation: drop `not open_here` from main's presence rule -> SystemExit 2 and no row, which
+    # is the branch as it shipped.
+    import grid.weekly as weekly_mod
+    from grid.weekly import main
+    _release_cli_env(tmp_path, monkeypatch,
+                     "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_PROMPT_VARIANT=v1-sandbox\n"
+                     "MIND_PROMPT_CANDIDATE=v2-terse\nMIND_PROMPT_AB_SPLIT=0.2\n")
+    _prompt_registry(monkeypatch, ids=("v1-sandbox", "v2-terse"))
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)
+    since = 1_000_000
+    _seed_ab_row(tmp_path, dimension="prompt", version="v2-terse", decision="ab_started",
+                 incumbent="v1-sandbox", since_ts=since)
+    _seed_ab(tmp_path / "v", since_ts=since, inc="v1-sandbox", cand="v2-terse",
+             inc_rep=12, cand_rep=60, variant=True)
+
+    assert main(["release", "--dimension", "prompt"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    row = _last_row(tmp_path)
+    # A real, binding verdict on the colony's fossil record -- not a usage error, and not a
+    # week thrown away.
+    assert row["dimension"] == "prompt" and row["decision"] == "released"
+    assert printed["reason"] == "candidate rate 0.545 >= 0.090 (incumbent 0.100 x 0.9)"
+    assert row["evals"]["colony_ab"]["binding"] is True
+    assert row["evals"]["colony_ab"]["winner"] == "v2-terse"
+    # ...and the flip really happened: the winner is the live wording and the split is cleared.
+    env = (tmp_path / "grid.env").read_text()
+    assert "MIND_PROMPT_VARIANT=v2-terse" in env and "MIND_PROMPT_CANDIDATE=\n" in env
+
+
+def test_the_cli_judges_a_model_ab_too_and_never_reads_rogue_on_a_judging_week(tmp_path, monkeypatch, capsys):
+    # The other dimension of the same seam, through the same door. `model` was never broken by
+    # C1 -- the presence rule exempts it outright, so `not open_here` changes nothing here (I
+    # ran that mutation against this test and it SURVIVED, which is the correct result and the
+    # reason this test is about coverage rather than about C1's fix). What was missing is that
+    # the CLI judging path had no test in EITHER dimension, so the seam was unpinned as a seam.
+    #
+    # Mutations, both run: `dimension = a.dimension or "prompt"` (the parser's documented
+    # default, that a bare `grid.weekly release` is the MODEL experiment) -> RED; and drop
+    # release()'s `state is not None` judging branch, so a judging Sunday becomes a probe day
+    # again -> RED on the `find_candidate` guard below.
+    import grid.weekly as weekly_mod
+    from grid.weekly import main
+    _release_cli_env(tmp_path, monkeypatch,
+                     "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_CANDIDATE=kannaka-brain-v4\n"
+                     "MIND_AB_SPLIT=0.2\n")
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)
+    monkeypatch.setattr(weekly_mod, "find_candidate",
+                        lambda remote, cfg: pytest.fail("Rogue was read on a judging Sunday"))
+    since = 1_000_000
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v4", decision="ab_started",
+                 incumbent="kannaka-brain-v3", since_ts=since)
+    _seed_ab(tmp_path / "v", since_ts=since, inc_rep=60, cand_rep=12)
+
+    assert main(["release"]) == 0
+    row = _last_row(tmp_path)
+    assert row["dimension"] == "model" and row["decision"] == "held"
+    assert row["reason"].startswith("colony A/B lost")
+    capsys.readouterr()
+
+
+def test_the_cli_refuses_a_candidate_on_a_judging_week_instead_of_ignoring_it(tmp_path, monkeypatch, capsys):
+    # The other half of C1, and the workaround it created. With the presence rule broken, the
+    # only way past the argument layer was to invent a `--candidate`; its value was then silently
+    # discarded, so `release --dimension prompt --candidate v1-sandbox` judged v2-terse and
+    # printed a row saying so. "A flag a verb has no use for is REFUSED, not ignored" is this
+    # parser's own rule, stated twelve lines above the place C1 broke it.
+    #
+    # Mutation: drop the `a.candidate is not None and open_here` guard -> exit 0, and the row
+    # binds v2-terse while the operator named v1-sandbox.
+    import grid.weekly as weekly_mod
+    from grid.versions import Versions
+    from grid.weekly import main
+    _release_cli_env(tmp_path, monkeypatch,
+                     "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_PROMPT_VARIANT=v1-sandbox\n"
+                     "MIND_PROMPT_CANDIDATE=v2-terse\nMIND_PROMPT_AB_SPLIT=0.2\n")
+    _prompt_registry(monkeypatch, ids=("v1-sandbox", "v2-terse"))
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)
+    _seed_ab_row(tmp_path, dimension="prompt", version="v2-terse", decision="ab_started",
+                 incumbent="v1-sandbox", since_ts=1_000_000)
+    before = len(Versions(tmp_path / "releases" / "versions.jsonl").rows())
+
+    with pytest.raises(SystemExit) as e:
+        main(["release", "--dimension", "prompt", "--candidate", "v1-sandbox"])
+    assert e.value.code == 2
+    assert "would be silently ignored" in capsys.readouterr().err
+    # Refused BEFORE the ledger: a week is not spent on a usage error.
+    assert len(Versions(tmp_path / "releases" / "versions.jsonl").rows()) == before
+
+    # ...and the same rule for every other caller, not only the argument layer, so the pair
+    # cannot diverge the way C1's did. Mutation: drop `release()`'s copy -> no raise.
+    import asyncio
+    from grid.weekly import release
+    async def never(p): raise AssertionError("probes must not run during an A/B week")
+    with pytest.raises(ValueError, match="silently ignored"):
+        asyncio.run(release(_cfg(tmp_path), FakeRemote({}), ask_factory=lambda m: never,
+                            local_run=lambda c: 0, dimension="prompt", candidate="v1-sandbox"))
+
+
+def test_the_cli_judges_both_legs_of_a_factorial_run(tmp_path, monkeypatch, capsys):
+    # C1's blast radius: the second leg of EVERY factorial run is a prompt judging command, so
+    # the deliverable four fix rounds went into was unreachable through its own documentation.
+    # Judged here in the README's own order, model then prompt, both through main().
+    #
+    # Mutation: drop `not open_here` from main's presence rule -> the model leg still judges and
+    # the prompt leg exits 2, leaving one dimension bound and the other still splitting.
+    import grid.weekly as weekly_mod
+    from grid.weekly import main
+    _factorial_week(tmp_path)
+    _cli_env_for(tmp_path, monkeypatch)
+    _prompt_registry(monkeypatch, ids=("p0", "p1"))
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)
+    monkeypatch.setattr(weekly_mod, "Remote", lambda *a, **k: FakeRemote({}))
+    monkeypatch.setattr(weekly_mod, "find_candidate",
+                        lambda remote, cfg: pytest.fail("Rogue was read on a judging Sunday"))
+
+    assert main(["release", "--week", "W2"]) == 0
+    model_row = _last_row(tmp_path)
+    assert main(["release", "--dimension", "prompt", "--week", "W2"]) == 0
+    prompt_row = _last_row(tmp_path)
+    capsys.readouterr()
+
+    # Both legs judged, both on their MARGINAL -- which is what makes a factorial verdict
+    # attributable at all, and is exactly what the CLI could not reach.
+    for row, dim, other in ((model_row, "model", "prompt"), (prompt_row, "prompt", "model")):
+        assert row["dimension"] == dim
+        assert row["evals"]["colony_ab"]["factorial_judged"] is True
+        assert f"[factorial marginal, pooled over {other}" in row["reason"]
+        assert set(row["evals"]["colony_ab"]["cells"]) == {"m0|p0", "m0|p1", "m1|p0", "m1|p1"}
+
+
+def _c2_applied_but_unrecorded(tmp_path, monkeypatch):
+    """A won model A/B whose `ollama cp` succeeded and whose relay restart did not.
+
+    The exact shape of C2: the release IS applied to the world (the alias copied on debain2,
+    MIND_MODEL_ALIAS rewritten) and the ledger records `flip_incomplete` and no release.
+    """
+    import grid.weekly as weekly_mod
+    from grid.weekly import main
+    grid_env = _release_cli_env(tmp_path, monkeypatch,
+                                "MIND_MODEL_ALIAS=kannaka-brain-v3\n"
+                                "MIND_LLM_CANDIDATE=kannaka-brain-v4\nMIND_AB_SPLIT=0.2\n")
+    since = 1_000_000
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v3", decision="released",
+                 previous="kannaka-brain-v2")
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v4", decision="ab_started",
+                 incumbent="kannaka-brain-v3", since_ts=since)
+    _seed_ab(tmp_path / "v", since_ts=since, inc_rep=12, cand_rep=60)
+    monkeypatch.setattr(weekly_mod, "Remote", lambda *a, **k: FakeRemote({}))   # `ollama cp` succeeds
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 1)                # the restart does not
+    assert main(["release", "--week", "S2"]) == 3
+    row = _last_row(tmp_path)
+    assert row["decision"] == "flip_incomplete"
+    assert row["reason"] == "alias serves the candidate; relay restart failed twice"
+    assert "MIND_MODEL_ALIAS=kannaka-brain-v4" in grid_env.read_text()   # applied to the world
+    return grid_env
+
+
+def test_the_nightly_records_a_release_that_was_applied_and_never_written_down(tmp_path, monkeypatch, capsys):
+    # C2. A won A/B whose alias copy succeeded and whose relay restart failed leaves the release
+    # applied to the world and absent from the ledger. The reconciler used to write `held` over
+    # it, so `_last_released` stayed on the superseded version FOREVER: `status` reported the
+    # wrong version and `rollback` -- the emergency lever -- refused outright or, in a longer
+    # ledger, would skip the version actually in service. The reconciler is the one thing that
+    # runs nightly and can see both the ledger and grid.env, so it closes the gap.
+    #
+    # Mutation: make `_unrecorded_release` return False -> the row is `held`, the last release
+    # stays kannaka-brain-v3 while the relay serves v4, and the rollback below raises SystemExit
+    # "the previous release was never released; refusing".
+    import grid.weekly as weekly_mod
+    from grid.versions import Versions
+    from grid.weekly import _last_released, main
+    _c2_applied_but_unrecorded(tmp_path, monkeypatch)
+    capsys.readouterr()
+
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)      # the operator's relay is back
+    assert main(["ab", "--check", "--dimension", "model"]) == 0
+    reconciled = _last_row(tmp_path)
+    assert reconciled["decision"] == "released" and reconciled["version"] == "kannaka-brain-v4"
+    assert reconciled["previous"] == "kannaka-brain-v3"
+    assert "applied and never recorded" in reconciled["reason"]
+    vs = Versions(tmp_path / "releases" / "versions.jsonl")
+    assert _last_released(vs, dimension="model")["version"] == "kannaka-brain-v4"
+    capsys.readouterr()
+
+    # ...and the two consequences that made this the most dangerous thing on the branch are gone:
+    # the gate is quiet because it is RIGHT, and the emergency lever works and names v3.
+    monkeypatch.setattr(weekly_mod, "find_candidate",
+                        lambda remote, cfg: {"tag": "kannaka-brain-v4", "run": "", "rogue_ts": 0.0,
+                                             "manifest": {}})
+    assert main(["release", "--week", "S4"]) == 0
+    assert _last_row(tmp_path)["reason"] == "kannaka-brain-v4 is already released"
+    capsys.readouterr()
+    assert main(["rollback"]) == 0
+    assert _last_row(tmp_path)["version"] == "kannaka-brain-v3"
+    capsys.readouterr()
+
+
+def test_the_gate_is_never_quiet_while_the_ledger_and_the_world_disagree(tmp_path, monkeypatch, capsys):
+    # C2's backstop, and the property the brief names: a state that is both wrong and silent is
+    # worse than either alone. Before the nightly gets a chance to record it -- or if the live
+    # value was set by some route the reconciler cannot prove anything about -- the Sunday gate
+    # meets `cand["tag"] == _live_arm(...)` and used to call it `unchanged` at exit 0 with the
+    # reason `kannaka-brain-v4 is already the live model incumbent`, which reads as "nothing to
+    # do". It is not: the ledger's last release is v3.
+    #
+    # Mutation: drop the `evals[UNRESOLVED]` marker (or restore the single benign reason) -> this
+    # exits 0 and the reason reads as routine, which is the branch as it shipped.
+    import grid.weekly as weekly_mod
+    from grid.versions import Versions
+    from grid.weekly import UNRESOLVED, main
+    _c2_applied_but_unrecorded(tmp_path, monkeypatch)
+    capsys.readouterr()
+    monkeypatch.setattr(weekly_mod, "find_candidate",
+                        lambda remote, cfg: {"tag": "kannaka-brain-v4", "run": "", "rogue_ts": 0.0,
+                                             "manifest": {}})
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)
+
+    assert main(["release", "--week", "S4"]) == 3
+    row = _last_row(tmp_path)
+    assert row["decision"] == "unchanged"          # decides nothing, spends no week, blacklists nothing
+    assert row["evals"][UNRESOLVED] is True
+    assert "applied and never recorded" in row["reason"]
+    assert "kannaka-brain-v3" in row["reason"] and "kannaka-brain-v4" in row["reason"]
+    capsys.readouterr()
+
+    # ...and `unchanged` really is inert: nothing is remembered against the tag.
+    assert lost_tags(Versions(tmp_path / "releases" / "versions.jsonl"), dimension="model") == set()
+
+
+def test_a_dimension_with_no_release_of_its_own_stays_the_benign_unchanged_it_was(tmp_path, monkeypatch, capsys):
+    # The case the I1 guard was written for, and the one the C2 fix must NOT make loud: a
+    # dimension that has never had a release through the gate still has an incumbent (a hand-set
+    # MIND_MODEL_ALIAS, the registry default), so `released` is None and nothing is being
+    # contradicted. Mutation: mark every `already the live incumbent` week UNRESOLVED -> the
+    # nightly unit fails every Sunday on a host that has simply never released anything.
+    import grid.weekly as weekly_mod
+    from grid.weekly import UNRESOLVED, main
+    _release_cli_env(tmp_path, monkeypatch, "MIND_MODEL_ALIAS=kannaka-brain-v4\n")
+    monkeypatch.setattr(weekly_mod, "find_candidate",
+                        lambda remote, cfg: {"tag": "kannaka-brain-v4", "run": "", "rogue_ts": 0.0,
+                                             "manifest": {}})
+    assert main(["release"]) == 0
+    row = _last_row(tmp_path)
+    assert row["decision"] == "unchanged" and UNRESOLVED not in row["evals"]
+    assert row["reason"] == "kannaka-brain-v4 is already the live model incumbent"
+    capsys.readouterr()
+
+
+def _broken_registry(monkeypatch):
+    """A registry that will not load, exactly as `_live_arm` meets it."""
+    import grid.weekly as weekly_mod
+    from grid.variants import VariantError
+
+    def boom(variant_id=None, *, path=None):
+        raise VariantError("prompt_variants.json: not valid JSON: Expecting ',' delimiter")
+
+    monkeypatch.setattr(weekly_mod, "get_variant", boom)
+
+
+def test_a_registry_that_will_not_load_records_a_row_instead_of_a_traceback(tmp_path, monkeypatch, capsys):
+    # I1/(e). `_live_arm` resolves a blank MIND_PROMPT_VARIANT through `get_variant`, so a
+    # registry that will not load raises VariantError out of the middle of a prompt Sunday.
+    # `main` caught only LedgerRewritten, so the operator got a Python traceback from a systemd
+    # timer: no row saying why the week did nothing, and no reading of the exit code.
+    #
+    # Mutation: remove the `except VariantError` around the release call -> VariantError escapes
+    # and this test errors instead of asserting an exit code, with no row written.
+    from grid.versions import Versions
+    from grid.weekly import UNRESOLVED, ab_state, main
+    _release_cli_env(tmp_path, monkeypatch,
+                     "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_PROMPT_CANDIDATE=v2-terse\n"
+                     "MIND_PROMPT_AB_SPLIT=0.2\n")
+    _seed_ab_row(tmp_path, dimension="prompt", version="v2-terse", decision="ab_started",
+                 incumbent="v1-sandbox", since_ts=1_000_000)
+    _broken_registry(monkeypatch)
+
+    assert main(["release", "--dimension", "prompt", "--week", "W9"]) == 3
+    row = _last_row(tmp_path)
+    # A NON-DECISION row. `unchanged` is the only decision that neither spends a week against
+    # MAX_WEEKS nor closes the episode, so a registry fault cannot kill an experiment that is
+    # still perfectly alive. Mutations, both run and both RED: record `held` -> the episode is
+    # CLOSED, so a broken JSON file kills a healthy experiment; record `ab_inconclusive` -> a
+    # week the gate never measured is counted against the cap. (The `decision` assertion catches
+    # both immediately; the `ab_state` and `weeks` checks below are here because they are what
+    # those two decisions would actually cost.)
+    assert row["decision"] == "unchanged" and row["dimension"] == "prompt"
+    assert row["version"] is None                  # no candidate was resolved; none is invented
+    assert row["evals"][UNRESOLVED] is True
+    assert "variant registry did not load" in row["reason"]
+    assert "not valid JSON" in row["reason"]
+    vs = Versions(tmp_path / "releases" / "versions.jsonl")
+    # It cannot blacklist, and it is defended TWICE over: the row names no version at all, and
+    # its reason begins with none of the three rejection prefixes `lost_tags` matches. Wording
+    # the reason `colony A/B stuck: ...` alone therefore SURVIVES (I ran it) -- `lost_tags`
+    # skips a row with no version. The mutation that kills this is both together: name the open
+    # candidate as `version` AND word the reason as a rejection -> {"v2-terse"}, and a variant
+    # is blacklisted for good over a JSON file it had nothing to do with.
+    assert lost_tags(vs, dimension="prompt") == set()
+    assert ab_state(vs, dimension="prompt") is not None       # the experiment is still open
+    # ...and no week was spent on it. Mutation: record `ab_inconclusive` -> weeks == 1, and two
+    # broken nightlies would close a healthy experiment on the MAX_WEEKS cap.
+    assert ab_state(vs, dimension="prompt")["weeks"] == 0
+    capsys.readouterr()
+
+
+def test_one_dimensions_registry_fault_does_not_silence_the_others_nightly(tmp_path, monkeypatch, capsys):
+    # I1's unfiled half. `ab --check` loops `sorted(DIMENSIONS)`: `model` reconciled, then
+    # `prompt` raised out of the loop. So the prompt dimension was never reconciled -- precisely
+    # when the relay is down and grid.env is most likely to have diverged -- and the model
+    # dimension's repair was written to the ledger and never printed, its exit code replaced by
+    # an uncaught 1. "The loudest exit code any of them produced" is the contract.
+    #
+    # Mutation: move the `except VariantError` outside the loop -> the model repair is written
+    # but not printed, and this raises instead of returning 3.
+    import grid.weekly as weekly_mod
+    from grid.weekly import UNRESOLVED, main
+    _ab_cli_env(tmp_path, monkeypatch,
+                "MIND_MODEL_ALIAS=kannaka-brain-v4\nMIND_LLM_CANDIDATE=\n"
+                "MIND_PROMPT_CANDIDATE=v2-terse\nMIND_PROMPT_AB_SPLIT=0.2\n")
+    # A model dimension needing repair -- and the C2 shape, so the repair has to RECORD a
+    # release -- beside a healthy prompt A/B whose stuck check reads the registry through
+    # `_live_arm`, which is where the VariantError comes out.
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v3", decision="released",
+                 previous="kannaka-brain-v2")
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v4", decision="ab_started",
+                 incumbent="kannaka-brain-v3")
+    _seed_ab_row(tmp_path, dimension="model", version="kannaka-brain-v4", decision="flip_incomplete",
+                 winner="kannaka-brain-v4", reason="alias serves the candidate; relay restart failed twice")
+    _seed_ab_row(tmp_path, dimension="prompt", version="v2-terse", decision="ab_started",
+                 incumbent="v1-sandbox", since_ts=1_000_000)
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)
+    _broken_registry(monkeypatch)
+
+    assert main(["ab", "--check"]) == 3
+    printed = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.strip()]
+    by_dim = {r["dimension"]: r for r in printed}
+    # BOTH dimensions reported, in one nightly. The model repair happened, recorded the release
+    # C2 lost, and was printed -- with the prompt registry unloadable throughout.
+    # Mutation: make `_unrecorded_release` return False -> the row is `held` and the release is
+    # still missing. (`_live_arm` on the MODEL dimension reads no registry, so the raw-line read
+    # in `_unrecorded_release` is not what this test pins; see the prompt case below.)
+    assert by_dim["model"]["decision"] == "released"
+    assert by_dim["model"]["reason"].startswith("colony A/B reconciled")
+    assert "applied and never recorded" in by_dim["model"]["reason"]
+    # ...and the prompt fault is a row of its own rather than a traceback that ate the model's.
+    assert by_dim["prompt"]["evals"][UNRESOLVED] is True
+    assert "variant registry did not load" in by_dim["prompt"]["reason"]
+def test_a_broken_registry_does_not_block_the_prompt_reconcilers_repair(tmp_path, monkeypatch, capsys):
+    # The reconciler is not a prompt reader, and after C2 it must not become one. Its
+    # applied-but-unrecorded test asks whether the LIVE grid.env line is the winner; resolved
+    # through `_live_arm` that question drags the variant registry into every prompt reconcile,
+    # so a broken JSON file would stop the one nightly path that repairs a standing
+    # `flip_incomplete` -- the state I1 says is exactly when grid.env is most likely to have
+    # diverged. Read raw, it cannot: the two readings differ only when the line is blank, and a
+    # blank line is never a winner's id.
+    #
+    # MIND_PROMPT_VARIANT is ABSENT here, which is not a contrivance: `_live_arm`'s own docstring
+    # says the line does not exist until the first prompt release writes it, so this is what an
+    # ordinary first prompt experiment looks like -- and it is the only shape in which the two
+    # readings differ at all, because that is when `_live_arm` reaches for the registry.
+    #
+    # Mutation: `return _live_arm(cfg, dimension) == version` in `_unrecorded_release` -> the
+    # reconcile raises VariantError, main records a registry-fault row instead of repairing, and
+    # this returns 3 with `decision == "unchanged"` while the split is still live.
+    import grid.weekly as weekly_mod
+    from grid.weekly import main
+    grid_env = _ab_cli_env(tmp_path, monkeypatch,
+                           "MIND_MODEL_ALIAS=kannaka-brain-v3\n"
+                           "MIND_PROMPT_CANDIDATE=v2-terse\nMIND_PROMPT_AB_SPLIT=0.2\n")
+    # A prompt win whose LOCAL flip reverted both lines: the winner is NOT live, so nothing was
+    # applied and there is no release to record -- only a split to clear.
+    _seed_ab_row(tmp_path, dimension="prompt", version="v2-terse", decision="ab_started",
+                 incumbent="v1-sandbox", since_ts=1_000_000)
+    _seed_ab_row(tmp_path, dimension="prompt", version="v2-terse", decision="flip_incomplete",
+                 winner="v2-terse", since_ts=1_000_000,
+                 reason="colony A/B won but the relay restart failed twice; MIND_PROMPT_VARIANT unchanged")
+    monkeypatch.setattr(weekly_mod, "_local_run", lambda cmd: 0)
+    _broken_registry(monkeypatch)
+
+    assert main(["ab", "--check", "--dimension", "prompt"]) == 0
+    row = _last_row(tmp_path)
+    assert row["decision"] == "held" and row["dimension"] == "prompt"
+    assert row["reason"].startswith("colony A/B reconciled")
+    assert "applied and never recorded" not in row["reason"]      # nothing was applied
+    assert "MIND_PROMPT_CANDIDATE=\n" in grid_env.read_text()      # ...and the split is cleared
+    capsys.readouterr()
+
+
+def test_the_row_says_whether_the_relay_came_back_after_a_revert(tmp_path, monkeypatch):
+    # 3b. `_restart_after_revert` computed the answer and threw it away: both callers ignored it
+    # and the row was byte-identical whether the relay came back or not, so a reader of
+    # versions.jsonl could not tell "a human must restart grid-odin" from "the colony's mind is
+    # off". The readiness gate made `systemctl restart`'s exit code truthful; this records it.
+    #
+    # Mutation: `return None` from `_restart_after_revert` again (or drop the `note`/block
+    # stamp) -> the two rows below are identical and the `down` assertions fail.
+    import asyncio
+    from grid.weekly import release
+
+    async def judge(root, *, revert_ok):
+        _prompt_registry(monkeypatch, ids=("v1-sandbox", "v2-terse"))
+        root.mkdir(parents=True, exist_ok=True)
+        cfg = _cfg(root)
+        (root / "grid.env").write_text("MIND_MODEL_ALIAS=kannaka-brain-v3\n"
+                                       "MIND_PROMPT_VARIANT=v1-sandbox\n"
+                                       "MIND_PROMPT_CANDIDATE=v2-terse\nMIND_PROMPT_AB_SPLIT=0.2\n")
+        since = 1_000_000
+        _seed_ab_row(root, dimension="prompt", version="v2-terse", decision="ab_started",
+                     incumbent="v1-sandbox", since_ts=since)
+        _seed_ab(root / "v", since_ts=since, inc="v1-sandbox", cand="v2-terse",
+                 inc_rep=12, cand_rep=60, variant=True)
+        # The flip's own restart always fails (two attempts); only the restart AFTER the revert
+        # differs, which is exactly the distinction the row could not make.
+        calls = {"n": 0}
+        def local_run(cmd):
+            calls["n"] += 1
+            return 0 if (calls["n"] > 2 and revert_ok) else 1
+        async def never(p): raise AssertionError("probes must not run during an A/B week")
+        return await release(cfg, FakeRemote({}), ask_factory=lambda m: never,
+                             local_run=local_run, dimension="prompt", week="W2")
+
+    up = asyncio.run(judge(tmp_path / "up", revert_ok=True))
+    down = asyncio.run(judge(tmp_path / "down", revert_ok=False))
+    for row in (up, down):
+        assert row["decision"] == "flip_incomplete"       # the verdict itself is the same
+    assert up["evals"]["colony_ab"]["relay_after_revert"] == "ok"
+    assert down["evals"]["colony_ab"]["relay_after_revert"] == "down"
+    # ...and an operator reading the printed reason sees it too. APPENDED, never prepended:
+    # `lost_tags` matches the reason's prefix and `_exit_code` its `": flip_failed"` suffix.
+    assert down["reason"].startswith(up["reason"])
+    assert down["reason"].endswith("restart grid-odin.service")
+    assert not up["reason"].endswith("restart grid-odin.service")
+
+    # BOTH callers, because both reverted and both discarded the answer. This is `start_ab`'s:
+    # a week whose probes passed and whose relay never picked the candidate up.
+    # Mutation: drop `block["relay_after_revert"] = ...` in start_ab -> RED here alone, which is
+    # how this half was found to be uncovered after the flip half was fixed.
+    async def start(root, *, revert_ok):
+        _prompt_registry(monkeypatch, ids=("v1-sandbox", "v2-terse"))
+        root.mkdir(parents=True, exist_ok=True)
+        cfg = _cfg(root)
+        (root / "grid.env").write_text("MIND_MODEL_ALIAS=kannaka-brain-v3\n"
+                                       "MIND_PROMPT_VARIANT=v1-sandbox\n")
+        calls = {"n": 0}
+        def local_run(cmd):
+            calls["n"] += 1
+            return 0 if (calls["n"] > 2 and revert_ok) else 1
+        async def never(p): raise AssertionError("a prompt release runs no probes")
+        return await release(cfg, FakeRemote({}), ask_factory=lambda m: never, local_run=local_run,
+                             dimension="prompt", candidate="v2-terse", week="W1")
+
+    up2 = asyncio.run(start(tmp_path / "up2", revert_ok=True))
+    down2 = asyncio.run(start(tmp_path / "down2", revert_ok=False))
+    for row in (up2, down2):
+        assert row["decision"] == "flip_incomplete"
+    assert up2["evals"]["colony_ab"]["relay_after_revert"] == "ok"
+    assert down2["evals"]["colony_ab"]["relay_after_revert"] == "down"
+    assert down2["reason"].startswith(up2["reason"])
+    assert down2["reason"].endswith("restart grid-odin.service")
+    assert not up2["reason"].endswith("restart grid-odin.service")
+
+
+def test_a_degraded_factorial_row_does_not_contradict_its_own_remember_marker(tmp_path):
+    # N-c/I5. `degraded = degraded or "no other dimension was splitting during this window"` was
+    # written independently of the `_neighbours` test that sets `remember: False`, so a leg whose
+    # partner could not be identified while a neighbour WAS live wrote a row saying, in English,
+    # that nothing else was splitting, and carrying, for machines, the marker whose entire
+    # meaning is that something was. One row, two contradictory claims.
+    #
+    # Mutation: restore the independent `degraded or ...` default -> the reason says "no other
+    # dimension was splitting during this window" on a row carrying `remember: False`.
+    import asyncio
+    from grid.versions import Versions, release_row
+    cfg = _cfg(tmp_path)
+    since = 1_000_000
+    vs = Versions(cfg.releases_dir / "versions.jsonl")
+    kw = dict(base="", run="", adapter_sha256="", gguf_sha256="", set_manifest_sha256="",
+              grid_examples={}, verdict_window={}, spend_usd=0, rogue_ledger_ts=0)
+    # The prompt leg carries the --factorial marker but the model leg opened LATER and carries
+    # none, so `_partner_bound` matches neither shape and there is no design to cross. The model
+    # split is live over this leg's window all the same.
+    vs.append(release_row(week="W1", decision="ab_started", dimension="prompt", version="p1",
+                          previous=None, reason="", ts=since / 1000, **kw,
+                          evals={"colony_ab": {"candidate": "p1", "incumbent": "p0", "split": 0.2,
+                                               "since_ts": since, "factorial": True}}))
+    vs.append(release_row(week="W1", decision="ab_started", dimension="model", version="m1",
+                          previous=None, reason="", ts=(since + 3_000) / 1000, **kw,
+                          evals={"colony_ab": {"candidate": "m1", "incumbent": "m0", "split": 0.2,
+                                               "since_ts": since + 3_000, "factorial": False}}))
+    _seed_ab(tmp_path / "v", since_ts=since, inc="p0", cand="p1", inc_rep=60, cand_rep=12,
+             variant=True)
+    (tmp_path / "grid.env").write_text("MIND_MODEL_ALIAS=m0\nMIND_LLM_CANDIDATE=m1\n"
+                                       "MIND_AB_SPLIT=0.2\nMIND_PROMPT_VARIANT=p0\n"
+                                       "MIND_PROMPT_CANDIDATE=p1\nMIND_PROMPT_AB_SPLIT=0.2\n")
+    row = asyncio.run(_judge(cfg, tmp_path, "prompt"))
+    ab = row["evals"]["colony_ab"]
+    assert ab["factorial_judged"] is False and ab["remember"] is False
+    # The prose and the marker come from ONE read of `_neighbours`, so they cannot disagree.
+    assert "no other dimension was splitting" not in row["reason"]
+    assert "model was splitting alongside it" in row["reason"]

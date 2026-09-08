@@ -57,6 +57,17 @@ _SMOKE_VALUES: dict[str, object] = {
 }
 
 
+#: A variant id may not contain this character. It is `grid.weekly.CELL_SEP`, the separator that
+#: joins the two labels of a factorial cell (`"<model>|<variant>"`), and it is refused HERE --
+#: at load, before the relay can serve the id and before a proposal row can carry it -- because
+#: by the time `cell_key` sees it the damage is done: `load_registry` accepted `"v2|weird"`, the
+#: relay served it, a week of traffic was logged under it, and the first factorial Sunday died
+#: with a raw `ValueError` out of `release()`. Duplicated rather than imported: `grid.weekly`
+#: imports this module, so the dependency cannot run the other way. `test_variants.py` pins the
+#: two to the same character.
+CELL_SEP = "|"
+
+
 class VariantError(ValueError):
     """A prompt-variant registry entry is malformed. Raised at load time."""
 
@@ -107,6 +118,10 @@ def _dup_key_hook(registry_path: Path):
 
 
 def _load_variant(variant_id: str, entry: object, registry_dir: Path) -> Variant:
+    if CELL_SEP in variant_id:
+        raise VariantError(f"variant {variant_id!r}: an id may not contain {CELL_SEP!r} -- it is the "
+                           "separator in a factorial cell key, and an id carrying it would make a "
+                           "key two different pairs of arms could spell")
     if not isinstance(entry, dict):
         raise VariantError(f"variant {variant_id!r}: entry must be a JSON object, got {type(entry).__name__}")
 
@@ -213,6 +228,13 @@ def load_registry(path: Path | None = None) -> tuple[str, dict[str, Variant]]:
         default_id = raw["default"]
     except KeyError:
         raise VariantError(f"{registry_path}: missing 'default'") from None
+    # Checked HERE, not left to `default_id not in variants` below: an unhashable default
+    # (`{"default": ["a"]}`) makes that membership test raise a raw `TypeError: unhashable type:
+    # 'list'`, which is precisely what this module's docstring promises cannot escape -- a
+    # caller's `except VariantError` would miss it, and the relay's fail-closed loader would
+    # come down with a traceback naming neither the file nor the key.
+    if not isinstance(default_id, str):
+        raise VariantError(f"{registry_path}: 'default' must be a string, got {default_id!r}")
 
     try:
         raw_variants = raw["variants"]
