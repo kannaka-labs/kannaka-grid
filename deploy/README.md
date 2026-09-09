@@ -1,11 +1,11 @@
 # Skywave runbook — kannaka-grid v0.1
 
-Host facts: `NickFlach/kax-computer` `docs/DEPLOY.md` (WARP on, `ssh debain1`, user `nick`, no backups).
+Host facts: `kannaka-labs/kax-computer` `docs/DEPLOY.md` (WARP on, `ssh debain1`, user `nick`, no backups).
 
 ## 0. Prerequisites (once)
 ```bash
 sudo install -d -o nick -g nick /srv/grid
-cd /srv/grid && git clone --recurse-submodules https://github.com/NickFlach/kannaka-grid.git
+cd /srv/grid && git clone --recurse-submodules https://github.com/kannaka-labs/kannaka-grid.git
 cd /srv/grid/kannaka-grid
 ln -s /srv/grid/kannaka-grid/thegrid /srv/grid/thegrid
 python3 -m venv /srv/grid/venv && /srv/grid/venv/bin/pip install -e "/srv/grid/kannaka-grid[dev]" -e /srv/grid/thegrid
