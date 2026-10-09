@@ -195,3 +195,10 @@ async def test_the_bus_route_refuses_sampling_it_cannot_carry():
         with pytest.raises(MindError, match="cannot carry sampling parameters"):
             await mind.ask("q", **kwargs)
     assert len(bus.calls) == 2                     # the refused asks never reached the bus
+
+
+async def test_recall_lets_a_closed_bus_through():
+    # #2 item 5: a dead bus is fatal, not "no memories".
+    from grid.natsio import BusClosed
+    with pytest.raises(BusClosed):
+        await Mind("m", FakeBus(exc=BusClosed("connection closed for good"))).recall("x")

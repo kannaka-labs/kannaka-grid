@@ -30,6 +30,9 @@ from .variants import Variant, get_variant
 log = logging.getLogger("grid.odin")
 
 UNPARSEABLE_LIMIT = 3       # consecutive failed parses before the file is binned
+# Renamed-aside proposals kept for a post-mortem; older ones are deleted so a colony
+# that keeps abandoning requests cannot fill the queue directory.
+STALE_KEEP = 20
 # thegrid keeps ONE request slot, so a request that can never be answered (a candidate
 # arm whose tag the gateway rejects, say) starves the other arm too: nothing else is
 # ever filed. Bin it after this many consecutive defers so thegrid can file a fresh
@@ -202,6 +205,16 @@ class Relay:
         except BusError as e:
             log.error("odin.%s publish failed: %s", kind, e)
 
+    def _reap_stale(self) -> None:
+        """Keep the newest STALE_KEEP `proposal.stale-*.json`; delete the rest."""
+        try:
+            stale = sorted(self.queue.glob("proposal.stale-*.json"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+        except FileNotFoundError:   # one vanished between glob and stat; try next time
+            return
+        for p in stale[STALE_KEEP:]:
+            p.unlink(missing_ok=True)
+
     def _log(self, req, prompt: str, proposal: list[str] | None, outcome: str, reason: str | None,
              epoch: int, tick: int, reply: str | None = None, model_alias: str | None = None,
              variant: Variant | None = None) -> None:
@@ -234,9 +247,17 @@ class Relay:
                 return None                     # thegrid has not consumed it yet
             # The request is gone, so thegrid will never read this proposal.
             stale = self.queue / f"proposal.stale-{int(time.time())}.json"
-            proposal_path.rename(stale)
+            try:
+                proposal_path.rename(stale)
+            except FileNotFoundError:
+                # thegrid consumes by unlinking proposal.json and request.json as two
+                # statements, so a poll that saw proposal.json a moment ago can find
+                # both gone by the time it renames. The proposal was consumed, not
+                # stale; there is nothing to rename.
+                return None
             self.stale_count += 1
             log.warning("stale proposal with no request: renamed to %s", stale.name)
+            self._reap_stale()
         if not request_path.exists():
             return None
         key = str(request_path)

@@ -453,3 +453,27 @@ async def test_chronicle_log_failure_does_not_block_publishing(tmp_path):
     out = await bridge.maybe_chronicle()
     assert out["topic"] == "Fine."
     assert [s for s, _ in bus.published if s.endswith(".chronicle.topic")]
+
+
+class ChronicleClosedBus(FakeBus):
+    """State and events go through; the chronicle publish finds the client closed."""
+
+    async def publish(self, subject, payload):
+        if ".chronicle." in subject:
+            from grid.natsio import BusClosed
+            raise BusClosed("connection closed for good")
+        await super().publish(subject, payload)
+
+
+async def test_a_closed_bus_in_the_chronicle_task_is_re_raised_on_the_stream_path():
+    # #2 item 4: nothing awaits the chronicle task, so its BusClosed must not vanish.
+    import asyncio
+    from grid.natsio import BusClosed
+    bridge = Bridge(cfg(), bus=ChronicleClosedBus(), mind=FakeMind(answers={
+        "What is this epoch about": "A slow squeeze."}))
+    await bridge.handle_state(state(tick=CHRONICLE_EVERY_TICKS))
+    bridge.schedule_chronicle()
+    task = bridge._chronicle_task
+    await asyncio.wait([task])
+    with pytest.raises(BusClosed):
+        bridge.schedule_chronicle()

@@ -146,3 +146,50 @@ async def test_close_closes():
     bus = await make_bus(nc)
     await bus.close()
     assert nc.closed
+
+
+async def test_a_refusal_for_another_subject_is_kept_for_its_own_publisher():
+    # #2 item 1: the state publish must not swallow the chronicle task's refusal.
+    nc = FakeNC()
+    bus = await make_bus(nc)
+    nc.error_on_publish = nats.errors.Error(
+        'nats: Permissions Violation for Publish to "GRID.c.chronicle.topic"')
+    await bus.publish("GRID.c.state", {"a": 1})          # not this publisher's refusal
+    nc.error_on_publish = None
+    with pytest.raises(BusError, match="refused"):
+        await bus.publish("GRID.c.chronicle.topic", {"a": 1})
+    await bus.publish("GRID.c.chronicle.topic", {"a": 1})  # consumed: reported once
+
+
+async def test_a_refusal_is_matched_by_exact_subject_not_substring():
+    # "GRID.c.event" is a substring of the refused subject but is not it.
+    nc = FakeNC()
+    bus = await make_bus(nc)
+    nc.error_on_publish = nats.errors.Error(
+        'nats: Permissions Violation for Publish to "GRID.c.event.storm"')
+    await bus.publish("GRID.c.event", {"a": 1})
+
+
+async def test_a_client_that_closes_mid_publish_raises_bus_closed():
+    # #2 item 3: the gap between the is_closed check and the flush.
+    nc = FakeNC()
+    bus = await make_bus(nc)
+
+    async def flush(timeout=None):
+        nc.is_closed = True
+        raise RuntimeError("nats: connection closed")
+    nc.flush = flush
+    with pytest.raises(BusClosed):
+        await bus.publish("GRID.c.state", {"a": 1})
+
+
+async def test_a_client_that_closes_mid_request_raises_bus_closed():
+    nc = FakeNC()
+    bus = await make_bus(nc)
+
+    async def request(subject, data, timeout=None):
+        nc.is_closed = True
+        raise RuntimeError("nats: connection closed")
+    nc.request = request
+    with pytest.raises(BusClosed):
+        await bus.request("KANNAKA.ask.m", {"text": "hi"}, timeout_s=1)

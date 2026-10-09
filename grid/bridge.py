@@ -164,6 +164,7 @@ class Bridge:
         self._chronicled_phase: int = -1
         self._last_chronicle_tick: int = 0
         self._chronicle_task: asyncio.Task | None = None
+        self._chronicle_fatal: BusClosed | None = None
 
     # -- identity ------------------------------------------------------------
 
@@ -312,7 +313,14 @@ class Bridge:
             log.warning("chronicle log write failed: %s", e)
 
     def schedule_chronicle(self) -> None:
-        """Run the chronicle off the stream path; at most one in flight."""
+        """Run the chronicle off the stream path; at most one in flight.
+
+        Nothing awaits that task, so a BusClosed inside it would only surface as
+        "Task exception was never retrieved". Its done-callback keeps the error,
+        and the next call here re-raises it on the stream path, where BusClosed
+        is fatal and the daemon exits for a systemd restart."""
+        if self._chronicle_fatal is not None:
+            raise self._chronicle_fatal
         if self._chronicle_task is not None and not self._chronicle_task.done():
             return
         if self.last is None:
@@ -321,6 +329,16 @@ class Bridge:
         if phase == 0 or phase == self._chronicled_phase:
             return
         self._chronicle_task = asyncio.create_task(self.maybe_chronicle())
+        self._chronicle_task.add_done_callback(self._chronicle_done)
+
+    def _chronicle_done(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()      # retrieving it is what silences the asyncio warning
+        if isinstance(exc, BusClosed):
+            self._chronicle_fatal = exc
+        elif exc is not None:
+            log.error("chronicle task failed: %r", exc)
 
 
 # -- daemon --------------------------------------------------------------------

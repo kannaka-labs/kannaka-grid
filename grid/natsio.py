@@ -5,8 +5,9 @@ for one by itself. A `Permissions Violation for Publish` arrives out of band on
 the client's error callback and leaves the connection open, and `flush()` is
 only PING/PONG, so a naive publish returns cleanly while the message is
 discarded. So the bus installs that callback, records every error it reports,
-and drains the record after each flush: an entry naming a permissions violation
-on the subject just published becomes a BusError. The hive bridge once read the
+and checks the record after each flush: an entry naming a permissions violation
+on exactly the subject just published is removed and becomes a BusError; entries
+for other subjects stay for their own publishers. The hive bridge once read the
 post-PING response and discarded it, so a permissions error looked like success
 and data was lost with the process still healthy. Not here.
 """
@@ -15,6 +16,7 @@ from __future__ import annotations
 import collections
 import json
 import logging
+import re
 from typing import Any, Callable
 
 import nats
@@ -37,6 +39,16 @@ class BusClosed(BusError):
 
 def _encode(payload: dict) -> bytes:
     return json.dumps(payload, separators=(",", ":")).encode()
+
+
+# The server's wording: `Permissions Violation for Publish to "SUBJECT"`.
+_REFUSAL = re.compile(r'Permissions Violation for Publish to "([^"]*)"', re.IGNORECASE)
+
+
+def _refused_subject(entry: str) -> str | None:
+    """The exact subject a permissions refusal names, or None for any other error."""
+    m = _REFUSAL.search(entry)
+    return m.group(1) if m else None
 
 
 class Bus:
@@ -89,11 +101,17 @@ class Bus:
             await nc.publish(subject, _encode(payload))
             await nc.flush(timeout=5)
         except Exception as e:  # nats-py raises a family of errors; all mean "not delivered"
+            if nc.is_closed:    # it gave up between the check above and the flush
+                raise BusClosed(f"publish {subject}: connection closed for good") from e
             raise BusError(f"publish {subject} failed: {e}") from e
-        while self._errors:     # a refusal arrives on the callback, never on flush
-            entry = self._errors.popleft()
-            if "Permissions Violation" in entry and subject in entry:
-                raise BusError(f"publish {subject} refused: {entry}")
+        # A refusal arrives on the callback, never on flush. Take only the entries
+        # that name THIS subject exactly; a concurrent publisher (the chronicle task
+        # beside a state publish) must still find its own refusal when it looks.
+        refused = [entry for entry in self._errors if _refused_subject(entry) == subject]
+        if refused:
+            for entry in refused:
+                self._errors.remove(entry)
+            raise BusError(f"publish {subject} refused: {refused[0]}")
 
     async def request(self, subject: str, payload: dict, timeout_s: float) -> dict:
         nc = self._require()
@@ -104,6 +122,8 @@ class Bus:
         except nats.errors.TimeoutError as e:
             raise BusTimeout(f"no reply on {subject} within {timeout_s}s") from e
         except Exception as e:
+            if nc.is_closed:    # it gave up between the check above and the request
+                raise BusClosed(f"request {subject}: connection closed for good") from e
             raise BusError(f"request {subject} failed: {e}") from e
         try:
             return json.loads(msg.data)

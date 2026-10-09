@@ -882,3 +882,34 @@ async def test_a_factorial_relay_logs_both_labels_from_two_independent_draws(tmp
     # other dimension, which is the entire basis on which grid.weekly is allowed to pool.
     assert len(set(cells)) == 4
     assert 0.15 < cells.count(("m1", "p1")) / len(cells) < 0.35
+
+
+async def test_a_proposal_consumed_mid_rename_is_not_an_error(tmp_path, monkeypatch):
+    # #2 item 2: thegrid unlinks proposal.json and request.json as two statements.
+    (tmp_path / "proposal.json").write_text(json.dumps({"genome": ["harvest"]}))
+    real_rename = Path.rename
+
+    def consumed_first(self, target):
+        if self.name == "proposal.json":
+            self.unlink()                   # thegrid got there between exists() and rename
+        return real_rename(self, target)
+    monkeypatch.setattr(Path, "rename", consumed_first)
+    r = relay(tmp_path, FakeMind(answer='["harvest","fork"]'))
+    assert await r.poll_once() is None
+    assert r.stale_count == 0
+    assert not list(tmp_path.glob("proposal.stale-*.json"))
+
+
+async def test_stale_proposals_are_reaped_to_the_newest_few(tmp_path):
+    import os
+    from grid.odin import STALE_KEEP
+    for i in range(STALE_KEEP + 5):
+        p = tmp_path / f"proposal.stale-{1000 + i}.json"
+        p.write_text("{}")
+        os.utime(p, (1000 + i, 1000 + i))
+    (tmp_path / "proposal.json").write_text(json.dumps({"genome": ["harvest"]}))
+    r = relay(tmp_path, FakeMind(answer='["harvest","fork"]'))
+    assert await r.poll_once() is None
+    left = list(tmp_path.glob("proposal.stale-*.json"))
+    assert len(left) == STALE_KEEP
+    assert not (tmp_path / "proposal.stale-1000.json").exists()     # oldest went first
