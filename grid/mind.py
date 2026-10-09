@@ -20,6 +20,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from .natsio import BusClosed
+
 log = logging.getLogger("grid.mind")
 
 ASK_TIMEOUT_S = 180.0
@@ -164,6 +166,8 @@ class Mind:
         try:
             reply = await self.bus.request(f"KANNAKA.recall.{self.agent_id}",
                                            {"query": query, "top_k": top_k}, timeout_s=15)
-        except Exception:
+        except BusClosed:
+            raise                   # fatal: the caller exits for a systemd restart
+        except Exception:           # recall is optional context; the ask goes ahead without it
             return []
         return [str(r.get("content", "")) for r in reply.get("results", []) if r.get("content")]
