@@ -58,7 +58,7 @@ UNSALTED_DIMENSION = "model"
 # experiment with no error anywhere. Task 4 makes dimensions first-class; until then a
 # name that is not here is a bug, and adding one is a deliberate edit. Keeping the names
 # short and colon-free also keeps the salted key below unambiguous.
-DIMENSIONS = frozenset({UNSALTED_DIMENSION, "prompt"})
+DIMENSIONS = frozenset({UNSALTED_DIMENSION, "prompt", "genome"})
 
 
 def arm_for(request_id: str, split: float) -> str:
@@ -135,6 +135,49 @@ def two_arm(candidate: str, incumbent: str, split: float) -> tuple[list[str], li
     return arms, weights
 
 
+@dataclass(frozen=True)
+class GenomeArm:
+    """One kannaka-dna genome expressed as a mind (kannaka-dna E-001).
+
+    A phenotype.json from `kdna express --role role-swarm-mind` carries the genome's hash,
+    its individual name, and the sampling it expresses: which gateway alias answers, at
+    what temperature, with how many recalled memories. Everything else about the ask (the
+    prompt variant, recall on or off, the memory the recall reads) is shared by every arm,
+    so a difference between arms is a difference between genomes and nothing else.
+    """
+    individual: str
+    genome_hash: str
+    model_alias: str
+    temperature: float
+    recall_top_k: int
+    max_tokens: int
+
+
+def load_genome_arms(directory: Path) -> list[GenomeArm]:
+    """Every `*.json` in `directory` that is a phenotype with `params`, sorted by individual.
+
+    Sorted, and refusing duplicates, because the arm list's ORDER is the bucket order in
+    assign(): two relays reading the same directory must build the same list, or a restart
+    would quietly reassign requests between arms mid-experiment.
+    """
+    import json
+    arms: list[GenomeArm] = []
+    for p in sorted(Path(directory).glob("*.json")):
+        d = json.loads(p.read_text(encoding="utf-8"))
+        params = d.get("params")
+        if not params or "genome" not in d:
+            raise ValueError(f"{p}: not a kdna phenotype (no 'params'/'genome'); refusing to guess an arm")
+        arms.append(GenomeArm(individual=str(d["individual"]), genome_hash=str(d["genome"]),
+                              model_alias=str(params["model_alias"]), temperature=float(params["temperature"]),
+                              recall_top_k=int(params["recall_top_k"]),
+                              max_tokens=int(params.get("max_tokens", DEFAULT_MAX_TOKENS))))
+    if len({a.genome_hash for a in arms}) != len(arms):
+        raise ValueError(f"{directory}: two phenotypes share a genome hash; an arm must be one genome")
+    if len(arms) < 2:
+        raise ValueError(f"{directory}: a genome dimension needs at least two arms, found {len(arms)}")
+    return arms
+
+
 class Relay:
     def __init__(self, queue: Path, *, colony: str, agent_id: str, mind, bus,
                  timeout_s: float = ASK_TIMEOUT_S, retry_after_s: float = 60.0,
@@ -143,7 +186,22 @@ class Relay:
                  proposal_log: ProposalLog | None = None, model_alias: str = "",
                  candidate_mind=None, candidate_alias: str = "", split: float = AB_SPLIT,
                  prompt_variant: Variant | None = None, prompt_candidate: Variant | None = None,
-                 prompt_split: float = AB_SPLIT):
+                 prompt_split: float = AB_SPLIT,
+                 genome_arms: list[GenomeArm] | None = None, genome_minds: dict | None = None):
+        # The genome dimension (kannaka-dna E-001): each request is answered by the mind
+        # one genome expresses. It owns the model choice, so it cannot run beside the model
+        # A/B: a request would then have two sources of truth for which alias answered it,
+        # and every ledger row would attribute the win to whichever one the reader believed.
+        if genome_arms and candidate_mind is not None:
+            raise ValueError("a genome dimension and a model A/B cannot run together: the genome "
+                             "decides the model; blank MIND_LLM_CANDIDATE while MIND_GENOMES_DIR is set")
+        self.genome_arms = list(genome_arms or [])
+        self.genome_minds = dict(genome_minds or {})
+        missing = sorted({a.model_alias for a in self.genome_arms} - set(self.genome_minds))
+        if missing:
+            raise ValueError(f"genome arms name aliases with no mind: {missing}")
+        self._genome_by_hash = {a.genome_hash: a for a in self.genome_arms}
+        self._genome_weights = [1.0 / len(self.genome_arms)] * len(self.genome_arms) if self.genome_arms else []
         self.queue = Path(queue)
         self.colony = colony
         self.agent_id = agent_id
@@ -195,6 +253,15 @@ class Relay:
         return self._prompt_by_id[assign(request_id, dimension="prompt",
                                          arms=self._prompt_arms, weights=self._prompt_weights)]
 
+    def genome_for(self, request_id: str) -> GenomeArm | None:
+        """Which genome answers this request, or None when no genome dimension is configured.
+        Salted by its own name in assign(), so it is independent of the prompt arm."""
+        if not self.genome_arms:
+            return None
+        return self._genome_by_hash[assign(request_id, dimension="genome",
+                                           arms=[a.genome_hash for a in self.genome_arms],
+                                           weights=self._genome_weights)]
+
     async def _publish(self, kind: str, epoch: int, tick: int, **fields) -> None:
         try:
             await self.bus.publish(subject(self.colony, "event", f"odin.{kind}"),
@@ -217,7 +284,7 @@ class Relay:
 
     def _log(self, req, prompt: str, proposal: list[str] | None, outcome: str, reason: str | None,
              epoch: int, tick: int, reply: str | None = None, model_alias: str | None = None,
-             variant: Variant | None = None) -> None:
+             variant: Variant | None = None, genome: GenomeArm | None = None) -> None:
         if self.proposal_log is None:
             return
         entry = proposal_entry(req=req, proposal=proposal, outcome=outcome, reason=reason,
@@ -225,7 +292,9 @@ class Relay:
                                model_alias=model_alias if model_alias is not None else self.model_alias,
                                prompt=prompt, ts_ms=now_ms(), reply=reply,
                                prompt_variant="" if variant is None else variant.id,
-                               prompt_variant_sha256="" if variant is None else variant.sha256)
+                               prompt_variant_sha256="" if variant is None else variant.sha256,
+                               genome="" if genome is None else genome.individual,
+                               genome_hash="" if genome is None else genome.genome_hash)
         self.proposal_log.record(entry, prompt)
 
     async def _epoch_tick(self) -> tuple[int, int]:
@@ -285,19 +354,31 @@ class Relay:
         if self._clock() < self._retry_not_before.get(req.request_id, 0.0):
             return None
 
-        arm = "candidate" if self.candidate_mind is not None and arm_for(req.request_id, self.split) == "candidate" else "incumbent"
-        mind = self.candidate_mind if arm == "candidate" else self.mind
-        alias = self.candidate_alias if arm == "candidate" else self.model_alias
+        genome = self.genome_for(req.request_id)
+        if genome is not None:
+            # The genome dimension owns the model and the sampling; the prompt variant below
+            # still owns the wording and whether recall happens. The recall and remember
+            # calls stay on self.mind: memory is the colony's, shared by every genome.
+            mind, alias = self.genome_minds[genome.model_alias], genome.model_alias
+            temperature, max_tokens, top_k = genome.temperature, genome.max_tokens, genome.recall_top_k
+        else:
+            arm = "candidate" if self.candidate_mind is not None and arm_for(req.request_id, self.split) == "candidate" else "incumbent"
+            mind = self.candidate_mind if arm == "candidate" else self.mind
+            alias = self.candidate_alias if arm == "candidate" else self.model_alias
+            temperature = max_tokens = None    # the variant's, below
+            top_k = 5
 
         # Before the recall call, because the variant is what decides whether recall
         # happens at all: a variant with no memory block must not pay for the lookup.
         variant = self.variant_for(req.request_id)
+        if temperature is None:
+            temperature, max_tokens = variant.temperature, variant.max_tokens
         recall = await self.mind.recall(
-            f"colony {self.colony} genome lineage {' '.join(req.genome[:6])}") if variant.recall else []
+            f"colony {self.colony} genome lineage {' '.join(req.genome[:6])}", top_k=top_k) if variant.recall else []
         prompt = render_prompt(req, recall, variant)
         try:
             reply = await mind.ask(prompt, recall_query=f"colony {self.colony}", timeout_s=self.timeout_s,
-                                   temperature=variant.temperature, max_tokens=variant.max_tokens)
+                                   temperature=temperature, max_tokens=max_tokens)
         except BusClosed:
             raise
         except (BusTimeout, BusError, MindError) as e:
@@ -316,7 +397,8 @@ class Relay:
             self._retry_not_before.pop(req.request_id, None)
             epoch, tick = await self._epoch_tick()
             reason = DEFER_BIN_REASON
-            self._log(req, prompt, None, "rejected", reason, epoch, tick, model_alias=alias, variant=variant)
+            self._log(req, prompt, None, "rejected", reason, epoch, tick, model_alias=alias, variant=variant,
+                      genome=genome)
             await self._publish("rejected", epoch, tick, request_id=req.request_id, reason=reason)
             return "rejected"
         self._defers.pop(req.request_id, None)      # consecutive, so a good ask resets
@@ -329,7 +411,7 @@ class Relay:
             # Log before publishing: a dead bus raises BusClosed out of poll_once, and
             # the training record must survive that. The reply is the negative example.
             self._log(req, prompt, None, "rejected", result.reason, epoch, tick, reply=reply, model_alias=alias,
-                      variant=variant)
+                      variant=variant, genome=genome)
             await self._publish("rejected", epoch, tick, request_id=req.request_id, reason=result.reason)
             if self.throttle.allow("odin.rejected"):
                 # Spec 6: the mind learns what does not work, not only what does.
@@ -343,9 +425,11 @@ class Relay:
             log.info("request %s vanished before the proposal landed", req.request_id)
             return None
         # The proposal itself is the training text, so no reply is kept here.
-        self._log(req, prompt, result, "proposed", None, epoch, tick, model_alias=alias, variant=variant)
+        self._log(req, prompt, result, "proposed", None, epoch, tick, model_alias=alias, variant=variant,
+                  genome=genome)
         await self._publish("proposed", epoch, tick, request_id=req.request_id,
-                            genome_len=len(result), mind=self.agent_id)
+                            genome_len=len(result), mind=self.agent_id,
+                            **({"genome": genome.individual} if genome is not None else {}))
         return "proposed"
 
 
@@ -378,6 +462,9 @@ class RelayConfig:
     # mid-experiment, across a restart. The two dimensions are independent everywhere
     # else; sharing one split would have been the only place they were not.
     prompt_ab_split: float = AB_SPLIT   # MIND_PROMPT_AB_SPLIT
+    # A directory of kdna phenotype.json files (kannaka-dna E-001). Set, it turns on the
+    # genome dimension; every request is answered by the mind one genome expresses.
+    genomes_dir: str = ""               # MIND_GENOMES_DIR
 
     @classmethod
     def from_env(cls) -> "RelayConfig":
@@ -411,6 +498,7 @@ class RelayConfig:
             prompt_variant=env("MIND_PROMPT_VARIANT", "") or "",
             prompt_candidate=env("MIND_PROMPT_CANDIDATE", "") or "",
             prompt_ab_split=_split(env, "MIND_PROMPT_AB_SPLIT"),
+            genomes_dir=env("MIND_GENOMES_DIR", "") or "",
         )
 
 
@@ -507,6 +595,26 @@ async def run(cfg: RelayConfig) -> None:
     else:
         log.info("prompt: %s (no A/B)", prompt_variant.id)
     check_sampling_route(cfg.llm, prompt_variant, prompt_candidate)
+    genome_arms: list[GenomeArm] = []
+    genome_minds: dict[str, Mind] = {}
+    if cfg.genomes_dir:
+        # Fail closed at boot, like the variant loader: a bad phenotype file is a start
+        # failure, not a request-time defer loop.
+        genome_arms = load_genome_arms(Path(cfg.genomes_dir))
+        if cfg.llm is None:
+            raise SystemExit("MIND_GENOMES_DIR needs MIND_LLM_URL: genome arms choose their model "
+                             "and temperature, which the NATS ask route cannot carry")
+        if candidate_mind is not None:
+            raise SystemExit("MIND_GENOMES_DIR and MIND_LLM_CANDIDATE are both set; the genome "
+                             "dimension owns the model, so blank the candidate while it runs")
+        for alias in sorted({a.model_alias for a in genome_arms}):
+            genome_minds[alias] = Mind(cfg.agent_id, bus, kannaka_bin=cfg.kannaka_bin,
+                                       data_dir=Path(cfg.mind_data_dir) if cfg.mind_data_dir else None,
+                                       ask_timeout_s=cfg.ask_timeout_s,
+                                       llm=DirectLlm(cfg.llm.base_url, alias, cfg.llm.api_key))
+        log.info("genome dimension: %d arms over %d models: %s", len(genome_arms), len(genome_minds),
+                 ", ".join(f"{a.individual}({a.model_alias} t={a.temperature} k={a.recall_top_k})"
+                           for a in genome_arms))
     async with httpx.AsyncClient(timeout=2) as client:
         async def fetch_state() -> dict:
             r = await client.get(f"{cfg.colony_url}/api/state")
@@ -519,7 +627,8 @@ async def run(cfg: RelayConfig) -> None:
                       retry_after_s=cfg.retry_after_s,
                       candidate_mind=candidate_mind, candidate_alias=cfg.candidate_tag, split=cfg.ab_split,
                       prompt_variant=prompt_variant, prompt_candidate=prompt_candidate,
-                      prompt_split=cfg.prompt_ab_split)
+                      prompt_split=cfg.prompt_ab_split,
+                      genome_arms=genome_arms or None, genome_minds=genome_minds or None)
         log.info("watching %s for %s", cfg.queue, cfg.agent_id)
         while True:
             try:

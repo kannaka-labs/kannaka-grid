@@ -84,6 +84,9 @@ def verdict_row(entry: dict, stats: dict | None, *, settled_tick: int,
             "births": births, "generations": gens, "lifetime_ticks": life, "tier": tier,
             "fitness": 0 if tier == "preexisting" else births,
             "model_alias": entry.get("model_alias", ""), "outcome": entry.get("outcome"),
+            # Carried through so the E-001 analysis groups verdicts by genome without
+            # joining back to the proposal log; "" when the row had no genome arm.
+            "genome": str(entry.get("genome") or ""), "genome_hash": str(entry.get("genome_hash") or ""),
             "history_sha256": history_sha256}
 
 

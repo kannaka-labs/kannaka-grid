@@ -74,7 +74,9 @@ def test_a_row_carries_its_dimension_defaults_to_model_and_refuses_an_unknown_on
     # assign is not a dimension the gate may write a week of history under. Mutation: drop the
     # check in release_row -> "modle" lands in the ledger, matches no filter, and that A/B is
     # unclosable and unrememberable forever.
-    assert DIMENSIONS == frozenset({"model", "prompt"})
+    # "genome" joined 2026-10-28 for kannaka-dna E-001: assigned by odin like the others, but
+    # started by kannaka-dna (MIND_GENOMES_DIR), never by the gate -- see _validate_candidate.
+    assert DIMENSIONS == frozenset({"model", "prompt", "genome"})
     with pytest.raises(ValueError, match="dimension must be one of"):
         release_row(**kw, dimension="modle")
     with pytest.raises(ValueError, match="dimension must be one of"):

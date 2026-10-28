@@ -1678,7 +1678,7 @@ async def test_an_unknown_dimension_is_refused_at_every_entry_point(tmp_path):
     # ONE allowlist, odin's, and every name on it has a knob here: the second guard in
     # _dimension_env is what a future task adding a dimension to DIMENSIONS alone would hit,
     # instead of silently running its experiment on the model alias.
-    assert set(_DIMENSION_ENV) == set(DIMENSIONS) == {"model", "prompt"}
+    assert set(_DIMENSION_ENV) == set(DIMENSIONS) == {"model", "prompt", "genome"}
     calls = [
         lambda: ab_state(vs, dimension="modle"),
         lambda: lost_tags(vs, dimension="modle"),
@@ -2094,7 +2094,9 @@ def test_a_failure_in_one_dimension_is_not_masked_by_a_success_in_another(tmp_pa
     # which is `sorted(DIMENSIONS)`, so pin that here rather than leaving it to how the names
     # happen to sort: a dimension added later that sorts before "model" would silently reorder
     # the run and this test would quietly stop testing what its comment says.
-    assert sorted(DIMENSIONS)[:2] == ["model", "prompt"]
+    # "genome" sorts before both and reconciles as a no-op here (no MIND_GENOMES_DIR in this
+    # env), so the first-fails/second-succeeds pair is still model then prompt, in that order.
+    assert [d for d in sorted(DIMENSIONS) if d != "genome"] == ["model", "prompt"]
     grid_env = _ab_cli_env(tmp_path, monkeypatch,
                            "MIND_MODEL_ALIAS=kannaka-brain-v3\nMIND_LLM_CANDIDATE=kannaka-brain-v4\n"
                            "MIND_AB_SPLIT=0.2\nMIND_PROMPT_VARIANT=v1-sandbox\n"
