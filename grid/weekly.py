@@ -61,6 +61,13 @@ EXCLUDED_TIERS = ("preexisting", "unknown", "rejected")
 _DIMENSION_ENV = {
     UNSALTED_DIMENSION: {"live": "MIND_MODEL_ALIAS", "candidate": "MIND_LLM_CANDIDATE", "split": "MIND_AB_SPLIT"},
     "prompt": {"live": "MIND_PROMPT_VARIANT", "candidate": "MIND_PROMPT_CANDIDATE", "split": "MIND_PROMPT_AB_SPLIT"},
+    # The genome dimension (kannaka-dna E-001) has no incumbent and no split: MIND_GENOMES_DIR
+    # set means N genomes are splitting ALL traffic, so the one line is live, candidate and
+    # split at once. Naming it as the candidate is what makes the interlock see a running
+    # genome experiment and refuse to start a model or prompt week on top of it. The gate
+    # never starts or judges a genome week itself (`_validate_candidate` refuses); kannaka-dna
+    # does, from its own pre-registration.
+    "genome": {"live": "MIND_GENOMES_DIR", "candidate": "MIND_GENOMES_DIR", "split": "MIND_GENOMES_DIR"},
 }
 
 
@@ -107,6 +114,9 @@ def _validate_candidate(dimension: str, name: str) -> None:
     if dimension == "prompt":
         get_variant(name)                     # VariantError (a ValueError) names the offending id
         return
+    if dimension == "genome":
+        raise ValueError("the genome dimension is started by kannaka-dna (MIND_GENOMES_DIR, from its own "
+                         "pre-registration), not by the gate; it has no candidate to write")
     raise ValueError(f"grid.weekly has no candidate check for dimension {dimension!r}; refusing "
                      "to write a name the relay may refuse at boot")
 
@@ -223,7 +233,7 @@ def _live_arm(cfg: WeeklyConfig, dimension: str) -> str | None:
     a perfectly healthy experiment until MAX_WEEKS killed it.
     """
     live = _env_get(cfg.grid_env, _dimension_env(dimension)["live"])
-    if dimension == UNSALTED_DIMENSION:
+    if dimension in (UNSALTED_DIMENSION, "genome"):   # genome: the directory, or nothing is live
         return live
     return live or get_variant().id
 

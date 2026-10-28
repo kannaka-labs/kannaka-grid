@@ -41,7 +41,8 @@ def variant_sha256_of(entry: dict) -> str:
 def proposal_entry(*, req: Request, proposal: list[str] | None, outcome: str, reason: str | None,
                    epoch: int, tick: int, colony: str, mind: str, model_alias: str,
                    prompt: str, ts_ms: int, reply: str | None = None,
-                   prompt_variant: str = "", prompt_variant_sha256: str = "") -> dict:
+                   prompt_variant: str = "", prompt_variant_sha256: str = "",
+                   genome: str = "", genome_hash: str = "") -> dict:
     """The `prompt_variant*` defaults make this callable without them; they say NOTHING
     about older log lines. A row written before the prompt registry existed does not
     carry these keys as "" -- it does not carry them AT ALL, across the whole existing
@@ -67,6 +68,11 @@ def proposal_entry(*, req: Request, proposal: list[str] | None, outcome: str, re
         # first name would have destroyed the input-side integrity check the corpus uses.
         "prompt_variant": prompt_variant,
         "prompt_variant_sha256": prompt_variant_sha256,
+        # The genome dimension (kannaka-dna E-001): the individual that answered and its
+        # genome hash. "" on every row from a relay with no genome arms, and, like the
+        # prompt keys, ABSENT on rows older than this field: read with .get().
+        "genome": genome,
+        "genome_hash": genome_hash,
     }
 
 
